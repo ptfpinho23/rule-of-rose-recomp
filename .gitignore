@@ -1,0 +1,30 @@
+# The game itself and anything made from it never goes in the repository
+*.iso
+*.iso:Zone.Identifier
+*.ISO
+SLES_*
+saves/
+launcher/assets/title.png
+recomp/rt/vu1_fast.inc
+recomp/tools/vu1_micro_*.bin
+recomp/tools/vu1_entries_*.txt
+
+# Build output and packages
+build/
+dist/
+launcher/build*/
+core.*
+game.log
+
+# Downloaded toolchains and SDKs (see tools/fetch-debs.sh and the README)
+tools/debs/
+tools/llvm-mingw/
+tools/vulkan/
+tools/ffx/
+
+# Abandoned first translator, kept locally for reference
+recompile/
+tools/build_native.sh
+
+__pycache__/
+*.pyc
