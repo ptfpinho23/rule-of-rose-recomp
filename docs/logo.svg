@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 520 300" width="520" height="300" role="img" aria-label="Rule of Rose PC Port">
+  <defs>
+    <radialGradient id="g" cx="50%" cy="42%" r="60%">
+      <stop offset="0" stop-color="#d9566a"/>
+      <stop offset="0.6" stop-color="#a8324a"/>
+      <stop offset="1" stop-color="#5e1626"/>
+    </radialGradient>
+  </defs>
+  <!-- rose -->
+  <g transform="translate(200 0) scale(0.5)">
+    <path d="M120 150 C118 180 126 205 112 232" fill="none" stroke="#4d6b52" stroke-width="6" stroke-linecap="round"/>
+    <path d="M118 190 C96 176 80 184 70 200 C92 206 108 202 118 190Z" fill="#4d6b52"/>
+    <path d="M121 206 C140 192 158 196 168 210 C150 218 132 216 121 206Z" fill="#3f5a45"/>
+    <circle cx="120" cy="92" r="70" fill="url(#g)"/>
+    <g fill="none" stroke="#f3d9dc" stroke-width="5" stroke-linecap="round" stroke-linejoin="round" opacity="0.92">
+      <path d="M120 92 c-6 -8 4 -18 13 -12 c11 7 6 25 -9 28 c-19 4 -33 -14 -27 -32 c7 -22 36 -29 54 -14 c22 18 19 53 -6 68 c-29 17 -66 0 -73 -32"/>
+      <path d="M72 98 c-10 -34 14 -66 50 -66"/>
+      <path d="M146 150 c26 -10 42 -38 34 -66"/>
+    </g>
+  </g>
+  <!-- wordmark: mid-tone colours so it reads on GitHub's light and dark themes -->
+  <text x="260" y="186" text-anchor="middle" font-family="'Cormorant Garamond', Garamond, 'Palatino Linotype', Georgia, serif" font-size="64" font-style="italic" font-weight="600" fill="#b23a52">Rule of Rose</text>
+  <line x1="150" y1="214" x2="218" y2="214" stroke="#8a8f98" stroke-width="1.5"/>
+  <line x1="302" y1="214" x2="370" y2="214" stroke="#8a8f98" stroke-width="1.5"/>
+  <circle cx="260" cy="214" r="3" fill="#b23a52"/>
+  <text x="260" y="256" text-anchor="middle" font-family="'Cormorant Garamond', Garamond, 'Palatino Linotype', Georgia, serif" font-size="26" letter-spacing="10" fill="#8a8f98">PC PORT</text>
+</svg>
