@@ -45,9 +45,11 @@ Not yet verified or known to be missing:
 - `--filter fsr3` (FSR 3.1) has been checked on one GPU (RTX 3090) over the
   same scripted stretch. Its output varies slightly from run to run at
   `--internal 1`.
-- With `--renderer gpu` at `--internal 2` or more the picture is sharper than
-  the original: the game's final softening pass has no effect there, which
-  also leaves its film grain crisp (`--film-grain` turns the grain down).
+- With `--renderer gpu` at `--internal 2` or more, detail that a PS2 picture
+  hides becomes visible: the bark and leaf textures (the game uses no
+  mip-mapping), its translucent foliage layers and its film grain, whose
+  specks stay crisp (`--film-grain` turns the grain down). This is the game's
+  content at a higher resolution, not a rendering error.
 - `--bloom` is accepted but its effect is too weak to see in this game yet.
 - Fullscreen start is verified on both platforms; the Alt+Enter / F11 toggle
   and `--aspect stretch` in a real window have not been tried by hand.

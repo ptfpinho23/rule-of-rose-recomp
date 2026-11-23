@@ -1551,18 +1551,23 @@ static void submit(int type) {
      * frame (PATH2/3) that tile a 64x64 32-bit noise texture over the picture,
      * blended with a constant: (Cs - Cd) * FIX + Cd and (Cd - Cs) * FIX + Cd,
      * FIX = 15 in the first scene. Below 100 the constant is scaled; 0 drops
-     * the sprites. */
-    if (film_grain != 100 && type == 6 && g_gif_path != GIF_PATH1 && (pr & 0x10) && (pr & 0x40) && (pr & 0x100) &&
+     * the sprites. Under --wide their texture coordinates are widened (below). */
+    if (type == 6 && g_gif_path != GIF_PATH1 && (pr & 0x10) && (pr & 0x40) && (pr & 0x100) &&
         c->tpsm == PSMCT32 && c->tw == 6 && c->th == 6 && ((c->alpha >> 4) & 3) == 2 && ((c->alpha >> 6) & 3) == 1) {
         s32 x0 = vq[0].x < vq[1].x ? vq[0].x : vq[1].x, x1 = vq[0].x < vq[1].x ? vq[1].x : vq[0].x, W = (s32)c->fbw * 64 * 16;
         s32 du = (s32)vq[1].u - (s32)vq[0].u; if (du < 0) du = -du;
-        if (x0 <= 16 && x1 >= W - 16 && du > 64 * 16) {              /* full width, and the texture repeats across it */
-            static int logged; if (!logged) { logged = 1; rt_log("[gs] film grain: %d%% (noise texture at %x, blend constant %u)\n", film_grain, c->tbp, (unsigned)((c->alpha >> 32) & 255)); }
+        int widen = wide_squeeze(c->fbp, &inv);
+        if (x0 <= 16 && x1 >= W - 16 && du > 64 * 16 && (film_grain != 100 || widen)) {      /* full width, and the texture repeats across it */
+            if (film_grain != 100) { static int logged; if (!logged) { logged = 1; rt_log("[gs] film grain: %d%% (noise texture at %x, blend constant %u)\n", film_grain, c->tbp, (unsigned)((c->alpha >> 32) & 255)); } }
             if (film_grain <= 0) return;
-            u64 keep = c->alpha, fix = (keep >> 32) & 255;
-            ((Ctxt *)c)->alpha = (keep & ~(0xFFull << 32)) | ((u64)((fix * (u64)film_grain + 50) / 100) << 32);
-            state_dirty = 1; submit1(type);
-            ((Ctxt *)c)->alpha = keep; state_dirty = 1;
+            u64 keep = c->alpha, fix = (keep >> 32) & 255; u32 keep_u = vq[1].u;
+            /* --wide shows the picture stretched: the grain is repeated more often
+             * across it instead, so that its specks keep their shape */
+            if (widen) vq[1].u = (u32)((s32)vq[0].u + (s32)lrintf((float)((s32)vq[1].u - (s32)vq[0].u) / inv));
+            if (film_grain != 100) { ((Ctxt *)c)->alpha = (keep & ~(0xFFull << 32)) | ((u64)((fix * (u64)film_grain + 50) / 100) << 32); state_dirty = 1; }
+            submit1(type);
+            vq[1].u = keep_u;
+            if (film_grain != 100) { ((Ctxt *)c)->alpha = keep; state_dirty = 1; }
             return;
         }
     }
@@ -2598,12 +2603,12 @@ static void hwg_prim(const DState *st, const Prim *p) {
     static int warned;
     if (c->fpsm != PSMCT32 && c->fpsm != PSMCT24) { if (!warned++) rt_log("[gs] hardware renderer: frame format %x not supported, primitives dropped\n", c->fpsm); return; }
     {   /* ROR_HW_SKIPTEX=hex[,hex...] (debugging): primitives textured from these TBP0 addresses are not drawn; "fffff" = untextured ones */
-        static int nskip = -1; static u32 skip[16];
-        if (nskip < 0) { nskip = 0; const char *e = getenv("ROR_HW_SKIPTEX"); while (e && *e && nskip < 16) { char *q; skip[nskip++] = (u32)strtoul(e, &q, 16); e = *q == ',' ? q + 1 : q; if (!*q) break; } }
+        static int nskip = -1; static u32 skip[512];
+        if (nskip < 0) { nskip = 0; const char *e = getenv("ROR_HW_SKIPTEX"); while (e && *e && nskip < 512) { char *q; skip[nskip++] = (u32)strtoul(e, &q, 16); e = *q == ',' ? q + 1 : q; if (!*q) break; } }
         for (int i = 0; i < nskip; i++) if (st->tme ? c->tbp == skip[i] : skip[i] == 0xfffff) {
             static int nlog; static int slog = -1; if (slog < 0) slog = getenv("ROR_HW_SKIPLOG") ? atoi(getenv("ROR_HW_SKIPLOG")) : 0;
             if (nlog < slog) { nlog++; extern int g_gif_path;
-                rt_log("[skip] vblank %llu path%d type %d tex %x %dx%d psm %x tcc %d tfx %d mmag %d | abe %d blend %d%d%d%d fix %x | ate %d atst %d aref %x afail %d | zte %d ztst %d zmsk %d | fge %d iip %d | v", (unsigned long long)g_gs_frames, g_gif_path + 1, p->type, c->tbp, 1 << c->tw, 1 << c->th, c->tpsm, c->tcc, c->tfx, c->mmag,
+                rt_log("[skip] vblank %llu path%d type %d tex %x %dx%d psm %x tcc %d tfx %d mmag %d mmin %d mxl %d | abe %d blend %d%d%d%d fix %x | ate %d atst %d aref %x afail %d | zte %d ztst %d zmsk %d | fge %d iip %d | v", (unsigned long long)g_gs_frames, g_gif_path + 1, p->type, c->tbp, 1 << c->tw, 1 << c->th, c->tpsm, c->tcc, c->tfx, c->mmag, (int)((c->tex1 >> 6) & 7), (int)((c->tex1 >> 2) & 7),
                        st->abe, st->aa, st->ab, st->ac, st->ad, st->fix, st->ate, st->atst, st->aref, st->afail, st->zte, st->ztst, c->zmsk, st->fge, st->iip);
                 for (int k = 0; k < (p->type == PT_TRI ? 3 : 2); k++) rt_log(" (%.2f,%.2f z %x rgba %02x%02x%02x%02x)", p->v[k].x / 16.0 - 1792, p->v[k].y / 16.0 - 1824, p->v[k].z, p->v[k].r, p->v[k].g, p->v[k].b, p->v[k].a);
                 rt_log("\n"); }

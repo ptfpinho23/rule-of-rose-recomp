@@ -915,3 +915,44 @@ literals, disassembly listings, binary files): none. The only tables are the
 GS memory-layout tables (gs.c, tools/gs_ref.c) and the MPEG-2 scan and
 quantiser tables (ipu.c). Game addresses and single instructions quoted in
 comments and in these notes are short references.
+
+## Uphill path: what the streaks are; grain under `--wide` (2026-11-23)
+
+Reaching the area: `recomp/tools/script-uphill.txt` (`--script "$(cat ...)"`,
+no memory card): the play script up to the bus stop, then Left from 21400 and
+Up+Left from 22200. The path with the broken fences is on screen from about
+22500; a caption cutscene runs around 24250-24500; 24750 and 25000 show the
+gate and fences from above. The walk is the same on Linux, Windows, both
+renderers and with `--wide`.
+
+Streaks and smeared areas in the foliage at `--internal 4`, examined at
+vblank 24750 (capture replayed at 4x, primitives of one texture address left
+out at a time, software against GPU):
+- The streaked translucent bands are tree trunks and branches: opaque
+  alpha-blended meshes with a 256x512 bark texture (vertical grain), seen
+  through the leaf layers drawn over them. Leaving out the bark texture
+  removes the band. The software renderer and the GPU renderer at 1x show the
+  same thing; at 4x the bark lines are resolved instead of averaged.
+- The smeared background is the distant hillside, a low-resolution texture
+  magnified with bilinear filtering.
+- Minification: every textured primitive of the two captures uses MMAG =
+  linear and MMIN = linear without mip levels (MXL is 1 on some, but MMIN
+  never selects a level). The game does not mip-map, so nothing is missing in
+  the port; minified textures alias on the console too.
+- Wrapped-Z polygons (the widescreen clip problem): none in the frames
+  rendered at 21:9 along this walk.
+So this class is the game's content at a higher resolution, not a defect.
+
+Correction to the previous section ("Found, not changed"): the frame's last
+pass is NOT a 2x2 blur. Its sprite maps pixel x to u = x + 0.5, which is the
+texel centre for the GS's bilinear filter, so horizontally it is an exact
+copy; v is 1/16 texel off (a 15:1 blend of each row with the one above).
+The pass is the x1.19 brightening on the console as well, and the GPU path
+reproduces it at any scale. There is therefore no console blur to offer as
+a switch; none was added.
+
+Grain under `--wide` (defect of the widescreen layer, fixed): the full-width
+grain sprites are not squeezed, so the stretched presentation widened every
+speck by aspect / (4/3). `gs.c submit()` now widens their U range by the same
+factor while 3D is widened (the 64x64 noise repeats more often), which keeps
+the specks' shape. Both renderers; no change without `--wide`.
