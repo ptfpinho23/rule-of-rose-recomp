@@ -1031,3 +1031,36 @@ compiler process 437 MB. Archives: Linux 122 MB, Windows 125 MB. The game
 built that way gives the reference md5s (16 PNG + WAV) on both systems.
 
 Pinned downloads and their SHA-256 are in `release/fetch.sh`.
+
+## ror-build: progress, timing and cancelling (2026-11-23, follow-up)
+
+- Progress lines are `PROGRESS <n> 100 <text>` from the first line on, with
+  player-facing text only: "Checking your disc", "Reading the game",
+  "Building the game (N of 78)", "Finishing". File names and commands are in
+  build.log, each with its duration and the time since the start.
+- What took the last 25 s of a build was not the link but `rt/vu.c`: with the
+  translated VU1 program it is one very large function and takes 24 s alone
+  (28-29 s with the other compilers running), and it was started last. Files
+  are now started longest first, so it runs beside everything else: 31 s in
+  all on both systems on the 24-thread development machine (before: 35-38 s
+  Linux, 42 s Windows), 45 s with `--jobs 4`.
+- On Windows the link took 16 s because the first link for a target makes Zig
+  build its C library and support code. A link of an empty program with the
+  same options (they are part of Zig's cache key; `-s` matters) now runs
+  beside the compiling; the real link then takes 0.2 s.
+- The percentage follows time: the compile phase is expected to last as long
+  as the longest file or as all files shared among the workers, whichever is
+  more, from nominal times (measured here) scaled by how fast the first fifth
+  of the work went on this machine. A ticker prints twice a second.
+- Cancelling. Linux: ror-build makes itself a process group; a small guard
+  process outside it watches a pipe and, when ror-build ends without telling
+  it (SIGKILL, crash), kills the group and removes the work folder. SIGTERM:
+  the group is signalled, the folder removed, `ERROR cancelled`. Windows: the
+  job objects end the compilers; the work folder of a killed build is removed
+  by the next build or `--check`. `DIR/.build/pid` (touched twice a second)
+  tells a stale folder from a running build. `--check` never looks at the
+  work folder to decide: only ror-game plus a matching stamp count.
+- With `ROR_MC_DIR` set, ror-game writes nothing into its own folder or the
+  current folder in a normal run (checked from a read-only folder). Without
+  it, it creates `saves/mc0` beside itself. `--shots` and the debug dumps
+  write under the current folder.

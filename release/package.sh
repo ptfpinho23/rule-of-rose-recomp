@@ -28,34 +28,41 @@ readme() {   # platform
   local exe="" sep=/ build=ror-build
   [ "$1" = windows ] && { exe=.exe; sep='\'; build=ror-build.exe; }
   cat <<EOF
-Rule of Rose - native PC build, version $VERSION
-==================================================
+Rule of Rose for PC, version $VERSION
+=======================================
 
-You need your own copy of the European disc (SLES-54218) as an .iso file.
-This package contains no part of the game.
+This package does NOT contain the game. You need your own copy of the
+European PlayStation 2 disc (SLES-54218) as an .iso file.
 
-Start:  RuleOfRose$exe
-        Choose your disc image and press PLAY. The first time, the game
-        program is built on this computer from your disc image; that takes
-        about a minute on a recent processor and needs no other software
-        and no internet connection. It is built again only when you change
-        the disc image or install another version of this package.
+How to play
+  1. Unpack this folder anywhere you like.
+  2. Start RuleOfRose$exe
+  3. Choose your disc image (.iso).
+  4. Press PREPARE GAME. This is needed once: the game is made ready for
+     this computer from your disc image. It takes a few minutes at most
+     (about one minute on a recent computer) and needs no internet
+     connection and no other software. It is only asked for again if you
+     choose another disc image or install a newer version of this package.
+  5. Press PLAY.
+
+Your disc image is only read, never changed and never sent anywhere.
+Saved games are kept in the saves folder next to the launcher.
 
 What is in this folder
-  RuleOfRose$exe      the launcher
-  $build         builds the game program from your disc image:
-                    $build --iso PATH --out FOLDER
-                  writes FOLDER${sep}ror-game$exe; FOLDER${sep}build.log has the details
-  buildkit$sep         what $build uses: the recompiler, the runtime (compiled),
-                  the Zig C compiler and a Python interpreter
-  licenses$sep         licences of everything bundled here
+  RuleOfRose$exe      the program you start
+  $build         does the preparation of step 4 (the launcher runs it for you)
+  buildkit$sep         the tools the preparation uses
+  licenses$sep         licences of the software bundled here
 
-Running the game without the launcher:
+If the preparation fails, the launcher shows the reason; the details are in
+build.log in the game folder it names.
+
+For the curious: preparing by hand is
+  $build --iso PATH --out FOLDER
+and the game can then be started without the launcher:
   FOLDER${sep}ror-game$exe --iso PATH [options]
-The options are listed in docs/OPTIONS.md of the project.
-
-The game's source code is on the project page; it is under the MIT licence
-(licenses${sep}LICENSE.txt). Qt is used under the LGPL v3 (https://www.qt.io/licensing);
+The options, and the source code (MIT licence, licenses${sep}LICENSE.txt), are on
+the project page. Qt is used under the LGPL v3 (https://www.qt.io/licensing);
 its libraries are separate files in this folder and can be replaced.
 EOF
 }

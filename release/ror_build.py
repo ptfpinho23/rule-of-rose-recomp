@@ -13,14 +13,17 @@ of that with the bundled compiler and links it with the runtime into
 DIR/ror-game (ror-game.exe on Windows).
 
 Output (stdout, UTF-8, one line per step, flushed):
-    PROGRESS <done> <total> <text>
+    PROGRESS <done> <total> <text>       total is always 100; done follows the time the build is expected to take;
+                                         the text is meant for the player (plain words, no file names)
     DONE <path of the executable>        exit 0
     ERROR <one line>                     exit 1
 --check prints "up to date" (exit 0) or "needs build: <reason>" (exit 1).
 The full log is DIR/build.log. Intermediate files live in DIR/.build and are
 removed on success; the executable is put in place by one rename at the very
-end, so an interrupted build leaves no partial ror-game. Nothing is written
-outside DIR and nothing is fetched from anywhere.
+end, so an interrupted build leaves no partial ror-game; a build that is
+killed takes its compilers with it and its work folder is removed (at once on
+Linux, by the next build or --check on Windows). Nothing is written outside
+DIR and nothing is fetched from anywhere.
 
 Only the Python standard library is used. The file runs from the kit folder
 (buildkit/ beside the launcher), which may be read-only.
@@ -36,8 +39,10 @@ import struct
 import subprocess
 import sys
 import threading
+import time
 
 KIT = os.path.dirname(os.path.abspath(__file__))
+T_START = time.monotonic()
 WINDOWS = os.name == 'nt'
 EXE = '.exe' if WINDOWS else ''
 GAME_ELF = 'SLES_542.18'
@@ -130,7 +135,53 @@ def identity(iso, elf):
             'version': kit_text('VERSION'), 'kit': kit_text('KITHASH')}
 
 
+def pid_alive(pid):
+    if pid <= 0:
+        return False
+    if WINDOWS:
+        import ctypes
+        k32 = ctypes.WinDLL('kernel32')
+        k32.OpenProcess.restype = ctypes.c_void_p
+        h = k32.OpenProcess(0x00100000, False, pid)        # SYNCHRONIZE
+        if not h:
+            return False
+        alive = k32.WaitForSingleObject(ctypes.c_void_p(h), 0) == 0x102     # WAIT_TIMEOUT: still running
+        k32.CloseHandle(ctypes.c_void_p(h))
+        return alive
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+
+
+def remove_stale_work(out):
+    """The work folder of a build that was killed: remove it unless that build is still running."""
+    work = os.path.join(out, '.build')
+    if not os.path.isdir(work):
+        return
+    try:
+        with open(os.path.join(work, 'pid'), 'r') as f:
+            pid = int(f.read().strip() or 0)
+    except (OSError, ValueError):
+        pid = 0
+    try:
+        fresh = time.time() - os.path.getmtime(os.path.join(work, 'pid')) < 30     # a running build touches it every half second
+    except OSError:
+        fresh = False
+    if pid != os.getpid() and fresh and pid_alive(pid):
+        raise BuildError('another build is running in this folder')
+    remove_tree(work)
+
+
 def check(iso, out):
+    try:
+        remove_stale_work(out)
+    except BuildError:
+        say('needs build: a build is running')
+        return 1
     try:
         elf = read_elf_from_iso(iso)
     except BuildError as e:
@@ -162,7 +213,7 @@ _children_lock = threading.Lock()
 _cancelled = False
 
 if WINDOWS:
-    def _tie_children_to_us():
+    def _tie_children_to_us(work=None):
         """A job object that kills everything in it when its last handle closes, i.e. when this process ends."""
         import ctypes
         from ctypes import wintypes
@@ -193,14 +244,50 @@ if WINDOWS:
         k32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info))
         k32.AssignProcessToJobObject(job, k32.GetCurrentProcess())      # children inherit the job
 
+    def _release_guard():
+        pass
+
     _preexec = None
 else:
-    def _tie_children_to_us():
-        pass
+    # Linux. This process makes itself a process group; the compilers and whatever they start stay in it.
+    # A guard process outside the group holds the read end of a pipe from here: when this process ends
+    # without saying goodbye (killed, crashed) the guard kills the group and removes the work folder.
+    GUARD = r"""
+import os, shutil, signal, sys, time
+pgid, work = int(sys.argv[1]), sys.argv[2]
+if sys.stdin.buffer.read() != b'done':
+    try: os.killpg(pgid, signal.SIGKILL)
+    except OSError: pass
+    time.sleep(0.3)
+    for d, dirs, _ in os.walk(work):
+        for n in dirs:
+            try: os.chmod(os.path.join(d, n), 0o700)
+            except OSError: pass
+    shutil.rmtree(work, ignore_errors=True)
+"""
+    _guard = None
+
+    def _tie_children_to_us(work=None):
+        global _guard
+        try:
+            os.setpgid(0, 0)
+        except OSError:
+            pass                                            # a session leader is a group leader already
+        if work:
+            _guard = subprocess.Popen([sys.executable, '-I', '-c', GUARD, str(os.getpgrp()), work], stdin=subprocess.PIPE,
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+    def _release_guard():
+        if _guard:
+            try:
+                _guard.stdin.write(b'done')
+                _guard.stdin.close()
+                _guard.wait(timeout=5)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
 
     def _preexec():
         import ctypes
-        os.setsid()                                         # own process group: the compiler starts helpers of its own
         ctypes.CDLL(None).prctl(1, signal.SIGKILL)          # PR_SET_PDEATHSIG: die with the parent
 
 
@@ -220,11 +307,12 @@ def run(cmd, cwd, env, log, stdout_path=None):
             out.close()
     with _children_lock:
         _children.add(p)
+    t0 = time.monotonic()
     text = p.communicate()[1 if stdout_path else 0] or b''
     with _children_lock:
         _children.discard(p)
     with log_lock:
-        log.write('$ ' + ' '.join(cmd) + '\n' + text.decode('utf-8', 'replace'))
+        log.write('$ ' + ' '.join(cmd) + '\n' + text.decode('utf-8', 'replace') + '  [%.1f s, at %.1f s]\n' % (time.monotonic() - t0, time.monotonic() - T_START))
         log.flush()
     if p.returncode != 0:
         tail = text.decode('utf-8', 'replace').strip().splitlines()
@@ -237,32 +325,54 @@ log_lock = threading.Lock()
 def _on_signal(signum, frame):
     global _cancelled
     _cancelled = True
-    with _children_lock:
-        for p in list(_children):
-            try:
-                if WINDOWS:
+    if WINDOWS:
+        with _children_lock:
+            for p in list(_children):
+                try:
                     p.kill()                                # (the job object takes the rest down)
-                else:
-                    os.killpg(p.pid, signal.SIGKILL)
-            except OSError:
-                pass
+                except OSError:
+                    pass
+    else:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)       # the whole group, compilers' helpers included; not us
+        try:
+            os.killpg(os.getpgrp(), signal.SIGTERM)
+        except OSError:
+            pass
     raise KeyboardInterrupt
 
 
 def build(iso, out, jobs):
     os.makedirs(out, exist_ok=True)
     work = os.path.join(out, '.build')
+    remove_stale_work(out)
+    os.makedirs(os.path.join(work, 'gen'))
+    with open(os.path.join(work, 'pid'), 'w') as f:
+        f.write(str(os.getpid()))
+    _tie_children_to_us(work)
+    signal.signal(signal.SIGTERM, _on_signal)
+    signal.signal(signal.SIGINT, _on_signal)
     try:
         return build_in(iso, out, jobs, work)
     except BaseException:
-        remove_tree(work)        # nothing made from the game is left behind
+        time.sleep(0.2)                                    # compilers that were just told to stop let go of their files
+        remove_tree(work)                                  # nothing made from the game is left behind
         raise
+    finally:
+        _release_guard()
+
+
+# Progress is reported out of 100 and follows time, not the number of steps: 0-1 the disc, 1-6 reading the
+# game (recompiler, VU1 translation), 6-94 compiling, 94-99 linking and installing. Compile times as measured
+# on the development machine (seconds, with all its 24 threads busy); only their proportions matter, the
+# actual speed of this machine is learnt from the files as they finish.
+NOMINAL_S = {'rt/vu.c': 28.0,          # with the translated VU1 program: one very large function
+             'rt/interp.c': 2.0, 'rt/support.c': 0.3, 'gen/fn_table.c': 1.0}
+NOMINAL_S_PER_BYTE = 8.85e-6           # the recompiled code, by source size
+WARM_UP = '(warm-up link)'
 
 
 def build_in(iso, out, jobs, work):
     game = os.path.join(out, 'ror-game' + EXE)
-    remove_tree(work)
-    os.makedirs(os.path.join(work, 'gen'))
     log = open(os.path.join(out, 'build.log'), 'w', encoding='utf-8')
     log.write('ror-build %s, kit %s, %s, %d jobs\n' % (kit_text('VERSION'), kit_text('KITHASH')[:16], sys.platform, jobs))
 
@@ -273,13 +383,15 @@ def build_in(iso, out, jobs, work):
     env['PYTHONDONTWRITEBYTECODE'] = '1'
     zig = os.path.join(KIT, 'zig', 'zig' + EXE)
     python = sys.executable
+    shown = [-1, '']
 
-    total = [5]                                        # disc, recompile, VU1, (files), link, install: fixed once the files are known
+    def progress(pct, text):
+        pct = max(int(pct), shown[0])                      # never backwards
+        if (pct, text) != (shown[0], shown[1]):
+            shown[0], shown[1] = pct, text
+            say('PROGRESS %d 100 %s' % (pct, text))
 
-    def progress(done, text):
-        say('PROGRESS %d %d %s' % (done, total[0], text))
-
-    progress(0, 'Reading the disc image')
+    progress(0, 'Checking your disc')
     elf = read_elf_from_iso(iso)
     ident = identity(iso, elf)
     if ident['elf_sha256'] != ELF_SHA256:
@@ -287,10 +399,9 @@ def build_in(iso, out, jobs, work):
     with open(os.path.join(work, GAME_ELF), 'wb') as f:
         f.write(elf)
 
-    progress(1, 'Recompiling the game code')
+    progress(1, 'Reading the game')
     run([python, '-B', os.path.join(KIT, 'recomp', 'gen.py'), GAME_ELF, 'gen'], work, env, log)
-
-    progress(2, 'Translating the VU1 program')
+    progress(5, 'Reading the game')
     run([python, '-B', os.path.join(KIT, 'recomp', 'vu1extract.py'), GAME_ELF, 'vu1_micro.bin'], work, env, log)
     run([os.path.join(KIT, 'vugen' + EXE), 'gen', 'vu1_micro.bin'], work, env, log,
         stdout_path=os.path.join(work, 'gen', 'vu1_fast_gen.inc'))
@@ -299,30 +410,71 @@ def build_in(iso, out, jobs, work):
     # compiler sees is relative to the work folder.
     shutil.copytree(os.path.join(KIT, 'rt', 'src'), os.path.join(work, 'rt'))
     os.makedirs(os.path.join(work, 'obj'))
-    sources = sorted('gen/' + n for n in os.listdir(os.path.join(work, 'gen')) if n.endswith('.c'))
-    sources += sorted('rt/' + n for n in os.listdir(os.path.join(work, 'rt')) if n.endswith('.c'))
-    total[0] = 5 + len(sources)
-    done = [3]
+    sources = ['gen/' + n for n in os.listdir(os.path.join(work, 'gen')) if n.endswith('.c')]
+    sources += ['rt/' + n for n in os.listdir(os.path.join(work, 'rt')) if n.endswith('.c')]
+    nominal = {s: NOMINAL_S.get(s) or os.path.getsize(os.path.join(work, s)) * NOMINAL_S_PER_BYTE for s in sources}
+    sources.sort(key=lambda s: (-nominal[s], s))           # the longest first: nothing big is left for the end
+    workers = max(1, min(jobs, len(sources)))
+    t_compile = time.monotonic()
+    st = {'n': 0, 'nominal_done': 0.0, 'actual_done': 0.0, 'finished': False}
+
+    def compile_progress():
+        # this machine against the reference, once a fifth of the work says something about it
+        speed = 1.0
+        if st['nominal_done'] >= 0.2 * sum(nominal.values()):
+            speed = min(max(st['actual_done'] / st['nominal_done'], 0.4), 4.0)
+        # as long as the longest file, or as all of them shared among the workers, whichever is more
+        # (the longest file is scaled less: the measured speed includes how much the other compilers slow each
+        # other down, which touches a single long compile much less)
+        expect = max(max(nominal.values()) * speed ** 0.5, sum(nominal.values()) * speed / workers, 1.0)
+        frac = min((time.monotonic() - t_compile) / expect, 0.99)
+        progress(6 + 88 * frac, 'Building the game (%d of %d)' % (st['n'], len(sources)))
+
+    def ticker():
+        while not st['finished']:
+            with log_lock:
+                if not st['finished']:
+                    compile_progress()
+            try:
+                os.utime(os.path.join(work, 'pid'))         # "this build is alive" (remove_stale_work)
+            except OSError:
+                pass
+            time.sleep(0.5)
 
     def compile_one(src):
+        if src == WARM_UP:
+            # The first link with a target makes the compiler build its C library and support routines, which
+            # takes it a quarter of a minute on Windows. Linking an empty program now, beside the compiling,
+            # gets that done (it is cached in the work folder) before the real link needs it.
+            with open(os.path.join(work, 'warm.c'), 'w') as f:
+                f.write('int main(void) { return 0; }\n')
+            run([zig, 'cc'] + TARGET + ['-o', 'warm' + EXE, 'warm.c'] + LINK_LIBS + ['-s'], work, env, log)     # the real link's options: they are part of the cache key
+            return None
         obj = 'obj/' + os.path.basename(src)[:-2] + '.o'
+        t0 = time.monotonic()
         run([zig, 'cc'] + CFLAGS + ['-Irt', '-Igen', '-c', src, '-o', obj], work, env, log)
         with log_lock:
-            done[0] += 1
-            progress(done[0], 'Compiling ' + os.path.basename(src))
+            st['n'] += 1
+            st['nominal_done'] += nominal[src]
+            st['actual_done'] += time.monotonic() - t0
+            compile_progress()
         return obj
 
-    progress(3, 'Compiling (%d files, %d at a time)' % (len(sources), jobs))
-    with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
-        futures = [pool.submit(compile_one, s) for s in sources]
-        try:
-            objs = [f.result() for f in futures]
-        except BaseException:
-            for f in futures:
-                f.cancel()
-            raise
+    threading.Thread(target=ticker, daemon=True).start()
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(compile_one, s) for s in [WARM_UP] + sources]
+            try:
+                objs = sorted(o for o in [f.result() for f in futures] if o)
+            except BaseException:
+                for f in futures:
+                    f.cancel()
+                raise
+    finally:
+        with log_lock:
+            st['finished'] = True
 
-    progress(done[0], 'Linking')
+    progress(95, 'Finishing')
     libdir = os.path.join(KIT, 'rt', 'lib')
     prebuilt = sorted(os.path.join(libdir, n) for n in os.listdir(libdir) if n.endswith(('.o', '.a')))
     with open(os.path.join(work, 'link.rsp'), 'w', encoding='utf-8') as f:      # a response file: the command line stays short
@@ -330,7 +482,7 @@ def build_in(iso, out, jobs, work):
             f.write('"%s"\n' % p.replace('\\', '/'))
     run([zig, 'cc'] + TARGET + ['-o', 'ror-game' + EXE, '@link.rsp'] + LINK_LIBS + ['-s'], work, env, log)
 
-    progress(done[0] + 1, 'Installing')
+    progress(99, 'Finishing')
     with open(os.path.join(work, 'ror-game.stamp'), 'w', encoding='utf-8') as f:
         json.dump(ident, f)
     stamp = os.path.join(out, 'ror-game.stamp')
@@ -360,9 +512,6 @@ def main():
     try:
         if a.check:
             return check(iso, out)
-        _tie_children_to_us()
-        signal.signal(signal.SIGTERM, _on_signal)
-        signal.signal(signal.SIGINT, _on_signal)
         jobs = a.jobs if a.jobs > 0 else (os.cpu_count() or 2)
         game = build(iso, out, jobs)
         say('DONE ' + game)
