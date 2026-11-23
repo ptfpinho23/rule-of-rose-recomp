@@ -7,12 +7,11 @@
 </p>
 
 <p align="center">
-  <a href="#project-status">Status</a> ·
   <a href="#download-and-play">Download and play</a> ·
   <a href="#features">Features</a> ·
+  <a href="#whats-next">What's next</a> ·
   <a href="#how-to-build">How to build</a> ·
   <a href="#how-it-works">How it works</a> ·
-  <a href="#want-to-help">Want to help?</a> ·
   <a href="#credits">Credits</a> ·
   <a href="#license">License</a>
 </p>
@@ -52,26 +51,6 @@ Your saves are kept in the `saves` folder next to the launcher. The keyboard
 and gamepad layout is on the launcher's Controls screen and in
 [docs/CONTROLS.md](docs/CONTROLS.md).
 
-## Project status
-
-**Early, but it starts and plays.** The game runs from the first screen into
-the first area, with sound and movies. Nothing beyond that has been played
-yet, so expect problems further in.
-
-| | Status |
-|---|---|
-| Start-up, intro movies, title screen, New Game opening | Works |
-| First area of the game | Works |
-| Later areas, combat, saving at a save point | Not tested yet |
-| Sound | Works |
-| Windows 10/11 and Linux | Works |
-| High-resolution picture and smooth motion | Works, tested on one graphics card (RTX 3090) |
-| Widescreen | Experimental |
-| Xbox and PlayStation controllers | Included, not yet tried with a real controller |
-
-The full list of what is missing or unverified is in
-[docs/STATUS.md](docs/STATUS.md).
-
 ## Features
 
 - **Sharper picture.** Play at the original PS2 resolution or at up to 8 times
@@ -85,6 +64,23 @@ The full list of what is missing or unverified is in
   how strong the game's film grain is.
 - **Controllers.** Keyboard, Xbox pads, DualShock 4 and DualSense.
 - **One launcher** for all of it, in window or fullscreen.
+
+## What's next
+
+- **Playing further.** Only the opening and the first area have been played;
+  later areas, combat and saving at a save point come next.
+- **DLSS.** NVIDIA's upscaler as another choice beside FSR 1.0 and FSR 3.1.
+- **More graphics cards.** The high-resolution renderer has been tried on one
+  card so far (RTX 3090); AMD and Intel cards and Linux Vulkan drivers are
+  still to be checked.
+- **Controllers.** Xbox and PlayStation pads are supported but have not been
+  tried with real hardware yet.
+- **Sound.** Reverb, and a comparison with a real console.
+- **Widescreen** beyond the first area.
+
+What is missing or unverified today is listed in
+[docs/STATUS.md](docs/STATUS.md). Issues and pull requests are welcome; please
+do not attach or link anything from the game itself.
 
 ## How to build
 
@@ -147,17 +143,6 @@ Run headless, the game is deterministic. Every change is checked by a scripted
 run from boot into gameplay that must produce the same frames and the same
 audio, byte for byte, on Linux and on Windows. The recipe and the notes on the
 game's internals are in [recomp/NOTES.md](recomp/NOTES.md).
-
-## Want to help?
-
-- Play past the first area and report what breaks.
-- Try a real controller on Windows or Linux.
-- Try the GPU renderer on AMD or Intel graphics, or on Linux with a real
-  Vulkan driver.
-- Compare the sound with a real console.
-
-Issues and pull requests are welcome. Please do not attach or link anything
-from the game itself.
 
 ## Credits
 
