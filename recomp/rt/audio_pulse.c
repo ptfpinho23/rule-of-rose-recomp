@@ -1,8 +1,9 @@
 /* audio_pulse.c — sound device for Linux (plat.h adev_*): PulseAudio.
  *
  * There is no libpulse on this system, so the PulseAudio "native" protocol
- * is spoken directly over the server's unix socket ($PULSE_SERVER, WSLg:
- * unix:/mnt/wslg/PulseServer). Only the four things needed are implemented:
+ * is spoken directly over the server's unix socket ($PULSE_SERVER, else
+ * $XDG_RUNTIME_DIR/pulse/native, else one fixed path some set-ups use).
+ * Only the four things needed are implemented:
  * AUTH, SET_CLIENT_NAME, CREATE_PLAYBACK_STREAM (protocol version 12
  * layouts) and stream data packets; from the server only REQUEST is read.
  * The socket is non-blocking after the handshake: audio never stalls the

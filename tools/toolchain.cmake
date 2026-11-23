@@ -1,5 +1,5 @@
 # toolchain.cmake — self-contained Linux build of the Rule of Rose launcher.
-# The host has no system C++ toolchain (no-root WSL2). Everything comes from
+# For a Linux host without a system C++ toolchain and without root. Everything comes from
 # user-space downloads, all in durable locations (nothing under /tmp):
 #   ~/.local/opt/clang               clang 18.1.8 + lld + libc++ (headers & runtime)
 #   ~/.local/opt/qt6/6.8.2/gcc_64    Qt 6.8.2

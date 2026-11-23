@@ -222,8 +222,8 @@ QString shapeName(const QSize &z)
 }
 
 // The renderer a fresh install starts with, and how the GPU choice is named.
-// (Windows machines nearly always have a Vulkan GPU driver; under Linux -
-// WSL in particular - Vulkan is often a slow CPU implementation. Without
+// (Windows machines nearly always have a Vulkan GPU driver; a Linux system
+// without one falls back to a slow CPU implementation of Vulkan. Without
 // Vulkan the game uses its software renderer by itself.)
 #ifdef Q_OS_WIN
 const char *const kDefaultRenderer = "gpu";

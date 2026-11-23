@@ -57,8 +57,8 @@ static void preloadXcbRuntime()
 int main(int argc, char **argv)
 {
 #ifdef Q_OS_LINUX
-    // Only the xcb (X11) platform plugin is shipped; under WSLg/XWayland
-    // that is the one that works. An explicit QT_QPA_PLATFORM still wins.
+    // Only the xcb (X11) platform plugin is shipped; it also works under
+    // XWayland. An explicit QT_QPA_PLATFORM still wins.
     if (qEnvironmentVariableIsEmpty("QT_QPA_PLATFORM"))
         qputenv("QT_QPA_PLATFORM", "xcb");
     if (qgetenv("QT_QPA_PLATFORM").startsWith("xcb"))

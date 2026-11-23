@@ -95,8 +95,7 @@ never committed or published: the build makes it from your disc image, and
 the released launcher does the same on the player's machine (that is what
 PREPARE GAME runs).
 
-Builds run on Linux (WSL2 is fine) with a user-space toolchain, no root
-needed. The Windows build is cross-compiled from the same machine.
+Builds run on Linux with a user-space toolchain, no root needed. The Windows build is cross-compiled from the same machine.
 
 | You need | Where |
 |---|---|

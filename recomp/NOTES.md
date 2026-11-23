@@ -184,8 +184,8 @@ What differs on Windows:
 - Dragging the window blocks the game while the mouse button is held (the
   window is pumped from the game thread).
 
-Testing from WSL (interop): copy `ror.exe` to a folder on a Windows drive and
-run it there; the ISO can be passed as `\\wsl.localhost\<distro>\...`.
+Testing the Windows build: copy `ror.exe` to a folder on a Windows drive and
+run it there; the ISO can be passed as a path or a network path.
 Verified 2026-11-22: the NOTES test script (no card, `--no-window --no-sync
 --frames 16000 --shots 1000`) gives the same md5 for all 16 screenshots and
 for the `ROR_WAV` file as the Linux build of the same sources; no libm
@@ -275,7 +275,7 @@ gpu` is given (see "In the game" below).
   sha256 f38a653b...bcf5). gs_hw.c includes the headers by relative path and
   needs `-I tools/vulkan/Vulkan-Headers-1.3.290/include` (vk_video).
 - Tools: `HW=1 recomp/tools/gsreplay.sh CAP -hw N [-o out.raw]` (lavapipe in
-  WSL), `recomp/tools/gsreplay-win.sh` -> `build/gsreplay/gsreplay-hw.exe`
+  Linux), `recomp/tools/gsreplay-win.sh` -> `build/gsreplay/gsreplay-hw.exe`
   (run from a Windows folder for the real GPU), `recomp/tools/gscmp.sh REF OUT
   [-scale N] [-png DIR FRAME...]`, `recomp/tools/vkprobe.c`.
 - Env: `ROR_GS_HW=N` (set by `-hw N`), `ROR_VK_DEVICE=i`, `ROR_HW_SHBLEND=1`
@@ -522,7 +522,7 @@ gap in the GPU renderer section above.
   t = 1 replay differs in 0-11 pixels per frame, 99.9-100% interpolated.
   The storybook crease itself was not looked at again.
 - X11: refresh rate through XRandR, loaded with dlopen (falls back to 60).
-  On WSLg it reports 60, which cannot be told apart from the fallback.
+  On the test system it reports 60, which cannot be told apart from the fallback.
 - Descriptor pool access is under a mutex (two threads create images).
 
 ## Gamepad (2026-11-22)
@@ -597,7 +597,7 @@ an entry holds until the next. While it is set no real device is read.
 `--script` string (optionally turning D-pad directions into left-stick tilt);
 The result is passed in `ROR_PAD_FAKE` in place of `--script`.
 
-### Verification (no physical controller was available: none in WSL, where
+### Verification (no physical controller was available: none on the Linux test system, where
 /dev/input does not exist and /dev/uinput is root-only, and none on the
 Windows side)
 - Standard script to 16000, `--shots 1000`, `ROR_WAV`: 16 PNG + WAV md5s
@@ -611,7 +611,7 @@ Windows side)
   keyboard-script run, Linux and Windows (full tilt = D-pad, as the game
   code says). With 60 % tilt the frames differ from 21500 on: the character
   walks more slowly along the same path (looked at 21800, 22200).
-- Window: Linux (WSLg) `--frames 300` logs `no gamepad found (evdev:
+- Window: Linux `--frames 300` logs `no gamepad found (evdev:
   /dev/input does not exist)`; with `ROR_PAD_FAKE` in a window the frames
   100..1400 equal the headless ones. Windows `ror.exe --frames 300` in a real
   window: exit 0, `no gamepad found (XInput, xinput1_4.dll)`. `--pad off`

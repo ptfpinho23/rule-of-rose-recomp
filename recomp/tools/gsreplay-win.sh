@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # gsreplay-win.sh — build the replay tool with the Vulkan renderer for Windows
-# (build/gsreplay/gsreplay-hw.exe) with tools/llvm-mingw. Run it through WSL
-# interop from a Windows folder to use the real GPU.
+# (build/gsreplay/gsreplay-hw.exe) with tools/llvm-mingw. Run it on Windows, from a
+# Windows folder, to use the real GPU.
 set -euo pipefail
 R="$(cd "$(dirname "$0")/../.." && pwd)"
 CC=$R/tools/llvm-mingw/bin/x86_64-w64-mingw32-clang
