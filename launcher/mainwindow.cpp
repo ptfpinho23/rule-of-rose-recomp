@@ -4,6 +4,7 @@
 
 #include <QCloseEvent>
 #include <QCoreApplication>
+#include <QDesktopServices>
 #include <QDir>
 #include <QDragEnterEvent>
 #include <QDropEvent>
@@ -19,6 +20,7 @@
 #include <QProcessEnvironment>
 #include <QScreen>
 #include <QSettings>
+#include <QStandardPaths>
 #include <QTimer>
 #include <QUrl>
 #include <QWindow>
@@ -144,6 +146,7 @@ MainWindow::MainWindow(const QString &isoOverride, QWidget *parent) : QWidget(pa
     // --- overlays -------------------------------------------------------------
     m_options = new Overlay("Options", buildOptions(), this);
     m_controls = new Overlay("Controls", buildControls(), this);
+    m_prepare = new Overlay("Preparing the game", buildPrepare(), this);
     connect(optionsLink, &QAbstractButton::clicked, m_options, &Overlay::open);
     connect(controlsLink, &QAbstractButton::clicked, m_controls, &Overlay::open);
 
@@ -643,7 +646,8 @@ void MainWindow::showEvent(QShowEvent *e)
 
 Overlay *MainWindow::openOverlay() const
 {
-    return m_options->isOpen() ? m_options : m_controls->isOpen() ? m_controls : nullptr;
+    return m_options->isOpen() ? m_options : m_controls->isOpen() ? m_controls
+           : m_prepare->isOpen() ? m_prepare : nullptr;
 }
 
 void MainWindow::showPanel(const QString &name)
@@ -793,8 +797,9 @@ void MainWindow::setDisc(const QString &path, bool remember)
 
     if (m_game)
         return; // keep the "running" status
-    m_play->setEnabled(m_disc.ok());
-    setStatus(Info, {});
+    if (m_build)                 // another disc was chosen mid-way: that build is void
+        cancelPrepare();
+    refreshGameState();
 }
 
 void MainWindow::browseDisc()
@@ -806,6 +811,286 @@ void MainWindow::browseDisc()
         "Disc images (*.iso *.ISO);;All files (*)");
     if (!f.isEmpty())
         setDisc(f, true);
+}
+
+// ------------------------------------------------- preparing the game ----
+namespace {
+QString g_gameDir;
+#ifdef Q_OS_WIN
+const char *const kBuilder = "ror-build.exe";
+#else
+const char *const kBuilder = "ror-build";
+#endif
+}
+
+void MainWindow::setGameDir(const QString &dir) { g_gameDir = dir; }
+
+QString MainWindow::gameDir()
+{
+    if (g_gameDir.isEmpty())
+        g_gameDir = QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation) + "/game";
+    return g_gameDir;
+}
+
+QString MainWindow::builderPath() const { return QDir(appDir()).filePath(kBuilder); }
+QString MainWindow::builtGamePath() const { return QDir(gameDir()).filePath(kPackagedGame); }
+
+// Decide where the game comes from, and whether it has to be prepared.
+void MainWindow::refreshGameState()
+{
+    if (m_build)
+        return;
+    if (!findGameBinary().isEmpty()) {
+        m_gameState = Bundled;
+    } else if (!QFileInfo(builderPath()).isFile()) {
+        m_gameState = NoBuilder;
+    } else if (!m_disc.ok()) {
+        m_gameState = NeedsBuild;          // unknown until there is a disc; PLAY is off anyway
+    } else {
+        // "--check" answers at once: 0 = the game in gameDir() is the one
+        // for this disc image and this package, anything else = prepare it.
+        QProcess check;
+        check.setProgram(builderPath());
+        check.setArguments({"--check", "--iso", QDir::toNativeSeparators(m_disc.path), "--out",
+                            QDir::toNativeSeparators(gameDir())});
+        check.setStandardOutputFile(QProcess::nullDevice());
+        check.setStandardErrorFile(QProcess::nullDevice());
+#ifdef Q_OS_WIN
+        check.setCreateProcessArgumentsModifier(
+            [](QProcess::CreateProcessArguments *a) { a->flags |= CREATE_NO_WINDOW; });
+#endif
+        check.start();
+        const bool finished = check.waitForFinished(8000);
+        if (!finished)
+            check.kill(), check.waitForFinished(2000);
+        const bool upToDate = finished && check.exitStatus() == QProcess::NormalExit &&
+                              check.exitCode() == 0 && QFileInfo(builtGamePath()).isFile();
+        m_gameState = upToDate ? Ready : NeedsBuild;
+    }
+    updatePlayButton();
+    if (m_game)
+        return;                             // keep the "running" status
+    if (m_gameState == NoBuilder)
+        setStatus(Bad, "This package is incomplete: the game builder is missing.",
+                  QString("Expected %1 next to the launcher, in %2")
+                      .arg(kBuilder, QDir::toNativeSeparators(appDir())));
+    else if (m_gameState == NeedsBuild && m_disc.ok())
+        setStatus(Info, "The game has to be prepared for this PC once, from your disc.",
+                  "Press PREPARE GAME; it takes a few minutes");
+    else
+        setStatus(Info, {});
+}
+
+void MainWindow::updatePlayButton()
+{
+    if (m_game) {
+        m_play->setEnabled(false);
+        return;
+    }
+    QString text = "PLAY";
+    bool on = m_disc.ok();
+    if (m_build) {
+        text = QString("PREPARING  %1%").arg(m_buildPercent);
+        on = true;
+    } else if (m_gameState == NoBuilder) {
+        on = false;
+    } else if (m_gameState == NeedsBuild && m_disc.ok()) {
+        text = "PREPARE GAME";
+    }
+    m_play->setText(text);
+    m_play->setEnabled(on);
+    m_play->update();
+}
+
+QWidget *MainWindow::buildPrepare()
+{
+    const int w = 520;
+    auto *root = new QWidget;
+    root->resize(w, 168);
+    m_prepText = makeLabel(root, serif(18, Regular, 0.2), chalk);
+    m_prepText->setWordWrap(true);
+    m_prepText->setAlignment(Qt::AlignLeft | Qt::AlignTop);
+    m_prepText->setGeometry(0, 0, w, 54);
+    m_prepBar = new ProgressLine(root);
+    m_prepBar->setGeometry(0, 66, w, 9);
+    m_prepStep = makeLabel(root, serif(15, Regular, 0.2), chalkDim);
+    m_prepStep->setGeometry(0, 84, w - 70, 22);
+    m_prepTime = makeLabel(root, serif(15, SemiBold, 0.3), chalkDim);
+    m_prepTime->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    m_prepTime->setGeometry(w - 70, 84, 70, 22);
+
+    m_prepCancel = new LinkButton("Cancel", LinkButton::Inline, root);
+    m_prepCancel->move(w - m_prepCancel->width(), 132);
+    connect(m_prepCancel, &QAbstractButton::clicked, this, &MainWindow::cancelPrepare);
+    m_prepRetry = new LinkButton("Try again", LinkButton::Inline, root);
+    m_prepRetry->move(w - m_prepRetry->width(), 132);
+    connect(m_prepRetry, &QAbstractButton::clicked, this, &MainWindow::startPrepare);
+    m_prepLog = new LinkButton("Open log", LinkButton::Inline, root);
+    m_prepLog->move(m_prepRetry->x() - 26 - m_prepLog->width(), 132);
+    connect(m_prepLog, &QAbstractButton::clicked, this, [this]() {
+        if (!m_testMode)
+            QDesktopServices::openUrl(QUrl::fromLocalFile(QDir(gameDir()).filePath("build.log")));
+    });
+
+    m_buildTick = new QTimer(this);
+    m_buildTick->setInterval(500);
+    connect(m_buildTick, &QTimer::timeout, this, [this]() {
+        const qint64 secs = m_buildClock.elapsed() / 1000;
+        m_prepTime->setText(QString("%1:%2").arg(secs / 60).arg(secs % 60, 2, 10, QChar('0')));
+    });
+    showPrepareState(0);
+    return root;
+}
+
+void MainWindow::showPrepareState(int state)
+{
+    const bool failed = state == 1;
+    m_prepCancel->setVisible(!failed);
+    m_prepRetry->setVisible(failed);
+    m_prepLog->setVisible(failed);
+    m_prepBar->setFailed(failed);
+    m_prepTime->setVisible(!failed);
+    setColor(m_prepText, failed ? roseLight : chalk);
+    if (!failed)
+        m_prepText->setText("The game is being built for your PC from your disc. "
+                            "This is done once and takes a few minutes.");
+}
+
+void MainWindow::startPrepare()
+{
+    if (m_build || m_game)
+        return;
+    if (m_gameState != NeedsBuild) {     // (also reached from "Try again" and the test hook)
+        refreshGameState();
+        if (m_gameState != NeedsBuild) {
+            emit prepareFinished(m_gameState == Ready || m_gameState == Bundled);
+            return;
+        }
+    }
+    QDir().mkpath(gameDir());
+    m_buildOut.clear();
+    m_buildError.clear();
+    m_buildDone.clear();
+    m_buildPercent = 0;
+    m_prepBar->setValue(0);
+    m_prepTime->setText("0:00");
+    setElided(m_prepStep, "Starting…");
+    showPrepareState(0);
+
+    m_build = new QProcess(this);
+    m_build->setProgram(builderPath());
+    m_build->setArguments({"--iso", QDir::toNativeSeparators(m_disc.path), "--out",
+                           QDir::toNativeSeparators(gameDir())});
+    m_build->setWorkingDirectory(appDir());
+    m_build->setStandardErrorFile(QProcess::nullDevice());     // the builder keeps its own log
+#ifdef Q_OS_WIN
+    m_build->setCreateProcessArgumentsModifier(
+        [](QProcess::CreateProcessArguments *a) { a->flags |= CREATE_NO_WINDOW; });
+#endif
+    connect(m_build, &QProcess::readyReadStandardOutput, this, &MainWindow::onBuilderOutput);
+    connect(m_build, &QProcess::finished, this, &MainWindow::onBuilderFinished);
+    connect(m_build, &QProcess::errorOccurred, this, [this](QProcess::ProcessError e) {
+        if (e == QProcess::FailedToStart)
+            onBuilderFinished(-1, QProcess::CrashExit);
+    });
+    m_buildClock.start();
+    m_buildTick->start();
+    note("prepare: " + builderPath() + " --iso " + m_disc.path + " --out " + gameDir());
+    m_build->start();
+    updatePlayButton();
+    setStatus(Info, "Preparing the game…");
+    m_prepare->open();
+}
+
+// The builder talks in lines: "PROGRESS <done> <total> <text>", then
+// "DONE <game program>" or "ERROR <what went wrong>".
+void MainWindow::onBuilderOutput()
+{
+    if (!m_build)
+        return;
+    m_buildOut += m_build->readAllStandardOutput();
+    int nl;
+    while ((nl = m_buildOut.indexOf('\n')) >= 0) {
+        const QString line = QString::fromLocal8Bit(m_buildOut.left(nl)).trimmed();
+        m_buildOut.remove(0, nl + 1);
+        if (line.startsWith("PROGRESS ")) {
+            const int done = line.section(' ', 1, 1).toInt(), total = line.section(' ', 2, 2).toInt();
+            if (total > 0) {
+                m_buildPercent = qBound(0, done * 100 / total, 100);
+                m_prepBar->setValue(qreal(done) / total);
+            }
+            setElided(m_prepStep, line.section(' ', 3));
+            updatePlayButton();
+        } else if (line.startsWith("DONE ")) {
+            m_buildDone = line.mid(5).trimmed();
+        } else if (line.startsWith("ERROR ")) {
+            m_buildError = line.mid(6).trimmed();
+        }
+    }
+}
+
+void MainWindow::onBuilderFinished(int code, QProcess::ExitStatus st)
+{
+    if (!m_build)
+        return;
+    onBuilderOutput();
+    const QString failedToStart = code == -1 && st == QProcess::CrashExit ? m_build->errorString() : QString();
+    const bool ok = st == QProcess::NormalExit && code == 0 && QFileInfo(builtGamePath()).isFile();
+    endBuild();
+    if (ok) {
+        m_gameState = Ready;
+        updatePlayButton();
+        m_prepare->close();
+        setStatus(Info, "The game is ready.");
+        note("prepare: done -> " + builtGamePath());
+        emit prepareFinished(true);
+        if (m_playAfterBuild) {
+            m_playAfterBuild = false;
+            play();
+        }
+        return;
+    }
+    m_playAfterBuild = false;
+    QString why = m_buildError;
+    if (why.isEmpty())
+        why = !failedToStart.isEmpty() ? failedToStart
+              : st != QProcess::NormalExit ? QString("The builder stopped unexpectedly.")
+              : QString("The builder ended without a game (code %1).").arg(code);
+    m_gameState = NeedsBuild;
+    updatePlayButton();
+    showPrepareState(1);
+    m_prepText->setText("The game could not be prepared.");
+    setElided(m_prepStep, why);
+    setStatus(Bad, "The game could not be prepared.",
+              why + "  ·  Log: " + QDir::toNativeSeparators(QDir(gameDir()).filePath("build.log")));
+    m_prepare->open();
+    emit prepareFinished(false);
+}
+
+void MainWindow::cancelPrepare()
+{
+    if (!m_build)
+        return;
+    m_build->disconnect(this);
+    m_build->kill();                    // our own child, by its handle
+    m_build->waitForFinished(5000);
+    endBuild();
+    m_playAfterBuild = false;
+    m_prepare->close();
+    refreshGameState();
+    setStatus(Info, "Preparing the game was cancelled.");
+    note("prepare: cancelled");
+    emit prepareFinished(false);
+}
+
+void MainWindow::endBuild()
+{
+    m_buildTick->stop();
+    if (m_build) {
+        m_build->disconnect(this);
+        m_build->deleteLater();
+        m_build = nullptr;
+    }
 }
 
 QString MainWindow::findGameBinary(QString *workDir)
@@ -837,6 +1122,10 @@ void MainWindow::play()
 {
     if (m_game)
         return;
+    if (m_build) {               // the button reads "PREPARING": show the panel again
+        m_prepare->open();
+        return;
+    }
     // The image may have been moved or replaced since it was checked.
     m_disc = checkDisc(m_disc.path);
     if (!m_disc.ok()) {
@@ -844,8 +1133,36 @@ void MainWindow::play()
         emit gameFinished(false);
         return;
     }
+    // Never start a game that does not belong to this disc image and this
+    // package: ask the builder again (it answers at once).
+    const bool saidPlay = m_gameState == Ready;
+    refreshGameState();
+    if (m_gameState == NoBuilder) {
+        emit gameFinished(false);
+        return;
+    }
+    if (m_gameState == NeedsBuild) {
+        m_playAfterBuild = saidPlay;      // PLAY was pressed: go on to the game afterwards
+        if (m_dryRun) {
+            printf("[dry-run] action: prepare the game first\n[dry-run] builder: %s\n",
+                   builderPath().toLocal8Bit().constData());
+            for (const QString &a : QStringList{"--iso", QDir::toNativeSeparators(m_disc.path),
+                                                "--out", QDir::toNativeSeparators(gameDir())})
+                printf("[dry-run] builder arg: %s\n", a.toLocal8Bit().constData());
+            printf("[dry-run] then play: %s\n", builtGamePath().toLocal8Bit().constData());
+            fflush(stdout);
+            emit gameFinished(true);
+            return;
+        }
+        startPrepare();
+        return;
+    }
     QString workDir;
-    const QString game = findGameBinary(&workDir);
+    QString game = findGameBinary(&workDir);
+    if (m_gameState == Ready) {
+        game = builtGamePath();
+        workDir = appDir();
+    }
     if (game.isEmpty()) {
         gameEnded(false, "The game program is missing.",
                   QString("Expected %1 next to the launcher, in %2")
@@ -875,6 +1192,11 @@ void MainWindow::play()
     if (!m_sound->isChecked())
         env.insert("ROR_NOAUDIO", "1");
 
+    // A game built on this PC lives in the user's data folder; it finds the
+    // files that stay with the launcher through this.
+    if (m_gameState == Ready)
+        env.insert("ROR_APP_DIR", QDir::toNativeSeparators(appDir()));
+
     if (m_dryRun) {
         // --dry-run: say exactly what would be started, and stop there.
         printf("[dry-run] program: %s\n[dry-run] cwd: %s\n", game.toLocal8Bit().constData(),
@@ -884,6 +1206,8 @@ void MainWindow::play()
         for (const char *k : {"ROR_MC_DIR", "ROR_NO_MC", "ROR_NOAUDIO"})
             printf("[dry-run] env: %s=%s\n", k,
                    env.contains(k) ? env.value(k).toLocal8Bit().constData() : "(unset)");
+        if (env.contains("ROR_APP_DIR"))
+            printf("[dry-run] env: ROR_APP_DIR=%s\n", env.value("ROR_APP_DIR").toLocal8Bit().constData());
         fflush(stdout);
         gameEnded(true, {});
         return;
@@ -977,7 +1301,7 @@ void MainWindow::gameEnded(bool ok, const QString &text, const QString &detail)
         m_game->deleteLater();
         m_game = nullptr;
     }
-    m_play->setEnabled(m_disc.ok());
+    updatePlayButton();
     setStatus(ok ? Info : Bad, text, detail);
     emit gameFinished(ok);
     // The launcher window was closed while the game ran: nothing left to do.
@@ -987,6 +1311,14 @@ void MainWindow::gameEnded(bool ok, const QString &text, const QString &detail)
 
 void MainWindow::closeEvent(QCloseEvent *e)
 {
+    // Closing while the game is being prepared cancels that (the builder
+    // leaves nothing half-made behind).
+    if (m_build) {
+        m_build->disconnect(this);
+        m_build->kill();
+        m_build->waitForFinished(5000);
+        endBuild();
+    }
     // Closing the launcher must not take the running game down with it:
     // hide, and quit once the game ends.
     if (m_game) {

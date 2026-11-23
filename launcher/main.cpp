@@ -12,6 +12,10 @@
 //                                 internal=N); repeatable
 //   --extra-arg X                 append X to the game's command line (tests,
 //                                 e.g. --extra-arg --frames --extra-arg 400)
+//   --prepare                     run the "prepare the game" step now and exit
+//                                 with its result (0 ready, 1 failed/cancelled);
+//                                 --cancel-after MS cancels it; with --grab,
+//                                 the picture is taken --grab-after MS into it
 //   --dry-run                     PLAY prints the game command line and ROR_*
 //                                 environment on stdout instead of starting it
 //   --show PANEL                  with --grab: open a panel first: options,
@@ -70,8 +74,10 @@ int main(int argc, char **argv)
     {
         const QStringList a = QCoreApplication::arguments();
         const int i = a.indexOf("--settings-dir");
-        if (i > 0 && i + 1 < a.size())
+        if (i > 0 && i + 1 < a.size()) {
             QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, a[i + 1]);
+            MainWindow::setGameDir(a[i + 1] + "/game");     // a game prepared in a test stays with it
+        }
     }
 
     // Fusion as the base style everywhere (it is built in: no style plugin
@@ -82,6 +88,8 @@ int main(int argc, char **argv)
     QString iso, grabPath, showPanel;
     bool autoplay = false, exitWithGame = false, hover = false, dryRun = false;
     QStringList sets, extra;
+    bool prepare = false;
+    int cancelAfter = 0, grabAfter = 0;
     const QStringList args = QCoreApplication::arguments();
     for (int i = 1; i < args.size(); ++i) {
         const QString &a = args[i];
@@ -97,6 +105,12 @@ int main(int argc, char **argv)
             dryRun = true;
         else if (a == "--set" && i + 1 < args.size())
             sets << args[++i];
+        else if (a == "--prepare")
+            prepare = true;
+        else if (a == "--cancel-after" && i + 1 < args.size())
+            cancelAfter = args[++i].toInt();
+        else if (a == "--grab-after" && i + 1 < args.size())
+            grabAfter = args[++i].toInt();
         else if (a == "--extra-arg" && i + 1 < args.size())
             extra << args[++i];
         else if (a == "--settings-dir")
@@ -153,6 +167,10 @@ int main(int argc, char **argv)
                 app.processEvents(QEventLoop::AllEvents, 20);
         };
         pump(900);
+        if (prepare) {            // picture of the prepare panel, --grab-after ms into it
+            w.startPrepare();
+            pump(grabAfter > 0 ? grabAfter : 2500);
+        }
         if (hover)
             w.forcePlayHover();
         if (!showPanel.isEmpty())
@@ -171,6 +189,25 @@ int main(int argc, char **argv)
                 av.width(), av.height(), av.x(), av.y(), w.devicePixelRatioF(),
                 av.contains(fg) ? "yes" : "NO");
         return ok ? 0 : 1;
+    }
+
+    if (prepare) {
+        // --prepare: run the prepare step as a press on PREPARE GAME would and
+        // leave with its result (0 ready, 1 failed or cancelled).
+        QObject::connect(&w, &MainWindow::prepareFinished, &app, [](bool ok) {
+            QCoreApplication::exit(ok ? 0 : 1);
+        }, Qt::QueuedConnection);
+        auto *t = new QTimer(&w);
+        t->setSingleShot(true);
+        QObject::connect(t, &QTimer::timeout, &w, &MainWindow::startPrepare);
+        t->start(300);
+        if (cancelAfter > 0) {
+            auto *c = new QTimer(&w);
+            c->setSingleShot(true);
+            QObject::connect(c, &QTimer::timeout, &w, &MainWindow::cancelPrepare);
+            c->start(300 + cancelAfter);
+        }
+        return app.exec();
     }
 
     if (autoplay) {

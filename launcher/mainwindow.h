@@ -12,6 +12,7 @@ class LinkButton;
 class Overlay;
 class PlayButton;
 class QLabel;
+class ProgressLine;
 class QTimer;
 class Segmented;
 class Slider;
@@ -30,6 +31,16 @@ public:
     // then build/recomp/ror in a folder above it, then $ROR_GAME. workDir
     // receives the directory to start it in.
     static QString findGameBinary(QString *workDir = nullptr);
+
+    // Where a game built on this PC lives (see the "prepare" step in the
+    // .cpp). Default: <per-user application data>/game.
+    static void setGameDir(const QString &dir);
+    static QString gameDir();
+
+    // Test hooks: start the prepare step as a press on PREPARE GAME would
+    // (prepareFinished reports how it ended), and cancel it.
+    void startPrepare();
+    void cancelPrepare();
 
     // For --show / --hover on the command line (pictures of each state).
     void showPanel(const QString &name);
@@ -51,6 +62,8 @@ public slots:
 signals:
     // The game process ended (ok = clean exit) or could not be started.
     void gameFinished(bool ok);
+    // The prepare step ended: the game is ready (ok), or it failed / was cancelled.
+    void prepareFinished(bool ok);
 
 protected:
     void paintEvent(QPaintEvent *) override;
@@ -80,6 +93,22 @@ private:
     QString lastLogLine() const;
     Overlay *openOverlay() const;
 
+    // The game on this PC. With a game program beside the launcher (the full
+    // local package, developer builds) nothing here applies. Otherwise the
+    // game is made from the player's disc by the builder program beside the
+    // launcher, into gameDir(), once - and again when the disc image or the
+    // package changes.
+    enum GameState { Bundled, NoBuilder, NeedsBuild, Ready };
+    QWidget *buildPrepare();
+    QString builderPath() const;
+    QString builtGamePath() const;
+    void refreshGameState();
+    void updatePlayButton();
+    void showPrepareState(int state);          // 0 working, 1 failed
+    void onBuilderOutput();
+    void onBuilderFinished(int code, QProcess::ExitStatus st);
+    void endBuild();
+
     DiscInfo m_disc;
     QString m_logPath;
     QProcess *m_game = nullptr;
@@ -88,6 +117,19 @@ private:
     bool m_shown = false;
     bool m_dryRun = false;
     bool m_testMode = false;
+
+    GameState m_gameState = Bundled;
+    QProcess *m_build = nullptr;
+    QByteArray m_buildOut;
+    QString m_buildError, m_buildDone;
+    int m_buildPercent = 0;
+    bool m_playAfterBuild = false;
+    QElapsedTimer m_buildClock;
+    QTimer *m_buildTick = nullptr;
+    Overlay *m_prepare = nullptr;
+    QLabel *m_prepText = nullptr, *m_prepStep = nullptr, *m_prepTime = nullptr;
+    ProgressLine *m_prepBar = nullptr;
+    LinkButton *m_prepCancel = nullptr, *m_prepLog = nullptr, *m_prepRetry = nullptr;
     QStringList m_extraArgs;
 
     QLabel *m_discMain = nullptr;

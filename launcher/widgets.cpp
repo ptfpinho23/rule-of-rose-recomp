@@ -125,7 +125,10 @@ void PlayButton::paintEvent(QPaintEvent *)
     p.drawRect(r.adjusted(4, 4, -4, -4));
 
     p.setPen(label);
-    drawTracked(p, r.adjusted(0, -1, 0, -1), text(), serif(21, SemiBold, 9));
+    // "PLAY" is set wide; longer labels ("PREPARE GAME") a little tighter.
+    const bool longText = text().size() > 6;
+    drawTracked(p, r.adjusted(0, -1, 0, -1), text(),
+                longText ? serif(16, SemiBold, 3.4) : serif(21, SemiBold, 9));
 }
 
 // ----------------------------------------------------------------- link --
@@ -747,6 +750,15 @@ void KeyMap::paintEvent(QPaintEvent *)
                m_ps ? "DualShock 4 / DualSense names; PS button and touchpad are not used. "
                       "Keyboard and gamepad work together."
                     : "Xbox-style names. Keyboard and gamepad work together.");
+}
+
+// ------------------------------------------------------------- progress --
+void ProgressLine::paintEvent(QPaintEvent *)
+{
+    QPainter p(this);
+    const qreal y = height() / 2.0, h = 3;
+    p.fillRect(QRectF(0, y - 0.5, width(), 1), alpha(chalk, 0.24));
+    p.fillRect(QRectF(0, y - h / 2, width() * m_value, h), m_failed ? mix(panel, chalk, 0.4) : rose);
 }
 
 // -------------------------------------------------------------- overlay --

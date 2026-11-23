@@ -206,6 +206,22 @@ private:
     bool m_ps = false;
 };
 
+// A thin progress line: track, accent fill up to value (0..1).
+class ProgressLine : public QWidget {
+    Q_OBJECT
+public:
+    explicit ProgressLine(QWidget *parent = nullptr) : QWidget(parent) {}
+    void setValue(qreal v) { m_value = qBound(0.0, v, 1.0); update(); }
+    void setFailed(bool on) { m_failed = on; update(); }
+
+protected:
+    void paintEvent(QPaintEvent *) override;
+
+private:
+    qreal m_value = 0;
+    bool m_failed = false;
+};
+
 // A panel that fades and slides in over the dimmed window. Click outside
 // it or press Esc to close. The content widget is owned by the overlay.
 class Overlay : public QWidget {
