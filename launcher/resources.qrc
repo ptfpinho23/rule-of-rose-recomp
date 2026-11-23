@@ -1,0 +1,7 @@
+<RCC>
+  <qresource prefix="/">
+    <file>assets/fonts/CormorantGaramond-Medium.ttf</file>
+    <file>assets/fonts/CormorantGaramond-SemiBold.ttf</file>
+    <file>assets/fonts/CormorantGaramond-MediumItalic.ttf</file>
+  </qresource>
+</RCC>
