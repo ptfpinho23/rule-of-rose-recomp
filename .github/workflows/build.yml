@@ -1,0 +1,64 @@
+# Compile check: the runtime for both platforms, the player-side build tool
+# and both launchers. Nothing is packaged and no game code is involved (the
+# recompiled code needs the game, which is not available here).
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  QT_VERSION: 6.8.2
+  AQT_VERSION: 3.3.0
+
+jobs:
+  compile:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: System packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build python3-pip \
+            libgl1-mesa-dev libx11-dev libxkbcommon-dev
+
+      - name: Cache downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            tools/dl
+            ~/qt
+          key: tools-${{ env.QT_VERSION }}-${{ env.AQT_VERSION }}-${{ hashFiles('release/fetch.sh') }}
+
+      - name: Qt
+        run: |
+          python3 -m pip install --user "aqtinstall==${AQT_VERSION}"
+          [ -d "$HOME/qt/$QT_VERSION/gcc_64" ] || python3 -m aqt install-qt linux desktop "$QT_VERSION" linux_gcc_64 -O "$HOME/qt" --archives qtbase icu
+          [ -d "$HOME/qt/$QT_VERSION/llvm-mingw_64" ] || python3 -m aqt install-qt windows desktop "$QT_VERSION" win64_llvm_mingw -O "$HOME/qt" --archives qtbase
+
+      - name: Pinned tools
+        run: release/fetch.sh zig-linux llvm-mingw vulkan-headers
+
+      - name: Runtime and build tool, Linux and Windows
+        run: |
+          mkdir -p build/x11inc && ln -sfn /usr/include/X11 build/x11inc/X11
+          export X11_INC="$PWD/build/x11inc"
+          RUNTIME_ONLY=1 release/make-kit.sh linux build/ci/linux 0.0.0-ci
+          RUNTIME_ONLY=1 release/make-kit.sh windows build/ci/windows 0.0.0-ci
+          python3 -m py_compile release/ror_build.py recomp/gen.py recomp/sem.py recomp/r5900.py recomp/elf.py recomp/tools/vu1extract.py
+
+      - name: Launchers
+        env:
+          ROR_TOOLCHAIN: system
+          CMAKE: cmake
+          NINJA: ninja
+        run: |
+          export QT_LINUX="$HOME/qt/$QT_VERSION/gcc_64" QT_WIN="$HOME/qt/$QT_VERSION/llvm-mingw_64"
+          tools/build.sh
+          tools/build-win.sh

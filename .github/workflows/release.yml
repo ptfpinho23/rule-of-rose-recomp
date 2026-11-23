@@ -1,0 +1,92 @@
+# Builds the two release archives. A release contains no game code: the game
+# program is built on the player's machine by ror-build (see release/).
+#
+#   push of a tag v*    build, then publish a GitHub Release with the archives
+#   manual run          build only; the archives are workflow artifacts
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  QT_VERSION: 6.8.2
+  AQT_VERSION: 3.3.0
+
+jobs:
+  package:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: System packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build python3-pip \
+            libgl1-mesa-dev libx11-dev libxkbcommon-dev libxkbcommon-x11-0 \
+            libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
+            libxcb-render-util0 libxcb-shape0 libxcb-xkb1 libxcb-util1 \
+            libfontconfig1 libfreetype6 libdbus-1-3 libegl1
+
+      - name: Cache downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            tools/dl
+            ~/qt
+          key: tools-${{ env.QT_VERSION }}-${{ env.AQT_VERSION }}-${{ hashFiles('release/fetch.sh') }}
+
+      - name: Qt (Linux kit, and the Windows kit for the cross build)
+        run: |
+          python3 -m pip install --user "aqtinstall==${AQT_VERSION}"
+          [ -d "$HOME/qt/$QT_VERSION/gcc_64" ] || python3 -m aqt install-qt linux desktop "$QT_VERSION" linux_gcc_64 -O "$HOME/qt" --archives qtbase icu
+          [ -d "$HOME/qt/$QT_VERSION/llvm-mingw_64" ] || python3 -m aqt install-qt windows desktop "$QT_VERSION" win64_llvm_mingw -O "$HOME/qt" --archives qtbase
+
+      - name: Pinned tools (Zig, Python, llvm-mingw, Vulkan headers, FidelityFX DLLs)
+        run: release/fetch.sh
+
+      - name: Version
+        id: version
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = tag ]; then v="${GITHUB_REF_NAME#v}"; else v="0.0.0-$(git rev-parse --short HEAD)"; fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Build the archives
+        env:
+          ROR_TOOLCHAIN: system
+          CMAKE: cmake
+          NINJA: ninja
+        run: |
+          export QT_LINUX="$HOME/qt/$QT_VERSION/gcc_64" QT_WIN="$HOME/qt/$QT_VERSION/llvm-mingw_64"
+          # the X11 headers alone, so that no other system header gets in the way of the compiler's own
+          mkdir -p build/x11inc && ln -sfn /usr/include/X11 build/x11inc/X11
+          export X11_INC="$PWD/build/x11inc"
+          release/package.sh all "${{ steps.version.outputs.version }}"
+          (cd build/release && sha256sum RuleOfRose-*.tar.gz RuleOfRose-*.zip | tee SHA256SUMS.txt)
+
+      - name: Upload the archives
+        uses: actions/upload-artifact@v4
+        with:
+          name: RuleOfRose-${{ steps.version.outputs.version }}
+          path: |
+            build/release/RuleOfRose-*.tar.gz
+            build/release/RuleOfRose-*.zip
+            build/release/SHA256SUMS.txt
+          if-no-files-found: error
+
+      - name: Publish the release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            build/release/RuleOfRose-*.tar.gz
+            build/release/RuleOfRose-*.zip
+            build/release/SHA256SUMS.txt
