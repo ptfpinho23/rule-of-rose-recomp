@@ -401,7 +401,7 @@ not located.
 wins). Ratio 1.0..3.6; anything up to 4:3 (and `off`) means off. `rt/wide.c`,
 both renderers, both platforms. Hor+: same vertical view, more to the sides.
 
-What was found in the game (research in `build/recomp/widework/`):
+What was found in the game (found by tracing camera set-up and the VIF stream):
 - Every camera is built by `0x228b80(a0 = renderer, a1 = frustum, a2 =
   world-to-view)`; 9 call sites. Frustum floats: [0] near, [1] far, [2] left,
   [3] right, [4] bottom, [5] top (on the near plane), [6..7] depth range,
@@ -454,8 +454,8 @@ Verified (final sources, Linux and Windows builds):
 - `--wide` off: standard script to 16000, 16 PNG + WAV md5s equal the
   17:38/17:39 binaries on both platforms.
 - Software `--wide 16:9` and `21:9`, play script to 22000, `--shots 200`:
-  110 of 110 raw frames byte-identical to the research build
-  (`widework/ror-integ`) on Linux and on Windows.
+  110 of 110 raw frames byte-identical to the prototype build
+  on Linux and on Windows.
 - Shape changes in the play script to 22000: wide at 7642 (storybook), 4:3
   at 8002, wide at 8026, then wide to the end (chapter card, gameplay). The
   8002-8026 gap is black (frames 8008 and 8021 are the all-black frame; 7995
@@ -593,15 +593,15 @@ window: buttons = XInput mask in hex (0001 up, 0002 down, 0004 left, 0008
 right, 0010 start, 0020 back, 0040/0080 stick clicks, 0100 LB, 0200 RB, 1000
 A, 2000 B, 4000 X, 8000 Y), sticks -32768..32767 with +y up, triggers 0..255;
 an entry holds until the next. While it is set no real device is read.
-`build/recomp/padwork/tofake.py SCRIPT [stick|half FROMFRAME]` converts a
+`recomp/tools/padfake.py SCRIPT [stick|half FROMFRAME]` converts a
 `--script` string (optionally turning D-pad directions into left-stick tilt);
-`build/recomp/padwork/run.sh` runs and collects md5s.
+The result is passed in `ROR_PAD_FAKE` in place of `--script`.
 
 ### Verification (no physical controller was available: none in WSL, where
 /dev/input does not exist and /dev/uinput is root-only, and none on the
 Windows side)
 - Standard script to 16000, `--shots 1000`, `ROR_WAV`: 16 PNG + WAV md5s
-  equal for the previous binaries (`gscap/base/ror.pre-pad*`) and the new
+  equal for the previous binaries and the new
   ones, Linux == Windows (frame_016000 ed535164..., audio.wav 670b42cf...).
   Play script to 22400, `--shots 100` (224 PNG + WAV): new == previous (Linux).
 - The same standard script given only as `ROR_PAD_FAKE` (A/Start/D-pad/B, no
@@ -748,7 +748,7 @@ controller has been connected to this code on either platform.
 ## FSR 3.1 (`--filter fsr3`), hairline fix, `--film-grain` (2026-11-23)
 
 ### FSR 3.1
-Integrated from `build/recomp/fsr3work/out/fsr3.diff` (applied without
+Developed as a separate patch (applied without
 offsets). Design is described at "FSR 3.1" in `rt/gs.c` and `rt/hw/gs_hw.c`;
 in short: Windows + `--renderer gpu` + AMD's `amd_fidelityfx_loader_vk.dll`
 and `amd_fidelityfx_upscaler_vk.dll` beside the exe (FidelityFX SDK 2.4.0,
@@ -853,7 +853,7 @@ Only checked in the scripted stretch (storybook to first walk).
   reproduced: the scripted run does not reach that area.
 
 Debug aids added: `ROR_HW_SKIPTEX=hex[,hex]` (`fffff` = untextured),
-`ROR_HW_SKIPLOG=n`, `ROR_HW_UVSHIFT=k`. Images: `build/recomp/artifacts-1123/`.
+`ROR_HW_SKIPLOG=n`, `ROR_HW_UVSHIFT=k`.
 Final build (with the hairline fix and `--film-grain`): software md5s, pad
 self-test and the `--internal 1` GPU identity re-checked; fsr3 headless
 re-run at 1x and 2x, exit 0, same upscaler log lines; the 2x fsr3 picture

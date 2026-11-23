@@ -22,9 +22,5 @@ tools/llvm-mingw/
 tools/vulkan/
 tools/ffx/
 
-# Abandoned first translator, kept locally for reference
-recompile/
-tools/build_native.sh
-
 __pycache__/
 *.pyc
