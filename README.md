@@ -3,13 +3,13 @@
 </p>
 
 <p align="center">
-  <b>Rule of Rose (PlayStation 2) running natively on Windows and Linux,<br>built on your PC from your own copy of the game.</b>
+  <b>Rule of Rose (PlayStation 2) as a native Windows and Linux game,<br>made on your PC from your own copy.</b>
 </p>
 
 <p align="center">
   <a href="#project-status">Status</a> ·
+  <a href="#download-and-play">Download and play</a> ·
   <a href="#features">Features</a> ·
-  <a href="#playing">Playing</a> ·
   <a href="#how-to-build">How to build</a> ·
   <a href="#how-it-works">How it works</a> ·
   <a href="#want-to-help">Want to help?</a> ·
@@ -22,71 +22,82 @@
   <img src="docs/options.png" alt="Launcher options" width="49%">
 </p>
 
-This is a static recompilation of the European release of *Rule of Rose*
-(SLES-54218). The game's MIPS machine code is translated ahead of time into C,
-compiled for x86-64 and linked against a runtime that stands in for the PS2:
-kernel, graphics, sound, movies, disc, memory card and pad. It is not an
-emulator, and there is no interpreter or JIT in the game you end up running.
+A PC version of *Rule of Rose* (European release, SLES-54218). You download
+the launcher from this page, point it at your own copy of the game, and it
+does the rest: it prepares the game for your PC once, then you press PLAY.
+No emulator to set up and nothing else to install.
 
 > [!IMPORTANT]
-> This repository **does not contain the game, its executable or any of its
-> assets**, and it does not explain how to get them. You need your own copy of
-> the disc as an `.iso` image. Everything the build makes from it stays on
-> your PC. Do not share those files.
+> **The game itself is not included, here or in the downloads.** You need your
+> own copy of the disc as an `.iso` image, and this project does not explain
+> how to get one. What the launcher makes from your disc stays on your PC.
+> Please do not share those files.
+
+## Download and play
+
+1. **Download** the latest package from the
+   [Releases page](https://github.com/ptfpinho23/rule-of-rose-recomp/releases/latest):
+   the `.zip` for Windows 10/11, or the `.tar.gz` for Linux.
+2. **Unpack** it anywhere and start `RuleOfRose.exe` (Windows) or
+   `./RuleOfRose` (Linux).
+3. **Choose your disc image.** The launcher checks that it is the right game.
+4. **Press PREPARE GAME.** This happens once and takes a few minutes. You only
+   see it again after updating to a new release.
+5. **Press PLAY.**
+
+That is all. You do not need to install anything else or build anything
+yourself.
+
+Your saves are kept in the `saves` folder next to the launcher. The keyboard
+and gamepad layout is on the launcher's Controls screen and in
+[docs/CONTROLS.md](docs/CONTROLS.md).
 
 ## Project status
 
-**Early, but it boots and plays.** The game runs from power-on into the first
-gameplay area with sound and movies. Nothing beyond that has been played yet.
+**Early, but it starts and plays.** The game runs from the first screen into
+the first area, with sound and movies. Nothing beyond that has been played
+yet, so expect problems further in.
 
 | | Status |
 |---|---|
-| Boot, intro movies, title screen, New Game opening | Works |
-| First gameplay area | Works |
+| Start-up, intro movies, title screen, New Game opening | Works |
+| First area of the game | Works |
 | Later areas, combat, saving at a save point | Not tested yet |
-| Sound | Works, no reverb |
-| Windows 10/11 x64, Linux x86-64 | Works |
-| Software renderer | Works, pixel-exact, full speed |
-| GPU renderer (Vulkan) | Works, tested on one GPU (RTX 3090) |
+| Sound | Works |
+| Windows 10/11 and Linux | Works |
+| High-resolution picture and smooth motion | Works, tested on one graphics card (RTX 3090) |
 | Widescreen | Experimental |
-| Xbox and PlayStation pads | Written, not yet tried on real hardware |
+| Xbox and PlayStation controllers | Included, not yet tried with a real controller |
 
 The full list of what is missing or unverified is in
 [docs/STATUS.md](docs/STATUS.md).
 
 ## Features
 
-- **Two renderers.** A software renderer that matches the PS2 pixel for pixel,
-  and a Vulkan renderer that draws at up to 8x the original resolution.
-- **High refresh rates.** The game draws 25 pictures a second. The GPU
-  renderer builds the in-between pictures from the game's own geometry, up to
-  the refresh rate of your display (240 Hz measured).
-- **Widescreen.** 16:9, 21:9 and 32:9 with a wider 3D view. Text and menus keep
-  their proportions.
-- **Upscaling.** AMD FSR 1.0 on both renderers, FSR 3.1 on Windows with the
-  GPU renderer.
-- **Picture controls.** Brightness, contrast, gamma, saturation, bloom and the
-  strength of the game's film grain.
-- **Input.** Keyboard, Xbox pads, DualShock 4 and DualSense, with analog
-  movement and vibration.
-- **A launcher** that finds your disc image and holds all of the above.
-
-## Playing
-
-Build the packages as described below, then start the launcher:
-
-| Platform | Start |
-|---|---|
-| Windows | `dist/RuleOfRose-windows/RuleOfRose.exe` |
-| Linux | `dist/RuleOfRose-linux/RuleOfRose` |
-
-Point it at your disc image, pick your options and press **PLAY**. Saves go to
-`saves/mc0/` next to the launcher; that folder is the memory card.
-
-- Keyboard and gamepad mapping: [docs/CONTROLS.md](docs/CONTROLS.md)
-- Running the game without the launcher: [docs/OPTIONS.md](docs/OPTIONS.md)
+- **Sharper picture.** Play at the original PS2 resolution or at up to 8 times
+  that on your graphics card.
+- **Smooth motion.** The original shows 25 pictures a second. The PC version
+  can fill in the frames in between, up to your monitor's refresh rate.
+- **Widescreen.** 16:9, 21:9 and 32:9, showing more of the scene to the sides
+  instead of stretching it.
+- **Upscaling.** AMD FSR 1.0, and FSR 3.1 on Windows.
+- **Picture settings.** Brightness, contrast, gamma, saturation, bloom, and
+  how strong the game's film grain is.
+- **Controllers.** Keyboard, Xbox pads, DualShock 4 and DualSense.
+- **One launcher** for all of it, in window or fullscreen.
 
 ## How to build
+
+This section and the next are for people who want to work on the project.
+Players do not need any of it.
+
+The project is a static recompilation. The game's MIPS R5900 machine code is
+translated ahead of time into C, compiled for x86-64 and linked against a
+runtime that stands in for the PS2. There is no interpreter or JIT in the
+result. Because that translation is made from the game's executable, it is
+never committed or published: the build makes it from your disc image, and
+the released launcher does the same on the player's machine (that is what
+PREPARE GAME runs).
 
 Builds run on Linux (WSL2 is fine) with a user-space toolchain, no root
 needed. The Windows build is cross-compiled from the same machine.
@@ -113,9 +124,13 @@ tools/build-win.sh       # launcher, Windows
 recomp/package.sh all    # dist/RuleOfRose-linux, dist/RuleOfRose-windows
 ```
 
-The game build takes the executable out of your image, recompiles it and
-links it with the runtime. Everything it produces lands under `build/`, which
-git ignores.
+Everything made from the game lands under `build/` and `dist/`, which git
+ignores. The switches of the game executable are in
+[docs/OPTIONS.md](docs/OPTIONS.md).
+
+Releases are built by GitHub Actions when a `v*` tag is pushed. They contain
+the launcher, the runtime, the recompiler and a bundled compiler, and no game
+code.
 
 ## How it works
 
