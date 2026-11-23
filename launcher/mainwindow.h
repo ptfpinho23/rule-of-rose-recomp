@@ -26,6 +26,7 @@ class MainWindow : public QWidget {
 public:
     // isoOverride: disc image given on the command line (not remembered).
     explicit MainWindow(const QString &isoOverride = {}, QWidget *parent = nullptr);
+    ~MainWindow() override;
 
     // Where the game executable is, or empty: "ror-game" beside the launcher,
     // then build/recomp/ror in a folder above it, then $ROR_GAME. workDir
@@ -108,6 +109,7 @@ private:
     void onBuilderOutput();
     void onBuilderFinished(int code, QProcess::ExitStatus st);
     void endBuild();
+    void stopBuilder();
 
     DiscInfo m_disc;
     QString m_logPath;
@@ -123,6 +125,8 @@ private:
     QByteArray m_buildOut;
     QString m_buildError, m_buildDone;
     int m_buildPercent = 0;
+    int m_buildTotal = 0, m_buildBaseDone = 0;      // see onBuilderOutput
+    qreal m_buildBaseShown = 0, m_buildShown = 0;
     bool m_playAfterBuild = false;
     QElapsedTimer m_buildClock;
     QTimer *m_buildTick = nullptr;

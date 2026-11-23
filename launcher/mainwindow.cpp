@@ -972,6 +972,9 @@ void MainWindow::startPrepare()
     m_buildError.clear();
     m_buildDone.clear();
     m_buildPercent = 0;
+    m_buildTotal = 0;
+    m_buildBaseDone = 0;
+    m_buildBaseShown = m_buildShown = 0;
     m_prepBar->setValue(0);
     m_prepTime->setText("0:00");
     setElided(m_prepStep, "Starting…");
@@ -1016,8 +1019,21 @@ void MainWindow::onBuilderOutput()
         if (line.startsWith("PROGRESS ")) {
             const int done = line.section(' ', 1, 1).toInt(), total = line.section(' ', 2, 2).toInt();
             if (total > 0) {
-                m_buildPercent = qBound(0, done * 100 / total, 100);
-                m_prepBar->setValue(qreal(done) / total);
+                // The builder's total grows once it knows how much there is
+                // to do (5 steps at first, then one per file as well). The
+                // bar must not jump back when that happens: from the point
+                // where the total changed, the rest of the bar is shared out
+                // over the rest of the work.
+                if (total != m_buildTotal) {
+                    m_buildTotal = total;
+                    m_buildBaseDone = qMin(done, total - 1);
+                    m_buildBaseShown = m_buildShown;
+                }
+                const qreal rest = qreal(done - m_buildBaseDone) / (total - m_buildBaseDone);
+                m_buildShown = qMax(m_buildShown,
+                                    m_buildBaseShown + (1.0 - m_buildBaseShown) * qBound(0.0, rest, 1.0));
+                m_buildPercent = qBound(0, int(m_buildShown * 100), 100);
+                m_prepBar->setValue(m_buildShown);
             }
             setElided(m_prepStep, line.section(' ', 3));
             updatePlayButton();
@@ -1067,14 +1083,34 @@ void MainWindow::onBuilderFinished(int code, QProcess::ExitStatus st)
     emit prepareFinished(false);
 }
 
-void MainWindow::cancelPrepare()
+// Stop the builder - our own child, through its handle. It is asked to stop
+// first where that is possible (it then stops its own helpers and removes
+// its work files), and only killed if it does not.
+void MainWindow::stopBuilder()
 {
     if (!m_build)
         return;
     m_build->disconnect(this);
-    m_build->kill();                    // our own child, by its handle
+#ifdef Q_OS_WIN
+    m_build->kill();                    // (its helpers are tied to it by a job object)
     m_build->waitForFinished(5000);
+#else
+    m_build->terminate();
+    if (!m_build->waitForFinished(6000)) {
+        m_build->kill();
+        m_build->waitForFinished(3000);
+    }
+#endif
     endBuild();
+}
+
+MainWindow::~MainWindow() { stopBuilder(); }
+
+void MainWindow::cancelPrepare()
+{
+    if (!m_build)
+        return;
+    stopBuilder();
     m_playAfterBuild = false;
     m_prepare->close();
     refreshGameState();
@@ -1313,12 +1349,7 @@ void MainWindow::closeEvent(QCloseEvent *e)
 {
     // Closing while the game is being prepared cancels that (the builder
     // leaves nothing half-made behind).
-    if (m_build) {
-        m_build->disconnect(this);
-        m_build->kill();
-        m_build->waitForFinished(5000);
-        endBuild();
-    }
+    stopBuilder();
     // Closing the launcher must not take the running game down with it:
     // hide, and quit once the game ends.
     if (m_game) {
