@@ -5,6 +5,7 @@
  *   ROR_VUTRACE=0 vurun DUMP    also trace every instruction
  * Build/run with recomp/tools/vurun.sh. */
 #include "../rt/vu.c"
+u64 plat_time_ns(void) { struct timespec t; timespec_get(&t, TIME_UTC); return (u64)t.tv_sec * 1000000000ull + (u64)t.tv_nsec; }   /* for vu.c */
 #include <stdarg.h>
 #include <xmmintrin.h>
 

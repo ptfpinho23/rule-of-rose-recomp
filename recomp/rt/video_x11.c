@@ -3,8 +3,46 @@
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
+#include <dlfcn.h>
 #include "rt.h"
 #include "plat.h"
+
+/* libX11 is loaded at run time (dlopen), so the program links without the X11
+ * development files and starts without the library (headless runs; a clear
+ * message when a window is wanted and it is missing). The Xlib names used
+ * below are redirected to the loaded entry points. */
+#define X11_FUNCS(F) F(XOpenDisplay) F(XCreateSimpleWindow) F(XStoreName) F(XSelectInput) F(XInternAtom) F(XSetWMProtocols) F(XCreateGC) \
+    F(XChangeProperty) F(XMapWindow) F(XPending) F(XNextEvent) F(XLookupKeysym) F(XSendEvent) F(XCreateImage) F(XPutImage) F(XFlush)
+#define F(n) static __typeof__(n) *p_##n;
+X11_FUNCS(F)
+#undef F
+static int x11_load(void) {
+    static int state;                            /* 0 not tried, 1 loaded, -1 not available */
+    if (state) return state > 0;
+    void *l = dlopen("libX11.so.6", RTLD_NOW | RTLD_GLOBAL);
+    if (!l) { rt_log("[video] libX11.so.6 could not be loaded (%s): no window. Install the X11 client library (libx11-6 / libX11).\n", dlerror()); state = -1; return 0; }
+#define F(n) if (!(p_##n = (__typeof__(n) *)dlsym(l, #n))) { rt_log("[video] libX11.so.6 has no %s: no window\n", #n); state = -1; return 0; }
+    X11_FUNCS(F)
+#undef F
+    state = 1;
+    return 1;
+}
+#define XOpenDisplay p_XOpenDisplay
+#define XCreateSimpleWindow p_XCreateSimpleWindow
+#define XStoreName p_XStoreName
+#define XSelectInput p_XSelectInput
+#define XInternAtom p_XInternAtom
+#define XSetWMProtocols p_XSetWMProtocols
+#define XCreateGC p_XCreateGC
+#define XChangeProperty p_XChangeProperty
+#define XMapWindow p_XMapWindow
+#define XPending p_XPending
+#define XNextEvent p_XNextEvent
+#define XLookupKeysym p_XLookupKeysym
+#define XSendEvent p_XSendEvent
+#define XCreateImage p_XCreateImage
+#define XPutImage p_XPutImage
+#define XFlush p_XFlush
 
 static Display *dpy; static Window win; static GC gc; static XImage *img;
 static int img_w, img_h, cur_w, cur_h, is_full;
@@ -18,6 +56,7 @@ static void set_fullscreen(int on) {             /* EWMH: ask the window manager
     is_full = on;
 }
 int vwin_open(int w, int h, int fullscreen) {
+    if (!x11_load()) return 0;
     dpy = XOpenDisplay(0);
     if (!dpy) return 0;
     int scr = DefaultScreen(dpy);
@@ -74,8 +113,7 @@ void vwin_show(const u32 *px, int w, int h) {
 }
 void vwin_flush(void) { XFlush(dpy); }
 void vwin_native(void **a, void **b) { *a = dpy; *b = (void *)win; }
-/* Refresh rate from XRandR, loaded at run time (the build links only libX11). */
-#include <dlfcn.h>
+/* Refresh rate from XRandR, also loaded at run time. */
 int vwin_refresh_hz(void) {
     static int hz = -1;
     if (hz >= 0) return hz;

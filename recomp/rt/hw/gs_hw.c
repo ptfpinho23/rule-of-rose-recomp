@@ -632,7 +632,16 @@ int hw_fsr3_init(void) {
     static const wchar_t name[] = L"amd_fidelityfx_loader_vk.dll";
     memcpy(path + n, name, sizeof name);
     HMODULE m = LoadLibraryExW(path, 0, LOAD_WITH_ALTERED_SEARCH_PATH);
-    if (!m) { fprintf(stderr, "[gs_hw] FSR 3.1: amd_fidelityfx_loader_vk.dll could not be loaded from the program's folder (error %lu): using FSR 1.0\n", (unsigned long)GetLastError()); return 0; }
+    if (!m) {                                    /* not beside the program: the folder named by ROR_APP_DIR (the launcher's own) */
+        const wchar_t *app = _wgetenv(L"ROR_APP_DIR"); size_t al = app ? wcslen(app) : 0;
+        if (al > 0 && al < 900) {
+            memcpy(path, app, al * sizeof(wchar_t));
+            if (path[al - 1] != L'\\' && path[al - 1] != L'/') path[al++] = L'\\';
+            memcpy(path + al, name, sizeof name);
+            m = LoadLibraryExW(path, 0, LOAD_WITH_ALTERED_SEARCH_PATH);
+        }
+    }
+    if (!m) { fprintf(stderr, "[gs_hw] FSR 3.1: amd_fidelityfx_loader_vk.dll could not be loaded from the program's folder or %%ROR_APP_DIR%% (error %lu): using FSR 1.0\n", (unsigned long)GetLastError()); return 0; }
     ffx_create = (PfnFfxCreateContext)(void *)GetProcAddress(m, "ffxCreateContext"); ffx_destroy = (PfnFfxDestroyContext)(void *)GetProcAddress(m, "ffxDestroyContext");
     ffx_query = (PfnFfxQuery)(void *)GetProcAddress(m, "ffxQuery"); ffx_dispatch = (PfnFfxDispatch)(void *)GetProcAddress(m, "ffxDispatch");
     if (!ffx_create || !ffx_destroy || !ffx_query || !ffx_dispatch) { fprintf(stderr, "[gs_hw] FSR 3.1: amd_fidelityfx_loader_vk.dll does not export the FidelityFX API: using FSR 1.0\n"); return 0; }

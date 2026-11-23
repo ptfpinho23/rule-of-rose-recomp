@@ -54,7 +54,9 @@ static void hash_state(void) {
     u32 ext[8] = { v->q.u, v->p.u, v->i.u, v->r, v->status, v->mac, v->clip, v->pc };
     hq((const u8 *)ext, 32); hq(v->mem, 0x4000);
 }
-static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (double)t.tv_sec + (double)t.tv_nsec * 1e-9; }
+/* timespec_get: C11, present on Linux and in the Windows UCRT (no clock_gettime there without winpthreads) */
+u64 plat_time_ns(void) { struct timespec t; timespec_get(&t, TIME_UTC); return (u64)t.tv_sec * 1000000000ull + (u64)t.tv_nsec; }
+static double now(void) { struct timespec t; timespec_get(&t, TIME_UTC); return (double)t.tv_sec + (double)t.tv_nsec * 1e-9; }
 
 typedef struct { char name[64]; u32 hdr[4]; r128 vf[32]; u32 vi[16]; r128 acc; u32 ext[8]; u8 mem[0x4000], micro[0x4000]; } Start;
 static void load_start(const Start *s, int full) {

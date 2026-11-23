@@ -2,18 +2,28 @@
 # build.sh — regenerate the recompiled C and build the game binary.
 #   recomp/build.sh            full build
 #   EXTRA="-DROR_TRACE" ...    extra compiler flags
+# Toolchain (defaults are this project's private set-up: clang 18 under
+# ~/.local/opt/clang and the headers/CRT fetched by tools/fetch-debs.sh):
+#   CLANG=path                 the compiler
+#   ROR_TOOLCHAIN=system       use $CC (default cc) with the system's own headers and libraries instead
+#                              (needs the X11 and Vulkan headers installed, or VULKAN_INC=dir)
 set -euo pipefail
 cd "$(dirname "$0")/.."
-CLANG=~/.local/opt/clang/bin/clang
+CLANG=${CLANG:-$HOME/.local/opt/clang/bin/clang}
+VULKAN_INC=${VULKAN_INC:-tools/vulkan/Vulkan-Headers-1.3.290/include}
 E=tools/debs/extract/usr
 L=/usr/lib/x86_64-linux-gnu
 GEN=build/recomp/gen
 OBJ=${OBJ:-build/recomp/obj}
 OUT=${OUT:-build/recomp/ror}
-INC="-nostdinc -isystem $HOME/.local/opt/clang/lib/clang/18/include -isystem $E/include -isystem $E/include/x86_64-linux-gnu -isystem tools/debs/libx11/usr/include -isystem tools/debs/x11proto/usr/include -isystem tools/debs/qtdev/usr/include -isystem tools/debs/qtdev/usr/include/x86_64-linux-gnu"
-# (tools/debs/qtdev: linux-libc-dev, fetched by tools/fetch-debs.sh — the kernel headers, for <linux/input.h> in rt/pad_evdev.c)
-[ -e tools/debs/qtdev/usr/include/linux/input.h ] || { echo "kernel headers missing: run tools/fetch-debs.sh (tools/debs/qtdev)" >&2; exit 1; }
-CFLAGS="-O2 -g1 -fwrapv -fno-strict-aliasing -fno-math-errno -ffp-contract=off -Wall -Wno-unused-label -Wno-unused-variable -Wno-unused-but-set-variable -DGS_HW -Irecomp/rt -Itools/vulkan/Vulkan-Headers-1.3.290/include -I$GEN ${EXTRA:-}"
+if [ "${ROR_TOOLCHAIN:-private}" = system ]; then
+  CLANG=${CC:-cc}; INC=""
+else
+  INC="-nostdinc -isystem $HOME/.local/opt/clang/lib/clang/18/include -isystem $E/include -isystem $E/include/x86_64-linux-gnu -isystem tools/debs/libx11/usr/include -isystem tools/debs/x11proto/usr/include -isystem tools/debs/qtdev/usr/include -isystem tools/debs/qtdev/usr/include/x86_64-linux-gnu"
+  # (tools/debs/qtdev: linux-libc-dev, fetched by tools/fetch-debs.sh — the kernel headers, for <linux/input.h> in rt/pad_evdev.c)
+  [ -e tools/debs/qtdev/usr/include/linux/input.h ] || { echo "kernel headers missing: run tools/fetch-debs.sh (tools/debs/qtdev)" >&2; exit 1; }
+fi
+CFLAGS="-O2 -g1 -fwrapv -fno-strict-aliasing -fno-math-errno -ffp-contract=off -Wall -Wno-unused-label -Wno-unused-variable -Wno-unused-but-set-variable -DGS_HW -Irecomp/rt -I$VULKAN_INC -I$GEN ${EXTRA:-}"
 mkdir -p "$OBJ"
 recomp/tools/gamefiles.sh elf        # build/native/SLES_542.18 from the disc image, if it is not there
 if [ "${NOGEN:-0}" != 1 ]; then
@@ -38,8 +48,12 @@ compile() {
 export -f compile; export CLANG INC CFLAGS OBJ GEN
 ls "$GEN"/fn_*.c recomp/rt/*.c recomp/rt/hw/*.c | xargs -P "$(nproc)" -I{} bash -c 'compile {}'
 for o in "$OBJ"/fn_*.o; do [ -e "$GEN/$(basename "${o%.o}").c" ] || rm -f "$o"; done
-$CLANG -o "$OUT" -nostdlib $E/lib/x86_64-linux-gnu/crt1.o $E/lib/x86_64-linux-gnu/crti.o \
-  "$OBJ"/*.o $L/libX11.so.6 $L/libm.so.6 $L/libc.so.6 $E/lib/x86_64-linux-gnu/libc_nonshared.a \
-  $E/lib/gcc/x86_64-linux-gnu/14/libgcc.a $E/lib/x86_64-linux-gnu/crtn.o \
-  -Wl,--dynamic-linker=/lib64/ld-linux-x86-64.so.2
+if [ "${ROR_TOOLCHAIN:-private}" = system ]; then
+  $CLANG -o "$OUT" "$OBJ"/*.o -lm -ldl -lpthread
+else
+  $CLANG -o "$OUT" -nostdlib $E/lib/x86_64-linux-gnu/crt1.o $E/lib/x86_64-linux-gnu/crti.o \
+    "$OBJ"/*.o $L/libm.so.6 $L/libc.so.6 $E/lib/x86_64-linux-gnu/libc_nonshared.a \
+    $E/lib/gcc/x86_64-linux-gnu/14/libgcc.a $E/lib/x86_64-linux-gnu/crtn.o \
+    -Wl,--dynamic-linker=/lib64/ld-linux-x86-64.so.2
+fi
 echo "built $OUT" >&2

@@ -11,13 +11,14 @@
 # tools/llvm-mingw/bin/llvm-pdbutil).
 set -euo pipefail
 cd "$(dirname "$0")/.."
-TC=tools/llvm-mingw/bin
+TC=${LLVM_MINGW:-tools/llvm-mingw}/bin      # LLVM_MINGW=dir: another llvm-mingw
+VULKAN_INC=${VULKAN_INC:-tools/vulkan/Vulkan-Headers-1.3.290/include}
 CLANG=$TC/x86_64-w64-mingw32-clang
 [ -x "$CLANG" ] || { echo "llvm-mingw not found in tools/llvm-mingw (see recomp/NOTES.md, Windows build)" >&2; exit 1; }
 GEN=build/recomp/gen
 OBJ=${OBJ:-build/recomp/win/obj}
 OUT=${OUT:-build/recomp/win/ror.exe}
-CFLAGS="-O2 -g1 -gcodeview -fwrapv -fno-strict-aliasing -fno-math-errno -ffp-contract=off -Wall -Wno-unused-label -Wno-unused-variable -Wno-unused-but-set-variable -D_WIN32_WINNT=0x0A00 -DUNICODE -D_UNICODE -include recomp/rt/win_compat.h -DGS_HW -Irecomp/rt -Itools/vulkan/Vulkan-Headers-1.3.290/include -I$GEN ${EXTRA:-}"
+CFLAGS="-O2 -g1 -gcodeview -fwrapv -fno-strict-aliasing -fno-math-errno -ffp-contract=off -Wall -Wno-unused-label -Wno-unused-variable -Wno-unused-but-set-variable -D_WIN32_WINNT=0x0A00 -DUNICODE -D_UNICODE -include recomp/rt/win_compat.h -DGS_HW -Irecomp/rt -I$VULKAN_INC -I$GEN ${EXTRA:-}"
 mkdir -p "$OBJ" "$(dirname "$OUT")"
 recomp/tools/gamefiles.sh elf        # build/native/SLES_542.18 from the disc image, if it is not there
 if [ "${GEN:-0}" = 1 ] || [ ! -e "$GEN/funcs.h" ]; then

@@ -46,8 +46,8 @@ static __attribute__((noinline)) void vu_kick_timed(const u8 *mem, u32 addr, u32
 #define VU_KICK(mem, addr, mask) do { if (UNLIKELY(g_vu_stat)) vu_kick_timed(mem, addr, mask); else gif_write_path1(mem, addr, mask); } while (0)
 void vu_stat_report(void) {            /* called by vif_write(1), outside its timed section */
     static u64 next, t_last, c_last; static double ns_per_tick;
-    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-    u64 now = (u64)ts.tv_sec * 1000000000ull + (u64)ts.tv_nsec, tsc = __builtin_ia32_rdtsc();
+    u64 plat_time_ns(void);         /* plat.h (the tools that include this file supply their own) */
+    u64 now = plat_time_ns(), tsc = __builtin_ia32_rdtsc();
     if (!next) { next = g_gs_frames + 500; t_last = now; c_last = tsc; memset(g_vu_stat_ticks, 0, sizeof g_vu_stat_ticks); return; }
     if (g_gs_frames < next) return;
     ns_per_tick = (double)(now - t_last) / (double)(tsc - c_last);
