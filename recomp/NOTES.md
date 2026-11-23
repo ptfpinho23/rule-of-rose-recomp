@@ -1,7 +1,7 @@
 # Rule of Rose — static recompilation (new pipeline, started 2026-11-22)
 
-This directory replaces `recompile/` (the earlier attempt, which decoded the
-game as MIPS32 and was not a valid translation; kept only for reference).
+This directory replaces an earlier attempt (no longer in the tree, which decoded the
+game as MIPS32 and was not a valid translation).
 
 ## Pipeline
 
