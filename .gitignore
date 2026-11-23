@@ -21,6 +21,10 @@ tools/debs/
 tools/llvm-mingw/
 tools/vulkan/
 tools/ffx/
+tools/dl/
+tools/zig/
+tools/python-linux/
+tools/python-windows/
 
 __pycache__/
 *.pyc

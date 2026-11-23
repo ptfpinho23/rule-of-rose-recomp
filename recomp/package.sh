@@ -22,9 +22,21 @@ DIST=${DIST:-dist}     # output root (override for trial runs)
 # The host clang tools need libraries that live beside them. Set that only for
 # those tools: exported globally it makes llvm-mingw's clang (the Windows
 # cross compiler) load the wrong LLVM libraries and crash.
-CLANGLIB=$HOME/.local/opt/clang/lib
-host_strip()   { LD_LIBRARY_PATH="$CLANGLIB" "$HOME/.local/opt/clang/bin/llvm-strip" "$@"; }
-host_readelf() { LD_LIBRARY_PATH="$CLANGLIB" "$HOME/.local/opt/clang/bin/llvm-readelf" "$@"; }
+CLANGLIB=${ROR_CLANG:-$HOME/.local/opt/clang}/lib
+# Overridable locations (the defaults are this project's private set-up):
+#   QT_LINUX, QT_WIN   Qt 6 kits (gcc_64, llvm-mingw_64)      LLVM_MINGW   the Windows toolchain
+#   ROR_CLANG          the private clang (strip, readelf, libc++)
+#   ROR_TOOLCHAIN=system   the launcher was built with the system compiler: use the system's strip/readelf,
+#                      bundle no libc++, take the xcb helper libraries from the system (XCBRT=dir overrides)
+#   GAME=none          leave ror-game out (release layout: the player's machine builds it, see release/)
+if [ "${ROR_TOOLCHAIN:-private}" = system ]; then
+  host_strip()   { strip "$@"; }
+  host_readelf() { readelf "$@"; }
+else
+  host_strip()   { LD_LIBRARY_PATH="$CLANGLIB" "${ROR_CLANG:-$HOME/.local/opt/clang}/bin/llvm-strip" "$@"; }
+  host_readelf() { LD_LIBRARY_PATH="$CLANGLIB" "${ROR_CLANG:-$HOME/.local/opt/clang}/bin/llvm-readelf" "$@"; }
+fi
+GAME=${GAME:-full}
 
 # licenses/: the bundled typeface, and AMD's MIT licence for FSR 1.0 (the
 # game's upscaler) when the game sources provide it under recomp/rt/.
@@ -73,11 +85,12 @@ EOF
 package_linux() {
   local BIN=${BIN:-build/recomp/ror}
   local D=$DIST/RuleOfRose-linux
-  local QT=$HOME/.local/opt/qt6/6.8.2/gcc_64
-  local CXXRT=$HOME/.local/opt/clang/lib/x86_64-unknown-linux-gnu
-  local XCBRT=$REPO/tools/debs/xcbrt/usr/lib/x86_64-linux-gnu
+  local QT=${QT_LINUX:-$HOME/.local/opt/qt6/6.8.2/gcc_64}
   local SYS=/usr/lib/x86_64-linux-gnu
-  [ -x "$BIN" ] || { echo "package linux: $BIN not found - run recomp/build.sh first" >&2; return 1; }
+  local CXXRT=${ROR_CLANG:-$HOME/.local/opt/clang}/lib/x86_64-unknown-linux-gnu
+  local XCBRT=${XCBRT:-$REPO/tools/debs/xcbrt/usr/lib/x86_64-linux-gnu}
+  if [ "${ROR_TOOLCHAIN:-private}" = system ]; then CXXRT=$QT/lib; XCBRT=${XCBRT_SYSTEM:-$SYS}; fi
+  [ "$GAME" = none ] || [ -x "$BIN" ] || { echo "package linux: $BIN not found - run recomp/build.sh first" >&2; return 1; }
 
   tools/build.sh dist >&2
   local L=launcher/build-dist/ror_launcher
@@ -87,8 +100,8 @@ package_linux() {
   mkdir -p "$D/lib" "$D/plugins/platforms"
 
   cp "$L" "$D/RuleOfRose"
-  cp "$BIN" "$D/ror-game"
-  host_strip "$D/RuleOfRose" "$D/ror-game"
+  host_strip "$D/RuleOfRose"
+  if [ "$GAME" = none ]; then rm -f "$D/ror-game"; else cp "$BIN" "$D/ror-game"; host_strip "$D/ror-game"; fi
   cp "$QT/plugins/platforms/libqxcb.so" "$D/plugins/platforms/"
   copy_licenses "$D"
 
@@ -210,10 +223,10 @@ EOF
 package_windows() {
   local WINBIN=${WINBIN:-build/recomp/win/ror.exe}
   local D=$DIST/RuleOfRose-windows
-  local QT=$HOME/.local/opt/qt6/6.8.2/llvm-mingw_64
-  local MINGW=$REPO/tools/llvm-mingw
+  local QT=${QT_WIN:-$HOME/.local/opt/qt6/6.8.2/llvm-mingw_64}
+  local MINGW=${LLVM_MINGW:-$REPO/tools/llvm-mingw}
   local OBJDUMP=$MINGW/bin/x86_64-w64-mingw32-objdump
-  if [ ! -f "$WINBIN" ]; then
+  if [ "$GAME" != none ] && [ ! -f "$WINBIN" ]; then
     echo "package windows: SKIPPED - $WINBIN does not exist yet (build it with recomp/build-win.sh, then re-run: recomp/package.sh windows)" >&2
     return 0
   fi
@@ -227,14 +240,16 @@ package_windows() {
   find "$D" -maxdepth 1 -type f -name '*.dll' -delete
 
   cp "$L" "$D/RuleOfRose.exe"
-  cp "$WINBIN" "$D/ror-game.exe"
-  "$MINGW/bin/x86_64-w64-mingw32-strip" "$D/RuleOfRose.exe" "$D/ror-game.exe"
+  "$MINGW/bin/x86_64-w64-mingw32-strip" "$D/RuleOfRose.exe"
+  if [ "$GAME" = none ]; then rm -f "$D/ror-game.exe"
+  else cp "$WINBIN" "$D/ror-game.exe"; "$MINGW/bin/x86_64-w64-mingw32-strip" "$D/ror-game.exe"; fi
   cp "$QT/plugins/platforms/qwindows.dll" "$D/platforms/"
   copy_licenses "$D"
 
   # Follow the import tables: copy every DLL that comes from Qt or from the
   # llvm-mingw runtime (libc++, libunwind, ...); the rest are Windows' own.
-  local todo=("$D/RuleOfRose.exe" "$D/ror-game.exe" "$D/platforms/qwindows.dll") f dll src dir
+  local todo=("$D/RuleOfRose.exe" "$D/platforms/qwindows.dll") f dll src dir
+  [ "$GAME" = none ] || todo+=("$D/ror-game.exe")
   while [ ${#todo[@]} -gt 0 ]; do
     f=${todo[0]}; todo=("${todo[@]:1}")
     while read -r dll; do

@@ -956,3 +956,78 @@ grain sprites are not squeezed, so the stretched presentation widened every
 speck by aspect / (4/3). `gs.c submit()` now widens their U range by the same
 factor while 3D is widened (the 64x64 noise repeats more often), which keeps
 the specks' shape. Both renderers; no change without `--wide`.
+
+## Releases: the game program is built on the player's machine (2026-11-23)
+
+A release archive contains no game code. It holds the launcher, the runtime
+as compiled objects, the recompiler, a C compiler and a Python, and
+`ror-build`, which makes `ror-game` from the player's own disc image.
+
+Files: `release/ror_build.py` (the tool), `release/ror-build.sh` and
+`release/ror-build-win.c` (its starters), `release/make-kit.sh` (builds the
+kit), `release/package.sh` (archives), `release/fetch.sh` (pinned downloads),
+`.github/workflows/release.yml` and `build.yml`.
+
+Contract of `ror-build` (used by the launcher):
+- `ror-build --iso PATH --out DIR [--jobs N]`: stdout, UTF-8, one line per
+  step: `PROGRESS <done> <total> <text>` (total is 5 until the file list is
+  known, then 5 + number of files, 83 today), then `DONE <path>` (exit 0) or
+  `ERROR <one line>` (exit 1). Log: `DIR/build.log`. Work files:
+  `DIR/.build`, removed on success, on error and on SIGTERM; the executable
+  and `DIR/ror-game.stamp` are put in place by renames at the end.
+- `ror-build --check --iso PATH --out DIR`: `up to date` (0) or
+  `needs build: <reason>` (1). The stamp is JSON: image size, sha256 of the
+  game executable, release version, kit hash (`buildkit/KITHASH`, a hash of
+  the recompiler, the runtime objects and sources, the VU1 translator and
+  the tool).
+- The image must hold `SLES_542.18` with the known sha256 (European disc).
+- Killing it: children are tied to it (Linux: own process groups, killed on
+  SIGTERM, and PR_SET_PDEATHSIG; Windows: a kill-on-close job object in the
+  starter and in the tool).
+
+What runs where:
+- Compiler: Zig 0.13.0 (`zig cc`, clang 18.1.6, the LLVM release the project
+  already used), targets `x86_64-linux-gnu.2.31` and `x86_64-windows-gnu`.
+  The same sources built entirely with it give the same 16 PNG + WAV md5s as
+  the clang 18.1.8 builds, at the same speed (103 against 102 fps headless in
+  the first scene).
+- On the player's machine: the generated C (`fn_*.c`, `fn_table.c`) and the
+  three runtime sources that include generated headers (`support.c` for
+  funcs.h, `vu.c` for the VU1 include, `interp.c` for the interpreter
+  tables), 78 files, then the link with the prebuilt objects.
+- Prebuilt (`buildkit/rt/lib`): every other runtime source. Linux: compiled
+  with zig for glibc 2.31. Windows: compiled with llvm-mingw as before,
+  because the runtime uses pthreads and Zig's Windows target has none;
+  llvm-mingw's `libpthread.a` (winpthreads) is shipped and linked by zig.
+- `vugen`: recomp/tools/vubench.c built with `-DVU_NO_FAST`.
+- Python: python-build-standalone 3.12.16 runs the tool and gen.py; the
+  recompiler is shipped as source. Chosen over a frozen executable because it
+  needs no build step per platform (both archives are made on one Linux
+  runner) and the same files run in development.
+- The kit drops what is not needed from Zig (other targets' C headers, libc++,
+  musl, WASI, macOS) and from Python (tests, Tk, IDLE, pip).
+
+Changes made for this in the runtime:
+- `video_x11.c` loads libX11.so.6 with dlopen; nothing of X11 is linked.
+  Without the library a windowed start logs one line and runs without a window.
+- `vu.c` takes the time from `plat_time_ns` instead of `clock_gettime`
+  (winpthreads); vubench.c / vurun.c supply it with `timespec_get`.
+- `gs_hw.c` looks for the AMD FSR 3.1 DLLs beside the program and then in
+  `%ROR_APP_DIR%` (the launcher's folder), since ror-game no longer sits
+  beside the launcher.
+
+Build scripts take their tool locations from the environment (defaults are
+the private set-up): `CLANG`, `ROR_TOOLCHAIN=system` + `CC`, `VULKAN_INC`,
+`LLVM_MINGW` (recomp/build.sh, build-win.sh); `CMAKE`, `NINJA`, `QT_LINUX`,
+`QT_WIN`, `ROR_CLANG`, `ROR_TOOLCHAIN=system` (tools/build.sh, build-win.sh,
+the two CMake toolchain files, recomp/package.sh). `GAME=none
+recomp/package.sh` lays out a package without ror-game; `release/package.sh`
+uses that and adds the kit.
+
+Measured (Ryzen 9 7900X, 24 threads, from the unpacked archives, paths with a
+space and an accent, read-only install folder, PATH without any compiler or
+Python): Linux 35-37 s, Windows 42 s; 220 CPU-seconds on Linux; largest single
+compiler process 437 MB. Archives: Linux 122 MB, Windows 125 MB. The game
+built that way gives the reference md5s (16 PNG + WAV) on both systems.
+
+Pinned downloads and their SHA-256 are in `release/fetch.sh`.
