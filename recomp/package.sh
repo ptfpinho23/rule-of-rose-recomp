@@ -121,8 +121,20 @@ package_linux() {
       esac
     done
   for n in $preload; do cp -L "$XCBRT/$n" "$D/lib/$n"; done
+  # libxkbcommon-x11 and libxkbcommon are two halves of one library and share
+  # internals: a bundled libxkbcommon-x11 with the system's libxkbcommon of
+  # another version crashes at start. Ship the libxkbcommon that belongs to
+  # the libxkbcommon-x11 just copied (same directory, else the system's).
+  if [ -e "$XCBRT/libxkbcommon.so.0" ]; then cp -L "$XCBRT/libxkbcommon.so.0" "$D/lib/libxkbcommon.so.0"
+  else cp -L "$SYS/libxkbcommon.so.0" "$D/lib/libxkbcommon.so.0"; fi
   if LD_LIBRARY_PATH="$QT/lib:$CXXRT:$XCBRT" ldd "${roots[@]}" | grep "not found" >&2; then
     echo "package linux: unresolved libraries (see above)" >&2; return 1
+  fi
+
+  # The launcher itself must not need an OpenGL library: libOpenGL.so.0 is
+  # missing on many desktops (see launcher/CMakeLists.txt).
+  if host_readelf -d "$D/RuleOfRose" | grep NEEDED | grep -E 'libOpenGL|libGLX|libGL\.so' >&2; then
+    echo "package linux: the launcher is linked against an OpenGL library (above); it would not start where that is not installed" >&2; return 1
   fi
 
   # The launcher must look in lib/ beside itself and nowhere else.
@@ -132,7 +144,7 @@ package_linux() {
 
   {
   cat <<'EOF'
-Rule of Rose — native PC build (Linux x86-64; runs under WSLg)
+Rule of Rose — native PC build (Linux x86-64)
 ===============================================================
 
 Run:      ./RuleOfRose
@@ -206,7 +218,7 @@ Running the game without the launcher
   ROR_MC_DIR=dir   memory card folder        ROR_NO_MC=1     no memory card
   ROR_NOAUDIO=1    no sound
 
-Requirements: a 64-bit Linux with X11 (or XWayland/WSLg) and the usual
+Requirements: a 64-bit Linux with X11 (or XWayland) and the usual
 desktop libraries (libX11, libxcb, libGL, fontconfig, freetype, glib, dbus).
 Qt is licensed under the LGPL v3; see https://www.qt.io/licensing.
 The launcher's typeface is Cormorant Garamond, under the SIL Open Font

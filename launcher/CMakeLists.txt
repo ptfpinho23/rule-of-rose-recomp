@@ -31,6 +31,12 @@ if(WIN32)
   set_target_properties(ror_launcher PROPERTIES WIN32_EXECUTABLE ON)
 else()
   target_link_libraries(ror_launcher PRIVATE ${CMAKE_DL_LIBS})
+  # Qt6::Gui's CMake package adds the system OpenGL libraries to the link
+  # line. The launcher calls nothing in them, and libOpenGL.so.0 is not
+  # installed on every desktop (Debian/Ubuntu: package libopengl0), so a
+  # launcher linked against it does not start there. Keep only the
+  # libraries that are really used.
+  target_link_options(ror_launcher PRIVATE -Wl,--as-needed)
   if(ROR_PACKAGE)
     set(ROR_RPATH "$ORIGIN/lib")
   else()
