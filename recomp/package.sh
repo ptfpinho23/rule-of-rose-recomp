@@ -132,7 +132,9 @@ package_linux() {
   fi
 
   # The launcher itself must not need an OpenGL library: libOpenGL.so.0 is
-  # missing on many desktops (see launcher/CMakeLists.txt).
+  # missing on many desktops (see launcher/CMakeLists.txt). Some linkers keep
+  # the entries although nothing is used from them: take them out.
+  python3 recomp/tools/elf-drop-needed.py "$D/RuleOfRose" libOpenGL.so.0 libGLX.so.0 >&2
   if host_readelf -d "$D/RuleOfRose" | grep NEEDED | grep -E 'libOpenGL|libGLX|libGL\.so' >&2; then
     echo "package linux: the launcher is linked against an OpenGL library (above); it would not start where that is not installed" >&2; return 1
   fi

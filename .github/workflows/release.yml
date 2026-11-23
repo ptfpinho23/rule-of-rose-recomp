@@ -33,7 +33,7 @@ jobs:
             libgl1-mesa-dev libx11-dev libxkbcommon-dev libxkbcommon-x11-0 \
             libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
             libxcb-render-util0 libxcb-shape0 libxcb-xkb1 libxcb-util1 \
-            libfontconfig1 libfreetype6 libdbus-1-3 libegl1
+            libfontconfig1 libfreetype6 libdbus-1-3 libegl1 xvfb
 
       - name: Cache downloads
         uses: actions/cache@v4
@@ -68,8 +68,22 @@ jobs:
           # the X11 headers alone, so that no other system header gets in the way of the compiler's own
           mkdir -p build/x11inc && ln -sfn /usr/include/X11 build/x11inc/X11
           export X11_INC="$PWD/build/x11inc"
-          release/package.sh all "${{ steps.version.outputs.version }}"
+          # on failure the last lines of the log become annotations of the run
+          if ! release/package.sh all "${{ steps.version.outputs.version }}" > build/package.log 2>&1; then
+            tail -n 12 build/package.log | while IFS= read -r line; do echo "::error::$line"; done
+            exit 1
+          fi
+          tail -n 4 build/package.log
           (cd build/release && sha256sum RuleOfRose-*.tar.gz RuleOfRose-*.zip | tee SHA256SUMS.txt)
+
+      - name: Start the packaged Linux launcher once
+        run: |
+          mkdir -p build/smoke && tar -C build/smoke -xzf build/release/RuleOfRose-*-linux-x64.tar.gz
+          cd build/smoke/RuleOfRose-*/
+          if ! xvfb-run -a ./RuleOfRose --settings-dir "$PWD/../settings" --grab "$PWD/../launcher.png" > ../launcher.log 2>&1 || [ ! -s ../launcher.png ]; then
+            tail -n 12 ../launcher.log | while IFS= read -r line; do echo "::error::$line"; done
+            exit 1
+          fi
 
       - name: Upload the archives
         uses: actions/upload-artifact@v4
