@@ -194,14 +194,26 @@ QString readout(Readout kind, int v)
     }
 }
 
-const char *const kFilters[] = {"nearest", "bilinear", "fsr", "fsr3"};
+const char *const kFilters[] = {"nearest", "bilinear", "fsr", "fsr3", "dlss"};
 // FSR 3.1 exists only in the Windows game (GPU renderer + AMD's DLLs); the
 // choice is not offered elsewhere, where the game would just use FSR 1.0.
+// DLSS is offered only once the player has put NVIDIA's four files in the
+// launcher's folder (they cannot be shipped; see docs/OPTIONS.md).
+int filterCount()
+{
 #ifdef Q_OS_WIN
-const int kFilterCount = 4;
+    static const int n = [] {
+        const QDir dir(QCoreApplication::applicationDirPath());
+        for (const char *f : {"sl.interposer.dll", "sl.common.dll", "sl.dlss.dll", "nvngx_dlss.dll"})
+            if (!dir.exists(f))
+                return 4;
+        return 5;
+    }();
+    return n;
 #else
-const int kFilterCount = 3;
+    return 3;
 #endif
+}
 
 // --pad values, in the order of the Gamepad cells.
 const char *const kPadKinds[4] = {"auto", "xinput", "playstation", "off"};
@@ -362,7 +374,7 @@ QWidget *MainWindow::buildOptions()
         QSettings().setValue("video/renderer", i ? "gpu" : "software");
         if (i == 0) {
             m_fps->setCurrentValue("0");
-            if (m_filter->current() == 3)
+            if (m_filter->current() >= 3)
                 m_filter->setCurrent(2);
         }
         updateOptionStates();
@@ -383,7 +395,7 @@ QWidget *MainWindow::buildOptions()
     // --- Quality ------------------------------------------------------------
     QWidget *q = m_optPages[1];
     m_internal = new Dropdown(236);
-    m_filter = new Segmented(QStringList({"Nearest", "Bilinear", "FSR 1.0", "FSR 3.1"}).mid(0, kFilterCount));
+    m_filter = new Segmented(QStringList({"Nearest", "Bilinear", "FSR 1.0", "FSR 3.1", "DLSS"}).mid(0, filterCount()));
     row(q, 0, "Renderer", m_renderer);
     m_internalLabel = row(q, 1, "Internal resolution", m_internal);
     m_texSmooth = new Toggle;
@@ -472,10 +484,10 @@ QWidget *MainWindow::buildOptions()
     // Software goes back to FSR 1.0, and a saved Software + FSR 3.1 is put
     // right here. Where FSR 3.1 is not offered, a saved one shows as FSR 1.0.
     int filter = defaultFilterIndex();
-    for (int i = 0; i < kFilterCount; ++i)
+    for (int i = 0; i < filterCount(); ++i)
         if (s.value("video/filter").toString() == kFilters[i])
             filter = i;
-    if (filter == 3 && m_renderer->current() == 0) {
+    if (filter >= 3 && m_renderer->current() == 0) {
         filter = 2;
         s.setValue("video/filter", kFilters[filter]);
     }
@@ -490,7 +502,7 @@ QWidget *MainWindow::buildOptions()
             [](int i) { QSettings().setValue("video/wide", kWide[i]); });
     connect(m_filter, &Segmented::changed, this, [this](int i) {
         QSettings().setValue("video/filter", kFilters[i]);
-        if (i == 3) {
+        if (i >= 3) {
             m_renderer->setCurrent(1);
             QSettings().setValue("video/renderer", "gpu");   // now the player's own choice, not a default
         }
@@ -605,7 +617,7 @@ void MainWindow::applyFollowingDefaults()
     const int internal = m_internal->currentValue().toInt();
     const bool fine = gpu && internal >= 2;
 
-    if (!s.contains("video/filter") && m_filter->current() != 3)
+    if (!s.contains("video/filter") && m_filter->current() < 3)
         m_filter->showCurrent(defaultFilterIndex());
 
     // The software renderer always draws the PS2 picture at its own size
@@ -666,7 +678,7 @@ void MainWindow::updateOptionStates()
 {
     applyFollowingDefaults();
     const bool windowed = m_mode->current() == 0, fsr = m_filter->current() >= 2;
-    const bool fsr3 = m_filter->current() == 3;
+    const bool fsr3 = m_filter->current() == 3, dlss = m_filter->current() == 4;
     const bool gpu = m_renderer->current() == 1;
     const QColor on = chalk, off = mix(panel, chalk, 0.36);
     m_res->setEnabled(windowed);
@@ -687,14 +699,18 @@ void MainWindow::updateOptionStates()
               gpu ? QString("Renderer: GPU (Vulkan)%1. Frame rate and V-Sync use it.")
                         .arg(hasCard ? " - " + g_gpu.name : QString())
                   : QString("Renderer: Software. Choosing a frame rate, or changing V-Sync, switches to GPU."));
-    setElided(m_fsrNote, fsr3 ? QString("FSR 3.1 renders at a low internal resolution and reconstructs detail over time.")
+    setElided(m_fsrNote, dlss ? QString("NVIDIA DLSS renders at a lower internal resolution and reconstructs detail over time.")
+                         : fsr3 ? QString("FSR 3.1 renders at a low internal resolution and reconstructs detail over time.")
                               : QString("FSR 1.0: sharper upscaling of the picture to the chosen resolution."));
     // With the software renderer FSR 1.0 is worked out on the processor,
     // which is a lot at a large output size.
     const QSize out = outputSize();
     const bool bigOut = qint64(out.width()) * out.height() > 1920 * 1080;
     setElided(m_fsrNote2,
-              fsr3 ? (m_internal->currentValue().toInt() > 2
+              dlss ? (m_internal->currentValue().toInt() < 2
+                          ? QString("DLSS needs 2× internal resolution or more, and a GeForce RTX card.")
+                          : QString("Best at 2× to 4× internal resolution. Needs a GeForce RTX card."))
+              : fsr3 ? (m_internal->currentValue().toInt() > 2
                           ? QString("FSR 3.1 is meant for 1× or 2× internal resolution; above that, FSR 1.0 is sharper.")
                           : QString("Best at 1× or 2× internal resolution. Windows and the GPU renderer only."))
               : !gpu && m_filter->current() == 2 && bigOut
@@ -815,7 +831,7 @@ void MainWindow::testSet(const QString &name, const QString &value)
     else if (name == "fps")
         m_fps->setCurrentValue(value);
     else if (name == "filter") {
-        const int i = int(QStringList(kFilters, kFilters + kFilterCount).indexOf(value));
+        const int i = int(QStringList(kFilters, kFilters + filterCount()).indexOf(value));
         if (i >= 0)                 // a choice this platform does not offer cannot be clicked
             m_filter->setCurrent(i);
     }
