@@ -183,9 +183,11 @@ In the launcher
              Resolution), Sharpness (FSR)
     Image    Brightness, Contrast, Gamma, Saturation, Bloom, Film grain
              (the game's own grain overlay; 100% original, 0% none)
-             Until you set them yourself, Film grain starts at 50% and
-             Sharpness at 50 (of at most 75) with the GPU renderer at 2x
-             and above, where both stand out more; otherwise 100% and 60.
+             Until you set them yourself, Film grain and Sharpness start
+             lower where they stand out more: 50% and 50 (of at most 75)
+             with the GPU renderer at 2x and above; with Software 75% and
+             50 at about 1080p, 50% and 40 (of at most 70) at 1440p and
+             above; otherwise 100% and 60.
              (double-click a slider, or Reset, for the defaults)
     Game     Sound on/off; Memory card inserted or not (without a card the
              game cannot save or load); Gamepad (Auto, Xbox, PlayStation,
@@ -355,9 +357,11 @@ In the launcher
              movies use FSR 1.0), Sharpness (FSR)
     Image    Brightness, Contrast, Gamma, Saturation, Bloom, Film grain
              (the game's own grain overlay; 100% original, 0% none)
-             Until you set them yourself, Film grain starts at 50% and
-             Sharpness at 50 (of at most 75) with the GPU renderer at 2x
-             and above, where both stand out more; otherwise 100% and 60.
+             Until you set them yourself, Film grain and Sharpness start
+             lower where they stand out more: 50% and 50 (of at most 75)
+             with the GPU renderer at 2x and above; with Software 75% and
+             50 at about 1080p, 50% and 40 (of at most 70) at 1440p and
+             above; otherwise 100% and 60.
              (double-click a slider, or Reset, for the defaults)
     Game     Sound on/off; Memory card inserted or not (without a card the
              game cannot save or load); Gamepad (Auto, Xbox, PlayStation,

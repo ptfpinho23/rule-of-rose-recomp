@@ -589,12 +589,13 @@ int MainWindow::defaultFilterIndex() const
 }
 
 // Settings the player has not chosen follow the renderer and the internal
-// resolution, also while the panel is open. With the GPU renderer at 2x and
-// above the picture is sharp enough that the game's film grain and the
-// sharpening stand out: grain defaults to 50 %, sharpness to 50 with a
-// range that ends at 75. At 1x, and with Software, the original values
-// stay (grain 100 %, sharpness 60, range to 100). A saved value is never
-// changed; a saved sharpness above the range is kept until the slider moves.
+// resolution (and, with Software, the output size), also while the panel is
+// open. With the GPU renderer at 2x and above the picture is sharp enough
+// that the game's film grain and the sharpening stand out: grain defaults
+// to 50 %, sharpness to 50 with a range that ends at 75; at 1x the original
+// values stay (grain 100 %, sharpness 60, range to 100). Software has its
+// own table below. A saved value is never changed; a saved sharpness above
+// the range is kept until the slider moves.
 void MainWindow::applyFollowingDefaults()
 {
     if (!m_grain || !m_sharp || !m_texSmooth)
@@ -607,14 +608,30 @@ void MainWindow::applyFollowingDefaults()
     if (!s.contains("video/filter") && m_filter->current() != 3)
         m_filter->showCurrent(defaultFilterIndex());
 
-    m_grain->setDefault(fine ? 50 : 100);
+    // The software renderer always draws the PS2 picture at its own size
+    // (448 lines); the more it is enlarged, the more grain and sharpening
+    // show. By how many times the output is taller than that:
+    //   3x and more (1440p, 4K): grain 50 %, sharpness 40, range to 70
+    //   2x to 3x (1080p):        grain 75 %, sharpness 50
+    //   below 2x:                the original values
+    int grain = 100, sharp = 60, sharpMax = 100;
+    if (fine) {
+        grain = 50, sharp = 50, sharpMax = 75;
+    } else if (!gpu) {
+        const double r = outputSize().height() / 448.0;
+        if (r >= 3)
+            grain = 50, sharp = 40, sharpMax = 70;
+        else if (r >= 2)
+            grain = 75, sharp = 50;
+    }
+    m_grain->setDefault(grain);
     if (!s.contains("video/film_grain"))
-        m_grain->showValue(m_grain->defaultValue());
+        m_grain->showValue(grain);
 
-    m_sharp->setMaximum(fine ? 75 : 100);
-    m_sharp->setDefault(fine ? 50 : 60);
+    m_sharp->setMaximum(sharpMax);
+    m_sharp->setDefault(sharp);
     if (!s.contains("video/sharpness"))
-        m_sharp->showValue(m_sharp->defaultValue());
+        m_sharp->showValue(sharp);
 
     // Untouched, the game decides ("auto": smooth from 2x on a separate
     // graphics card); the switch shows what that comes to.
@@ -663,9 +680,13 @@ void MainWindow::updateOptionStates()
     const bool pad = m_pad->current() != 3;
     m_deadzone->setEnabled(pad);
     setColor(m_deadzoneLabel, pad ? on : off);
+    // Which renderer is in use is said where the player looks first; nobody
+    // should be on Software without knowing.
+    const bool hasCard = g_gpu.kind == GpuInfo::Discrete || g_gpu.kind == GpuInfo::Integrated;
     setElided(m_displayNote,
-              gpu ? QString("Frame rate and V-Sync use the GPU renderer.")
-                  : QString("Choosing a frame rate, or changing V-Sync, switches to the GPU renderer."));
+              gpu ? QString("Renderer: GPU (Vulkan)%1. Frame rate and V-Sync use it.")
+                        .arg(hasCard ? " - " + g_gpu.name : QString())
+                  : QString("Renderer: Software. Choosing a frame rate, or changing V-Sync, switches to GPU."));
     setElided(m_fsrNote, fsr3 ? QString("FSR 3.1 renders at a low internal resolution and reconstructs detail over time.")
                               : QString("FSR 1.0: sharper upscaling of the picture to the chosen resolution."));
     // With the software renderer FSR 1.0 is worked out on the processor,
