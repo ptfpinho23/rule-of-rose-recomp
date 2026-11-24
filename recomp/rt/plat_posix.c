@@ -150,6 +150,7 @@ u64 plat_cpu_ns(void) {
     struct timespec t; clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &t);
     return (u64)t.tv_sec * 1000000000ull + (u64)t.tv_nsec;
 }
+void plat_thread_role(int role) { (void)role; }
 void plat_sleep_until(u64 t_ns) {
     struct timespec t = { (time_t)(t_ns / 1000000000ull), (long)(t_ns % 1000000000ull) };
     clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &t, 0);

@@ -35,6 +35,12 @@ static int want_gpu, gpu_internal = 4, gpu_vsync = 1, gpu_swap;      /* --render
 static int gpu_fps, gpu_interp;          /* --fps: 0 off, -1 display rate, N; gpu_interp: the presenter thread is running */
 static int want_fsr3;                    /* --filter fsr3: FSR 3.1 temporal upscaling on the GPU renderer; everywhere else it is --filter fsr */
 static u64 pace_next;                    /* ideal time of the next emulated vblank (50 Hz pacing clock) */
+/* --frameskip auto|off. auto: while the game runs behind its 50 Hz clock in a window, the renderer leaves out
+ * whole frames (gs_frameskip) so that game speed and sound stay right and only the picture rate drops.
+ * Never in unpaced or headless runs, with frame interpolation or FSR 3.1 (they pair consecutive frames). */
+static int frameskip = 1;
+#define FRAMESKIP_LATE_NS 6000000ll      /* ask for a skip when a vblank ends this far behind its time ... */
+#define FRAMESKIP_OK_NS 1000000ll        /* ... and stop asking once within this of it */
 static PostSettings post_cfg = { POST_FSR, 0, 60, 0, 0, 100, 100, 0 };
 static u32 *out_px; static int out_w, out_h; static size_t out_cap;
 static double post_ms, show_ms; static u32 post_n;
@@ -57,6 +63,10 @@ int video_option(const char *name, const char *value) {
     if (!strcmp(name, "internal")) {
         if (!value || strlen(value) != 1 || value[0] < '1' || value[0] > '8') return 0;
         gpu_internal = value[0] - '0'; return 1;
+    }
+    if (!strcmp(name, "frameskip")) {
+        if (value && !strcmp(value, "auto")) frameskip = 1; else if (value && !strcmp(value, "off")) frameskip = 0; else return 0;
+        return 1;
     }
     if (!strcmp(name, "fps")) {                   /* frame interpolation target: 0 = off, display, or 25..1000 */
         if (value && !strcmp(value, "display")) { gpu_fps = -1; return 1; }
@@ -101,6 +111,19 @@ static void run_post(const u32 *px, int w, int h, int ow, int oh) {
 }
 /* ROR_SHOT_FROM=frame (testing): --shots saves nothing before that frame */
 static u64 shot_from(void) { static s64 f = -1; if (f < 0) { const char *e = getenv("ROR_SHOT_FROM"); f = e ? (s64)strtoll(e, 0, 10) : 0; } return (u64)f; }
+/* The same, unless it was done already for these very pixels: the game draws a new picture every second vblank
+ * at most, and while the GS hands out the same pixels (g_gs_frame_id) for the same output size, rectangle and
+ * settings, the picture made last time is still right. Returns 1 if a new one was made. */
+static int post_frame(const u32 *px, int w, int h, int ow, int oh) {
+    static u64 done_id = ~0ull; static int done_w, done_h, done_ow, done_oh, done_rect[4];
+    static PostSettings done_cfg;
+    int rect[4]; post_rect(ow, oh, &post_cfg, &rect[0], &rect[1], &rect[2], &rect[3]);
+    if (g_gs_frame_id == done_id && w == done_w && h == done_h && ow == done_ow && oh == done_oh && out_px && out_w == ow && out_h == oh &&
+        !memcmp(rect, done_rect, sizeof rect) && !memcmp(&post_cfg, &done_cfg, sizeof post_cfg)) return 0;
+    run_post(px, w, h, ow, oh);
+    done_id = g_gs_frame_id; done_w = w; done_h = h; done_ow = ow; done_oh = oh; memcpy(done_rect, rect, sizeof rect); done_cfg = post_cfg;
+    return 1;
+}
 void video_config(int window, int shots, int frames, int nosync) {
     want_window = window; shot_every = shots; max_frames = frames; no_sync = nosync;
     gs_renderer(want_gpu, gpu_internal);        /* takes effect in gs_init (hw_init, called next) */
@@ -148,9 +171,98 @@ void save_png(const char *path, const u32 *px, int w, int h) {
     fclose(f); free(raw); free(z);
 }
 
+/* ---- ROR_PERFLOG=1: one line per second and a summary at exit --------------------------------
+ * [perf] F vblanks N behind B slip S max M ms | ee E vu V gs G tex T(n) pair P gpu W show S sleep Z ms
+ *        | pres R/s p50 a p95 b p99 c max d ms over8 x over16 y | frames F interp I up U cut C nostart S nopkg D texrepl X
+ *        | audio min Q ms starved K
+ * F: number of the last tick. vblanks: emulated 50 Hz ticks in the interval (paced ones only);
+ * behind: ticks that started more than a whole tick (20 ms) after their time on the 50 Hz schedule
+ * (the game ran in slow motion there; a game frame is two ticks, and the first of the two may run
+ * long without harm); slip: the largest delay against the schedule; max: the longest tick. Per tick,
+ * mean ms, each without the time of the ones after it in this list: ee = everything not named
+ * (game code, VIF, GIF and GS command handling outside VU1 kicks), vu = VU1 programs, gs = handling
+ * the primitives they send, tex = decoding textures and handing them to the GPU (n = textures
+ * decoded in the interval), pair = frame interpolation bookkeeping at the frame boundary, gpu =
+ * waiting for the GPU (wherever it happened), show = window, input and presenting, sleep = waiting
+ * for the next tick. pres: pictures presented
+ * per second by the interpolation thread and their intervals; over8 / over16: intervals longer than
+ * 8.4 / 16.7 ms. frames: game frames, how many were interpolated, and why the others were not (upload
+ * into a render target, a cut, no start-of-frame copy, presenter behind); texrepl: frames in which a
+ * GPU texture was replaced (for information). audio:
+ * the lowest level in the interval of a model queue (starts at 60 ms, holds at most 100, fed 20 ms
+ * per tick, drained by the clock, refilled to 60 after running empty) and how often it ran empty; no
+ * device is involved. */
+extern int g_perf_on; extern u64 g_perf[12]; extern u32 g_perf_hist[258]; extern u64 g_perf_pres_max;
+extern int g_vu_stat; extern u64 g_vu_stat_ticks[5];
+extern u64 hw_stat_wait_ns __attribute__((weak));
+typedef struct { u64 n, late, slip, maxi, ns, vu, gs1, tex, pair, gpu, gpu_show, gpu_pair, show, sleep, texn, pres, o8, o16, pmax, fr[7], starved; double amin; u32 hist[258]; } PerfAcc;
+static int perf_sites[16];
+static PerfAcc perf_sec, perf_all; static double perf_tick_ns; static u64 perf_show_ns, perf_sleep_ns, perf_show_gpu, perf_slip; static int perf_paced; static double perf_audio = 60.0;
+static double perf_pct(const u32 *h, u64 n, double q) { u64 want = (u64)((double)n * q), c = 0; for (int i = 0; i < 258; i++) { c += h[i]; if (c > want) return (i + 0.5) * 0.25; } return 0; }
+static void perf_line(const char *tag, const PerfAcc *a, double secs) {
+    double k = a->n ? 1e-6 / (double)a->n : 0;
+    /* show holds the boundary work (pair) and its GPU waits; the kicks (gs1) hold texture work and the other GPU waits */
+    double rest = (double)a->ns - (double)a->vu - (double)a->gs1 - (double)a->show - (double)a->sleep;
+    double gs = (double)a->gs1 - (double)a->tex - ((double)a->gpu - (double)a->gpu_show); if (gs < 0) gs = 0;
+    double pair = (double)a->pair - (double)a->gpu_pair, show = (double)a->show - (double)a->pair - ((double)a->gpu_show - (double)a->gpu_pair);
+    if (rest < 0) rest = 0; if (pair < 0) pair = 0; if (show < 0) show = 0;
+    rt_log("[perf] %s vblanks %llu behind %llu slip %.1f max %.1f ms | ee %.2f vu %.2f gs %.2f tex %.2f(%llu) pair %.2f gpu %.2f show %.2f sleep %.2f ms"
+           " | pres %.0f/s p50 %.1f p95 %.1f p99 %.1f max %.1f ms over8 %llu over16 %llu | frames %llu interp %llu up %llu cut %llu nostart %llu nopkg %llu texrepl %llu"
+           " | audio min %.0f ms starved %llu\n", tag, (unsigned long long)a->n, (unsigned long long)a->late, a->slip / 1e6, a->maxi / 1e6,
+           rest * k, a->vu * k, gs * k, a->tex * k, (unsigned long long)a->texn, pair * k, a->gpu * k, show * k, a->sleep * k,
+           secs > 0 ? (double)a->pres / secs : 0.0, perf_pct(a->hist, a->pres, 0.5), perf_pct(a->hist, a->pres, 0.95), perf_pct(a->hist, a->pres, 0.99), a->pmax / 1e6,
+           (unsigned long long)a->o8, (unsigned long long)a->o16, (unsigned long long)a->fr[0], (unsigned long long)a->fr[1], (unsigned long long)a->fr[2],
+           (unsigned long long)a->fr[4], (unsigned long long)a->fr[5], (unsigned long long)a->fr[6], (unsigned long long)a->fr[3], a->amin, (unsigned long long)a->starved);
+}
+static void perf_exit(void) { if (perf_all.n) perf_line("total", &perf_all, (double)perf_all.ns / 1e9); }
+static void perf_tick(void) {
+    static int on = -1; static u64 last, lw, tsc0, t0;
+    if (on < 0) { on = getenv("ROR_PERFLOG") != 0; if (on) { g_perf_on = atoi(getenv("ROR_PERFLOG")) > 1 ? 2 : 1; g_vu_stat = 2; atexit(perf_exit); perf_sec.amin = perf_all.amin = 100.0; } }
+    if (!on) return;
+    u64 now = plat_time_ns(), tsc = __builtin_ia32_rdtsc();
+    if (!last) { last = now; tsc0 = tsc; t0 = now; lw = &hw_stat_wait_ns ? hw_stat_wait_ns : 0; memset(g_vu_stat_ticks, 0, sizeof g_vu_stat_ticks); memset(g_perf, 0, sizeof g_perf); memset(g_perf_hist, 0, sizeof g_perf_hist); return; }
+    if (now - t0 > 200000000ull) perf_tick_ns = (double)(now - t0) / (double)(tsc - tsc0);
+    PerfAcc *a = &perf_sec; u64 d = now - last; last = now;
+    if (!perf_paced) {                 /* fast-forwarded or unpaced ticks are not counted */
+        memset(g_vu_stat_ticks, 0, sizeof g_vu_stat_ticks); memset(g_perf, 0, sizeof g_perf); memset(g_perf_hist, 0, sizeof g_perf_hist); g_perf_pres_max = 0;
+        lw = &hw_stat_wait_ns ? hw_stat_wait_ns : 0; perf_show_ns = perf_sleep_ns = perf_show_gpu = perf_slip = 0;
+        return;
+    }
+    a->n++; a->ns += d; if (perf_slip > 20000000ull) a->late++; if (perf_slip > a->slip) a->slip = perf_slip; if (d > a->maxi) a->maxi = d;
+    perf_slip = 0;
+    a->vu += (u64)((double)(g_vu_stat_ticks[0] - g_vu_stat_ticks[1]) * perf_tick_ns); a->gs1 += (u64)((double)g_vu_stat_ticks[1] * perf_tick_ns);
+    memset(g_vu_stat_ticks, 0, sizeof g_vu_stat_ticks);
+    a->tex += g_perf[0] + g_perf[2]; a->texn += g_perf[1]; a->pair += g_perf[3]; a->gpu_pair += g_perf[11]; a->gpu_show += perf_show_gpu; perf_show_gpu = 0;
+    for (int i = 0; i < 7; i++) a->fr[i] += g_perf[4 + i];
+    memset(g_perf, 0, sizeof g_perf);
+    { u64 w = &hw_stat_wait_ns ? hw_stat_wait_ns : 0; a->gpu += w - lw; lw = w; }
+    a->show += perf_show_ns; a->sleep += perf_sleep_ns; perf_show_ns = perf_sleep_ns = 0;
+    if (g_perf_on > 1) { extern int hw_flush_counts[16] __attribute__((weak)); if (&hw_flush_counts[0]) for (int i = 0; i < 16; i++) perf_sites[i] += hw_flush_counts[i]; }
+    perf_audio += 20.0 - (double)d / 1e6;
+    if (perf_audio > 100.0) perf_audio = 100.0;
+    if (perf_audio < 0.0) { perf_audio = 60.0; a->starved++; if (a->amin > 0.0) a->amin = 0.0; }      /* ran empty: a device would fill up again */
+    if (perf_audio < a->amin) a->amin = perf_audio;
+    if (a->n < 50) return;
+    for (int i = 0; i < 258; i++) { u32 c = g_perf_hist[i]; g_perf_hist[i] = 0; a->hist[i] = c; a->pres += c; if (i >= 34) a->o8 += c; if (i >= 67) a->o16 += c; }
+    a->pmax = g_perf_pres_max; g_perf_pres_max = 0;
+    { char tag[32]; snprintf(tag, sizeof tag, "%llu", (unsigned long long)frame_no); perf_line(tag, a, (double)a->ns / 1e9); }
+    if (g_perf_on > 1) { extern int hw_flush_sites[16], hw_flush_counts[16] __attribute__((weak)); char b[256]; int o = 0; b[0] = 0;
+        if (&hw_flush_counts[0]) for (int i = 0; i < 16; i++) if (perf_sites[i]) { o += snprintf(b + o, sizeof b - (size_t)o, " %d:%d", hw_flush_sites[i], perf_sites[i]); perf_sites[i] = 0; }
+        rt_log("[perf]   blocking GPU submits by source line:%s\n", b[0] ? b : " none"); }
+    if (g_perf_on > 1) { extern u64 g_perf_tx[8]; rt_log("[perf]   textures decoded: %llu new, %llu other palette, %llu other content, %llu drawn into (%llu texels); %llu found under another address\n", (unsigned long long)g_perf_tx[0], (unsigned long long)g_perf_tx[1], (unsigned long long)g_perf_tx[2], (unsigned long long)g_perf_tx[3], (unsigned long long)g_perf_tx[5], (unsigned long long)g_perf_tx[4]); memset(g_perf_tx, 0, sizeof g_perf_tx); }
+    PerfAcc *t = &perf_all;
+    t->n += a->n; t->late += a->late; if (a->slip > t->slip) t->slip = a->slip; t->gpu_show += a->gpu_show; t->gpu_pair += a->gpu_pair; if (a->maxi > t->maxi) t->maxi = a->maxi; t->ns += a->ns; t->vu += a->vu; t->gs1 += a->gs1; t->tex += a->tex; t->pair += a->pair; t->gpu += a->gpu;
+    t->show += a->show; t->sleep += a->sleep; t->texn += a->texn; t->pres += a->pres; t->o8 += a->o8; t->o16 += a->o16; if (a->pmax > t->pmax) t->pmax = a->pmax;
+    for (int i = 0; i < 7; i++) t->fr[i] += a->fr[i];
+    for (int i = 0; i < 258; i++) t->hist[i] += a->hist[i];
+    t->starved += a->starved; if (a->amin < t->amin) t->amin = a->amin;
+    memset(a, 0, sizeof *a); a->amin = 100.0;
+}
 void video_present(void) {
     u32 *px = 0; int w = 0, h = 0;
     frame_no++;
+    perf_tick();
+    u64 perf_in = plat_time_ns(), perf_gw = &hw_stat_wait_ns ? hw_stat_wait_ns : 0;
     { static int trace = -1; static u64 last, lastc; u64 t = plat_time_ns(), c = plat_cpu_ns();      /* ROR_STALLTRACE=frame: log late vblanks */
       if (trace < 0) trace = getenv("ROR_STALLTRACE") ? atoi(getenv("ROR_STALLTRACE")) : 0;
       extern u64 hw_stat_wait_ns, hw_stat_flushes __attribute__((weak)); static u64 lw, lf;
@@ -254,10 +366,14 @@ void video_present(void) {
                 gs_hw_show(rx, ry, rw, rh, ow, oh, gpu_filter(), post_lut(&post_cfg, lut) ? lut : 0, (post_cfg.saturation * 64 + 50) / 100);
                 show_ms += (double)(plat_time_ns() - t0) / 1e6; post_n++;
             } else if (have && ow > 0 && oh > 0) {
-                run_post(px, w, h, ow, oh); posted = 1;
-                u64 t0 = plat_time_ns();
-                vwin_show(out_px, ow, oh);
-                show_ms += (double)(plat_time_ns() - t0) / 1e6;
+                static int since;
+                int fresh = post_frame(px, w, h, ow, oh); posted = 1;
+                if (fresh || ++since >= 12) {            /* an unchanged picture: only refreshed now and then (the window may have been covered) */
+                    u64 t0 = plat_time_ns();
+                    vwin_show(out_px, ow, oh);
+                    show_ms += (double)(plat_time_ns() - t0) / 1e6;
+                    since = 0;
+                }
             }
             vwin_flush();
         }
@@ -270,7 +386,7 @@ void video_present(void) {
         int ow = sw, oh = sh; const char *e = getenv("ROR_POST_SIZE");
         if (e && sscanf(e, "%dx%d", &ow, &oh) != 2) { ow = sw; oh = sh; }
         if (ow < 16 || oh < 16 || ow > 8192 || oh > 8192) { ow = sw; oh = sh; }
-        run_post(px, w, h, ow, oh); posted = 1;
+        post_frame(px, w, h, ow, oh); posted = 1;
     }
     if (gpu && (shot_now & 1) && !posted) {                /* GPU renderer: the presentation pass, off screen */
         int ow = sw, oh = sh, rx, ry, rw, rh; static u8 lut[256]; u32 *gp;
@@ -291,12 +407,29 @@ void video_present(void) {
         rt_log("[video] %llu frames, %llu primitives drawn\n", (unsigned long long)frame_no, (unsigned long long)g_gs_prims);
         exit(0);
     }
+    perf_show_ns += plat_time_ns() - perf_in; perf_show_gpu += (&hw_stat_wait_ns ? hw_stat_wait_ns : 0) - perf_gw; perf_paced = !no_sync && !fast;
     if (!no_sync && !fast) {                         /* pace to 50 Hz */
         u64 now = plat_time_ns();
         if (!pace_next) pace_next = now;
         pace_next += 20000000;
         s64 ahead = (s64)(pace_next - now);
-        if (ahead > 0) plat_sleep_until(pace_next);
+        {   static int asking, logged; static u64 last_skipped;
+            if (frameskip && win_open && !gpu_interp && !want_fsr3) {
+                if (ahead < -FRAMESKIP_LATE_NS) asking = 1; else if (ahead > -FRAMESKIP_OK_NS) asking = 0;
+            } else asking = 0;
+            gs_frameskip(asking);
+            if (frame_no % 500 == 0) {
+                u64 sk, fr; gs_frameskip_stats(&sk, &fr);
+                if (sk != last_skipped && (!logged || getenv("ROR_FPSLOG"))) {       /* once; with ROR_FPSLOG every time */
+                    rt_log("[video] this machine is not keeping up at these settings: %llu pictures were left out in the last 500 vblanks (10 s) to keep the game and its sound at full speed (--frameskip off turns this off)\n",
+                           (unsigned long long)(sk - last_skipped));
+                    logged = 1;
+                }
+                last_skipped = sk;
+            }
+        }
+        if (ahead > 0) { plat_sleep_until(pace_next); perf_sleep_ns += plat_time_ns() - now; }
         else if (ahead < -200000000ll) pace_next = now;
+        if (ahead < 0) perf_slip = (u64)-ahead;
     }
 }

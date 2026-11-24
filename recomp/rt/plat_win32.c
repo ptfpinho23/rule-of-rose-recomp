@@ -52,6 +52,8 @@ void plat_init(int *argc, char ***argv) {
         LocalFree(wargv);
     }
     timeBeginPeriod(1);                      /* 1 ms scheduler granularity for the frame pacing */
+    { const char *e = getenv("ROR_AFFINITY"); if (e) SetProcessAffinityMask(GetCurrentProcess(), (DWORD_PTR)strtoull(e, 0, 16)); }     /* test: hexadecimal mask of the logical processors to use */
+    plat_thread_role(0);
 }
 void plat_exe_dir(char *out, size_t n) {
     wchar_t w[WPATH];
@@ -274,6 +276,26 @@ u64 plat_cpu_ns(void) {
     if (!GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u)) return 0;
     u64 kk = ((u64)k.dwHighDateTime << 32) | k.dwLowDateTime, uu = ((u64)u.dwHighDateTime << 32) | u.dwLowDateTime;
     return (kk + uu) * 100;
+}
+/* The game thread and, with frame interpolation, the presenter are both busy most of the time. When the
+ * scheduler puts them on the two logical processors of one core, each runs at little more than half speed
+ * and the game drops into slow motion in heavy scenes (seen in about one run in four on a 12-core
+ * processor with two threads per core). Each gets a preferred processor on a core of its own - a hint, not
+ * a restriction - and a priority just above normal, so that background work does not push it aside.
+ * ROR_NOPIN=1 leaves both to the system. */
+void plat_thread_role(int role) {
+    if (getenv("ROR_NOPIN")) return;
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    SYSTEM_LOGICAL_PROCESSOR_INFORMATION info[256]; DWORD len = sizeof info; DWORD_PTR pm = 0, sm = 0;
+    if (!GetLogicalProcessorInformation(info, &len) || !GetProcessAffinityMask(GetCurrentProcess(), &pm, &sm)) return;
+    int first[64], n = 0;                         /* first usable logical processor of every core */
+    for (DWORD i = 0; i < len / sizeof info[0] && n < 64; i++) {
+        if (info[i].Relationship != RelationProcessorCore) continue;
+        DWORD_PTR m = info[i].ProcessorMask & pm;
+        for (int b = 0; b < 64; b++) if (m & ((DWORD_PTR)1 << b)) { first[n++] = b; break; }
+    }
+    if (n < 4) return;                            /* few cores: nothing to gain by choosing */
+    SetThreadIdealProcessor(GetCurrentThread(), (DWORD)first[role == 0 ? n / 2 : n / 2 + 1]);     /* away from the first cores, where the system's own work lands */
 }
 void plat_sleep_until(u64 t_ns) {
     /* A high-resolution waitable timer where the system has one (Windows 10

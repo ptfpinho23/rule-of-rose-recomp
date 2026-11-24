@@ -23,6 +23,11 @@ int  gs_snapshot(FILE *f, int save);
  * `internal` times the PS2 resolution (1..8). If no usable device is found
  * the software renderer is used (one log line says so). */
 void gs_renderer(int gpu, int internal);
+/* Frame skipping: while want is set, whole frames the game draws are left out
+ * (at most two in a row, and only frames that start by clearing the picture);
+ * the display keeps the newest complete picture. See "frame skipping" in gs.c. */
+void gs_frameskip(int want);
+void gs_frameskip_stats(u64 *skipped, u64 *frames);   /* frames left out / frames the game finished, so far */
 void gs_film_grain(int pct);                          /* --film-grain 0..100 (100 = the game's own strength; both renderers) */
 int  gs_hw_active(void);                              /* 1 when the GPU renderer is drawing */
 /* --filter fsr3, before gs_init: ask for FSR 3.1 temporal upscaling on the GPU
@@ -55,6 +60,7 @@ int  gs_hw_show_pixels(int dx, int dy, int dw, int dh, int ww, int wh, int linea
 
 extern u32 g_gs_imr;
 extern u64 g_gs_prims, g_gs_frames;
+extern u64 g_gs_frame_id;       /* identifies the picture gs_get_frame last returned: unchanged = the same pixels again */
 
 /* gif.c */
 enum { GIF_PATH1, GIF_PATH2, GIF_PATH3 };

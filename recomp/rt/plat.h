@@ -56,6 +56,7 @@ void plat_co_free(PlatCo *co);                      /* co must not be running */
 u64  plat_time_ns(void);                            /* monotonic */
 u64  plat_cpu_ns(void);                             /* CPU time used by the process, all threads */
 void plat_sleep_until(u64 t_ns);                    /* on the plat_time_ns clock */
+void plat_thread_role(int role);                    /* the calling thread is 0 the game thread, 1 the picture presenter: see plat_win32.c */
 void plat_gmtime(s64 t, struct tm *out);
 
 /* ---- files -------------------------------------------------------------- */

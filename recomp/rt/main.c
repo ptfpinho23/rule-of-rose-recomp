@@ -38,7 +38,7 @@ static const char *find_iso(void) {
 
 static int is_picture_option(const char *a) {
     static const char *const names[] = { "--scale", "--res", "--aspect", "--filter", "--sharpness", "--brightness", "--contrast",
-                                         "--gamma", "--saturation", "--bloom", "--renderer", "--internal", "--vsync", "--fps" };
+                                         "--gamma", "--saturation", "--bloom", "--renderer", "--internal", "--vsync", "--fps", "--frameskip" };
     for (unsigned i = 0; i < sizeof names / sizeof *names; i++) if (!strcmp(a, names[i])) return 1;
     return 0;
 }
@@ -47,6 +47,7 @@ static void usage(const char *prog) {
         "          [--filter nearest|bilinear|fsr|fsr3] [--sharpness 0-100] [--brightness -100..100] [--contrast -100..100]\n"
         "          [--gamma 50-200] [--saturation 0-200] [--bloom 0-100]\n"
         "          [--renderer software|gpu] [--internal 1-8] [--vsync 0|1] [--fps 0|display|25-1000]\n"
+        "          [--frameskip auto|off]   (auto: leave out pictures, not game time, when the machine is too slow)\n"
         "          [--wide off|16:9|21:9|32:9|W:H|ratio]   (widescreen 3D; ratio 1.0-3.6, 4:3 = off)\n"
         "          [--film-grain 0-100]   (the game's film grain; 100 = original, 0 = off)\n"
         "          [--texture-filter auto|original|smooth]   (GPU renderer: smooth filters distant textures; auto = smooth from --internal 2 on a discrete graphics card)\n"

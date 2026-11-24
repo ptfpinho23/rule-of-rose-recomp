@@ -8,6 +8,14 @@
  *     pictures are then garbage, but they are the same garbage in any correct
  *     renderer, which lets the captures exercise formats and buffer overlaps
  *     the game itself never uses.
+ * -fuzz SEED: rewrite, pseudo-randomly, the alpha test (function, reference,
+ *     fail action), the depth test function and the depth write mask, the
+ *     blend equation and its constant, the texture-alpha bit, vertex colours
+ *     and the fraction of texel coordinates. Same idea as -fpsm: the pictures
+ *     are garbage but must be the same garbage from every correct renderer, so
+ *     two builds (or one build with and without a code path, e.g.
+ *     ROR_GS_NOSPRITE4=1) can be compared on state combinations the game never
+ *     uses. The image hash depends on SEED.
  * frames.raw: per frame "u32 w, u32 h, w*h u32 pixels" (w = h = 0: display off).
  * Build/run with recomp/tools/gsreplay.sh. */
 #define _POSIX_C_SOURCE 200809L
@@ -123,6 +131,7 @@ static void prof_stop(void) {}
 #endif
 
 u64 plat_time_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (u64)t.tv_sec * 1000000000ull + (u64)t.tv_nsec; }
+void plat_thread_role(int role) { (void)role; }
 void plat_sleep_until(u64 t_ns) { while (plat_time_ns() < t_ns) { struct timespec d = { 0, 200000 }; nanosleep(&d, 0); } }
 static double now_ms(void) {
     struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
@@ -130,8 +139,38 @@ static double now_ms(void) {
 }
 static int cmp_d(const void *a, const void *b) { double x = *(const double *)a, y = *(const double *)b; return x < y ? -1 : x > y; }
 
+static u64 fz_state;
+static u32 fz(void) { fz_state ^= fz_state << 13; fz_state ^= fz_state >> 7; fz_state ^= fz_state << 17; return (u32)(fz_state >> 16); }
+static u64 fuzz_reg(u8 reg, u64 d) {
+    static const u8 arefs[8] = { 0, 1, 2, 127, 128, 129, 254, 255 };
+    switch (reg) {
+    case 0x47: case 0x48:           /* TEST: ATST, AREF, AFAIL, ZTST */
+        if (fz() & 1) d = (d & ~0xEull) | ((u64)(fz() & 7) << 1);
+        if (fz() & 1) d = (d & ~0xFF0ull) | ((u64)((fz() & 1) ? arefs[fz() & 7] : (fz() & 255)) << 4);
+        if (fz() & 1) d = (d & ~0x3000ull) | ((u64)(fz() & 3) << 12);
+        if (!(fz() & 3)) d = (d & ~0x60000ull) | ((u64)(1 + fz() % 3) << 17);
+        break;
+    case 0x42: case 0x43:           /* ALPHA: A, B, C, D, FIX */
+        if (fz() & 1) d = (d & ~0xFFull) | (fz() & 255);
+        if (fz() & 1) d = (d & ~(0xFFull << 32)) | ((u64)(fz() & 255) << 32);
+        break;
+    case 0x06: case 0x07:           /* TEX0: TCC */
+        if (!(fz() & 3)) d ^= 1ull << 34;
+        break;
+    case 0x4E: case 0x4F:           /* ZBUF: ZMSK */
+        if (!(fz() & 3)) d ^= 1ull << 32;
+        break;
+    case 0x01:                      /* RGBAQ: colour */
+        if (!(fz() & 3)) d = (d & ~0xFFFFFFFFull) | fz();
+        break;
+    case 0x03:                      /* UV: fractions */
+        if (!(fz() & 3)) d ^= (fz() & 15) | ((u64)(fz() & 15) << 16);
+        break;
+    }
+    return d;
+}
 int main(int argc, char **argv) {
-    const char *cap = 0, *out = 0; int loops = 1, max_frames = 0, coalesce = 0, fpsm = -1, zpsm = -1;
+    const char *cap = 0, *out = 0; int loops = 1, max_frames = 0, coalesce = 0, fpsm = -1, zpsm = -1; u64 fuzz = 0;
     static u8 cbuf[1u << 22];
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-o") && i + 1 < argc) out = argv[++i];
@@ -141,6 +180,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-hw") && i + 1 < argc) setenv("ROR_GS_HW", argv[++i], 1);   /* GPU renderer at this scale */
         else if (!strcmp(argv[i], "-fpsm") && i + 1 < argc) fpsm = (int)strtol(argv[++i], 0, 0);
         else if (!strcmp(argv[i], "-zpsm") && i + 1 < argc) zpsm = (int)strtol(argv[++i], 0, 0);
+        else if (!strcmp(argv[i], "-fuzz") && i + 1 < argc) fuzz = strtoull(argv[++i], 0, 0) * 0x9E3779B97F4A7C15ull + 1;
         else cap = argv[i];
     }
     if (!cap) { fprintf(stderr, "usage: gsreplay CAP [-o frames.raw] [-n loops] [-f frames]\n"); return 2; }
@@ -197,6 +237,7 @@ int main(int argc, char **argv) {
     for (int loop = 0; loop < loops; loop++) {
         if (loop) { fseek(f, snap_pos, SEEK_SET); gs_snapshot(f, 0); }
         size_t p = 0; int frames = 0;
+        fz_state = fuzz;
         double t0 = now_ms();
         while (p < n) {
             u8 type = ev[p++];
@@ -204,6 +245,7 @@ int main(int argc, char **argv) {
                 u64 d; memcpy(&d, ev + p + 1, 8);
                 if (fpsm >= 0 && (ev[p] == 0x4C || ev[p] == 0x4D)) d = (d & ~(0x3Full << 24)) | ((u64)fpsm << 24);
                 if (zpsm >= 0 && (ev[p] == 0x4E || ev[p] == 0x4F)) d = (d & ~(0xFull << 24)) | ((u64)zpsm << 24);
+                if (fuzz) d = fuzz_reg(ev[p], d);
                 gs_write_reg(ev[p], d); p += 9;
             }
             else if (type == 2) {

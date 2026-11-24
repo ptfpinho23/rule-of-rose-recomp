@@ -1525,3 +1525,145 @@ frames, post-processed picture via `--post-shots`):
 512x448 and enlarged 4.2 times, so every speck is a blob four to five
 screen pixels wide; its strength sets the mean, sharpening mostly adds
 outliers (2.5 times as many strongly changing pixels at 88 as at 0).
+
+## Stutter on the GPU path with frame interpolation; performance patches (2026-11-24)
+
+Reported at `--renderer gpu --internal 4 --filter fsr --sharpness 88 --aspect
+stretch --res desktop --fps display`, V-Sync on, RTX 3090: "kind of slow,
+stuttering and slow-downs".
+
+### `ROR_PERFLOG=1`
+One `[perf]` line per second of paced play and `[perf] total` at exit
+(`video.c`, `perf_tick`; the comment above it explains every field):
+ticks, ticks more than 20 ms behind the 50 Hz schedule and the largest delay,
+mean ms per tick by component (game code, VU1, GS handling, textures, pairing,
+waiting for the GPU, presenting, sleeping), the presenter's pictures per
+second and interval percentiles, how many game frames were interpolated and
+why the others were not, and a model sound queue. `ROR_PERFLOG=2` adds the
+causes of texture decodes and the source lines of blocking GPU submits. The
+counters cost a few clock reads per tick.
+
+### What was wrong (uphill walk, vblanks 21300-25050, paced window)
+1. **Textures decoded again and again.** The game moves textures to other
+   places in GS memory while it streams an area in; the cache was keyed by
+   address first, so the same texels with the same palette were decoded (and
+   a GPU texture with mip levels made) again under every new address: 2853
+   decodes in 75 s, in bursts of 400-600 a second (40 million texels,
+   4 ms per tick averaged over such a second, single ticks 50-80 ms late).
+   Nine of ten were already in the cache. Now an entry with the same format,
+   size, palette and page contents is moved to the new address
+   (`texcache_get`): 214 decodes. The software renderer uses the same cache.
+2. **Frames shown without in-betweens because a texture had been replaced**
+   (300 of 1873): each one is a 40 ms step in an otherwise 4 ms sequence.
+   GPU textures are immutable and stay alive for the packages that use them,
+   so this never needed to stop interpolation; removed. 1863 of 1873 frames
+   are now interpolated, the rest are cuts and one upload into a target.
+3. **The game thread waited for the GPU twice per frame** (after publishing
+   a package and at every vblank): 2.3-3.3 ms per tick at 4x. With `--fps`
+   it now uses the "not waiting for the GPU" mechanism of the performance
+   patches (below) too; the presenter takes a package only when the GPU has
+   finished the submission it depends on (`hw_serial_done`). Palette
+   read-backs are collected when ready instead of forcing a wait. 0.00 ms.
+4. **Game thread and presenter on one processor core.** Both are busy most
+   of the time; when Windows put them on the two logical processors of one
+   core, all of the game thread's work took 1.6-2 times as long and the game
+   went into slow motion in the heaviest part of the walk (4 of 14 runs
+   before, one of them the whole-script run with 340 ticks behind; 0 of 5
+   with one logical processor per core allowed, 0 of 14 with the fix).
+   `plat_thread_role` (Windows) gives each a preferred processor on a core
+   of its own and a priority just above normal. `ROR_NOPIN=1` turns it off,
+   `ROR_AFFINITY=hexmask` restricts the process (testing).
+
+### Before / after, RTX 3090, 3612x2032 window, 4x, FSR 1.0, sharpness 88
+Display at 144 Hz during these runs (`--fps display` presented 144), so the
+240 rows use `--fps 240 --vsync 0`. "before" = the tree before this section
+with the statistics added.
+
+| run | presents/s | p99 / max interval | intervals > 16.7 ms | frames interpolated | ticks behind | model sound queue empty |
+|---|---|---|---|---|---|---|
+| uphill, display rate, before | 126 | 40.6 / 118 ms | 319 | 1566 of 1873 | - | 3 |
+| uphill, display rate, after | 143 | 10.9 / 128 ms | 11 | 1863 of 1873 | 0 | 1 |
+| uphill, 240, before | 195 | 40.4 / 135 ms | 352 | 1566 of 1873 | - | 33 |
+| uphill, 240, after | 238 | 8.1 / 134 ms | 11 | 1863 of 1873 | 0 | 1 |
+| to the right, 240, before | 213 | 38.1 / 65 ms | 242 | 1641 of 1876 | - | 9 |
+| to the right, 240, after | 239 | 8.1 / 43 ms | 4 | 1872 of 1876 | 0 | 1 |
+| whole script from the start, 240, after | 211 | 23.6 / 1574 ms | 2309 | 10605 of 14250 | 0 | 1 |
+
+Game thread, mean ms per tick, uphill at 240: game code 4.2 -> 2.6, VU1 1.8
+-> 1.3, GS handling 2.0 -> 1.5, textures 0.39 -> 0.01, pairing 3.9 -> 2.7,
+waiting for the GPU 3.05 -> 0.00, sleeping 4.6 -> 11.8 (the "before" run of
+that row was one of those slowed by item 4).
+
+What still dips, and why:
+- The remaining long intervals in the walk (11 over 16.7 ms, up to 134 ms)
+  are the camera cuts and scene changes: no in-betweens there by design.
+- Whole script: 3618 frames are movies and screens the game uploads into the
+  frame buffer; those are shown as they come, 25 a second. The 1574 ms gap
+  is a loading pause of the game.
+- The one "empty queue" per run is the first tick: opening the window and
+  the swapchain takes 230-250 ms.
+- In the first tick of a game frame the game thread works 25-35 ms, in the
+  second it sleeps; the 50 Hz schedule is met over the frame (largest delay
+  17 ms in the walk), but one frame's work must stay under 40 ms.
+- 240 a second at 4x leaves the GPU little room (4.0 ms per picture of 4.17).
+  At `--internal 2`: p99 6.1 ms.
+
+Scaling (after): `--internal 2` and `1` 239/s, p99 6.1 ms; `--texture-filter
+original` 236/s, p99 7.9; without `--fps` the game thread sleeps 15 of 20 ms.
+Video memory with everything on at 4x: about 0.9 GB.
+
+Other checks: interpolation detector (section "Frame interpolation:
+validated pairs") over 21600-25040: 0 of 2565 and 3 of 1345 mid-interval
+pictures with 3 or more pixels outside (the largest 20 pixels); FSR 3.1 runs
+with and without `--fps`; one start in about 170 today ended with "cannot
+reserve the guest address space": not looked into.
+
+### Performance patches taken over (measured on an i7-8565U / UHD 620 laptop)
+Profile there before, ms per vblank: software 37.3 (25.4 of it the game
+thread waiting for its two workers), GPU 1x 16.0, GPU 2x 29.0 (18.9 waiting
+for the GPU); the game thread's own work about 11.9 (EE 1.8, VU0 1.0, VU1
+3.1, VIF1 2.2, GIF+GS 2.1, transfers 1.2). Desktop: software 6.6, GPU 4x
+9.4. CPU FSR at 1080p on the laptop: 40-44 ms per picture, bilinear 3.6.
+Building for x86-64-v3 gave no meaningful gain and was not adopted. Next
+step identified, not done: VIF/VU1/GIF/GS command processing off the game
+thread.
+
+- sw-stripe-queue, sw-sprite-groups: per-stripe queues with stealing, the
+  game thread draws in `gs_sync`, new worker default; four-pixel path for
+  blended bilinear full-screen sprites (laptop 26.8 -> 51.5 fps in the
+  first area).
+- gpu-no-wait: three command buffers, up to two submissions in flight
+  (`hw_flush_async`, `hw_poll`, tickets and texture destruction follow the
+  submissions); laptop 1x 63.8 -> 81.8. It was limited to runs without
+  `--fps`; here it is also used with `--fps` (not with FSR 3.1).
+  `ROR_HW_SYNC=1` waits everywhere.
+- gpu-present-reuse, gpu-early-depth (shaders regenerated with
+  `gshw-shaders.sh`), post-skip-unchanged.
+- idle-spin: `gen.py` emits `TICK_SPIN` for the game's idle loop; one
+  generated line changes, so player-side builds are redone (the kit hash
+  covers `gen.py` and `rt/cpu.h`).
+- frameskip (`--frameskip auto|off`): not active with `--fps` or FSR 3.1
+  (`video.c`), so a skipped frame never reaches the pairing.
+- audio-slow: checked by reading against the device code (blocks of 960
+  frames, one per 20 ms of real time on average while stretching, the
+  devices drop rather than block) and with `recomp/tools/audio_slow_test.c`
+  (all cases ok); never run on a sound device. The alternating long / short
+  ticks of normal play do not trigger it (the ratio over 25 ticks stays
+  under 1.03 unless a long tick exceeds about 35 ms every time).
+- Not taken: sw-threads-default (the alternative to the stripe queue).
+
+Conflicts: `video.c` (the frame-skip hunk next to the pacing statistics,
+placed by hand); `gs_hw.c` / `gs.c`, where this tree had its own
+three-buffer ring for `--fps`; that was dropped in favour of the patch's
+mechanism plus `hw_submitted_serial` / `hw_serial_done` for the presenter.
+One type warning in the stripe queue fixed (`bar_passed` compare-exchange).
+
+Union verified: software 16 frames + audio identical at 1, 2, 4 and default
+workers (Linux) and default and 2 (Windows); GPU 4x without `--fps` 46
+shots identical to the build before (RTX 3090); lavapipe 1x 16 shots
+identical; `vubench starts` 3,723 hashes identical, generated code ==
+interpreter; pad self-test all ok. Unthrottled, desktop: software 172-176 ->
+209-221 fps at the bus stop, 123-126 -> 130-134 in the dense part; GPU 4x in
+a window now follows the display (144) where it made 113-142. No
+ThreadSanitizer run: no script for it was delivered and the toolchain here
+has no sanitizer runtime.

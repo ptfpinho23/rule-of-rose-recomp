@@ -42,7 +42,8 @@ void hw_ds_clear(int ds);
 void hw_rt_upload(int rt, int x, int y, int w, int h, const uint32_t *rgba);     /* native rect -> N x N blocks */
 void hw_rt_download(int rt, int x, int y, int w, int h, uint32_t *rgba);        /* native rect; waits for the GPU */
 int  hw_rt_copy_async(int rt, int x, int y, int w, int h);                       /* queued native read; returns a ticket */
-void hw_ticket_read(int ticket, uint32_t *rgba);      /* valid after the next hw_flush */
+void hw_ticket_read(int ticket, uint32_t *rgba);      /* waits for the GPU if the read has not been done yet */
+int  hw_ticket_ready(int ticket);                     /* the read has been done: hw_ticket_read will not wait */
 const uint32_t *hw_rt_read_scaled(int rt, int x, int y, int w, int h);           /* native rect at device resolution (RGBA) */
 void hw_rt_rows_from_depth(int rt, int dy, int rows, int ds, const uint32_t *table, int page0, int bw);   /* see gs_hw.c */
 void hw_rt_copy_rows(int src, int sy, int dst, int dy, int rows);                /* native rows, full width, src -> dst */
@@ -60,6 +61,16 @@ void hw_tex_destroy(int tex);                         /* deferred until the GPU 
 void hw_draw(const HwState *s, const HwVertex *v, int n);                        /* triangle list */
 void hw_flush_at(int site);                           /* submit everything and wait (site: caller's line, for statistics) */
 #define hw_flush() hw_flush_at(__LINE__)
+/* Not waiting for the GPU at the end of a frame (see gs_hw.c). hw_set_async(1) allows it; hw_flush_async and
+ * hw_present then leave the frame with the GPU (at most two are there at a time). hw_poll notes which have
+ * been finished; hw_flush still waits for everything. */
+void hw_set_async(int on);
+int  hw_async(void);
+void hw_flush_async(void);
+void hw_poll(void);
+void hw_wait_submitted(void);
+uint64_t hw_submitted_serial(void);                   /* game thread: number of its last submission (everything recorded before is in it or in an earlier one) */
+int  hw_serial_done(uint64_t serial);                 /* any thread: has the game thread's submission with that number finished on the GPU? */
 extern int hw_flush_sites[16], hw_flush_counts[16];   /* game thread: submits per call site since the counts were last cleared */
 extern uint64_t hw_stat_draws, hw_stat_copies, hw_stat_flushes, hw_stat_wait_ns;   /* wait_ns: game thread waiting for the GPU */
 #include "gs_hw_fsr3.h"

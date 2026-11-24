@@ -9,10 +9,11 @@
  *
  * Rendering is deferred and band-parallel (see "render queue" below):
  * primitives are queued together with an immutable snapshot of their draw
- * state, and worker threads each shade one horizontal band of the render
- * target for all queued primitives, in submission order, while the caller
- * carries on. Everything that looks at local memory from outside the
- * renderer first waits for the queue (gs_sync). ROR_GS_THREADS=n sets the
+ * state, and worker threads shade the render target stripe by stripe (8 pixel
+ * rows each), every stripe getting all queued primitives in submission
+ * order, while the caller carries on. Everything that looks at local memory
+ * from outside the renderer first finishes the queue (gs_sync: the caller
+ * draws along with the workers until it is empty). ROR_GS_THREADS=n sets the
  * number of workers; 0 renders every primitive at once on the caller. */
 #include <pthread.h>
 #include <stdatomic.h>
@@ -30,7 +31,16 @@ static u32 vram[VRAM_WORDS];
 
 u32 g_gs_imr = 0xFF00;
 u64 g_gs_prims, g_gs_frames;
+u64 g_gs_frame_id;              /* goes up whenever gs_get_frame hands out a picture that may differ from the one before */
 u64 g_gs_tex_rebuilt;           /* texels decoded into the texture cache */
+/* ROR_PERFLOG (video.c prints and clears): what the game thread and the presenter did.
+ * [0] ns decoding textures, [1] textures decoded, [2] ns making GPU textures of them,
+ * [3] ns pairing and publishing at the frame boundary, [4] logic frames, [5] of those interpolated,
+ * not interpolated because of [6] an upload into a render target, [7] a texture that was replaced,
+ * [8] too few primitives paired (a cut), [9] no start-of-frame copy, [10] no package (presenter behind),
+ * [11] ns of [3] spent waiting for the GPU */
+u64 g_perf_tx[8];               /* ROR_PERFLOG=2: decodes by cause: [0] nothing cached for this texture, [1] other palette, [2] other content, [3] written by a queued draw, [5] texels; [4] lookups answered by moving an entry to a new address */
+int g_perf_on; u64 g_perf[12]; u32 g_perf_hist[258]; u64 g_perf_pres_max;    /* hist: presenter intervals in 0.25 ms steps, last = 64 ms and more */
 u64 g_gs_stat[6];              /* bounding-box pixels and primitive counts: small / medium / large */
 
 enum { PSMCT32 = 0x00, PSMCT24 = 0x01, PSMCT16 = 0x02, PSMCT16S = 0x0A, PSMT8 = 0x13,
@@ -326,6 +336,7 @@ static void hwg_apply_cluts(void);
 struct Pkg_; static struct Pkg_ *hwp_publish(const int *partner, int ok, int pic, int sx, int sy, int sw, int sh);
 u64  plat_time_ns(void);                 /* plat.h (the replay tool supplies its own) */
 void plat_sleep_until(u64 t_ns);
+void plat_thread_role(int role);
 #include "hw/gs_hw.h"
 #endif
 
@@ -596,6 +607,36 @@ static const u32 *texcache_get(DState *s) {
                 e = &set[i]; e->gsig = gsig; goto hit;
             }
     }
+    if (g_perf_on > 1) {
+        int same_id = 0, same_pal = 0;
+        for (int i = 0; i < TEX_WAYS; i++) if (set[i].px && set[i].id == id) { same_id = 1; if (set[i].cs == cs && set[i].texa == texa) same_pal = 1; }
+        if (!same_pal) for (int k = 0; k < TEX_SETS && !same_id; k++) for (int i = 0; i < TEX_WAYS; i++) if (texcache[k][i].px && texcache[k][i].id == id) { same_id = 1; break; }
+        g_perf_tx[pending ? 3 : same_pal ? 2 : same_id ? 1 : 0]++; g_perf_tx[5] += (u64)w * h;
+    }
+    /* The game keeps moving textures to other places in GS memory as it streams an area in; the same
+     * texels with the same palette are then asked for under a new address (nine decodes of ten while
+     * walking outdoors). An entry that holds exactly that (same format and size, same place within
+     * its first page, same palette, same page contents) is moved to the new address instead of being
+     * decoded again; its GPU texture goes with it. */
+    if (!pending) {
+        TexEnt *donor = 0;
+        for (int k = 0; k < TEX_SETS && !donor; k++) for (int i = 0; i < TEX_WAYS; i++) {
+            TexEnt *o = &texcache[k][i];
+            if (o->px && o->csig_known && o->csig == csig && (o->id >> 14) == (id >> 14) && ((o->id ^ id) & 31) == 0 && o->cs == cs && o->texa == texa) { donor = o; break; }
+        }
+        if (donor) {
+            if (donor >= set && donor < set + TEX_WAYS) e = donor;
+            else {
+                for (int i = 0; i < TEX_WAYS && !e; i++) if (!set[i].px) e = &set[i];
+                if (!e) { e = &set[0]; for (int i = 1; i < TEX_WAYS; i++) if (set[i].stamp < e->stamp) e = &set[i]; }
+                tex_drop(e);
+                *e = *donor; donor->px = 0; donor->cap = 0; donor->hw_valid = 0;
+            }
+            e->id = id; e->gsig = gsig;
+            if (g_perf_on > 1) g_perf_tx[4]++;
+            goto hit;
+        }
+    }
     /* decode: into a free way, else over a stale render-target snapshot of this texture, else the least recently used */
     for (int i = 0; i < TEX_WAYS && !e; i++) if (!set[i].px) e = &set[i];
     for (int i = 0; i < TEX_WAYS && !e; i++) if (set[i].id == id && set[i].cs == cs && set[i].texa == texa && !set[i].csig_known) e = &set[i];
@@ -606,6 +647,7 @@ static const u32 *texcache_get(DState *s) {
     if (!e->px) { e->px = malloc(need); e->cap = need; tex_bytes += need; }
     e->id = id; e->cs = cs; e->texa = texa; e->gsig = gsig; e->csig = csig; e->csig_known = (u8)!pending;
     TexDesc d = { c->tbp, c->tbw, c->tpsm, c->tw, c->th, c->csa, s->ta0, s->ta1, s->aem };
+    u64 perf_t0 = g_perf_on ? plat_time_ns() : 0;
     if (pending) q_decode(&d, e->px);
     else {
         u32 pal[256];
@@ -615,6 +657,7 @@ static const u32 *texcache_get(DState *s) {
         }
         tex_decode_rows(&d, pal, e->px, 0, h);
     }
+    if (g_perf_on) { g_perf[0] += plat_time_ns() - perf_t0; g_perf[1]++; }
     g_gs_tex_rebuilt += (u64)w * h;
     e->stamp = ++tex_clock;
     while (tex_bytes > TEX_BUDGET) {             /* over budget: drop the least recently used texture */
@@ -1104,18 +1147,168 @@ static void tri_generic(const DState *st, const TriSetup *ts, const Rows rows, i
     }
 }
 
+/* ---- sprites, four pixels at a time -----------------------------------------------------
+ * The full-screen passes (film grain, feedback, movie pictures) are sprites
+ * with bilinear filtering, modulation, alpha test and blending: the states of
+ * specialisations 2 and 3. For those, sprite_row4 shades four horizontally
+ * adjacent pixels at once with SSE2. Every value is computed by the same
+ * operations as fs_shade computes it, only side by side:
+ *  - the texture coordinate with the same single-precision operations in the
+ *    same order (the range is checked first, so the conversions are the plain
+ *    ones);
+ *  - bilinear filtering as (top * (256 - fv) + bot * fv) >> 16 with
+ *    top = t00 * (256 - fu) + t10 * fu, which is the weighted sum bilerp()
+ *    forms, in 16-bit lanes (top <= 255 * 256);
+ *  - modulation, alpha test and blending in 16-bit lanes; the signed product
+ *    of the blend, which needs 17 bits, is taken as high and low halves.
+ * Depth is read and written pixel by pixel (16-bit depth pixels are not
+ * adjacent in memory). In PSMCT32 the pixels x and x + 1 (x even) of a row are
+ * adjacent words (checked once in sprite4_init), so a group is two 64-bit
+ * loads and stores. Pixels a group does not write are stored back unchanged;
+ * the whole row belongs to the calling thread. */
+typedef struct {
+    __m128i vc, alpha_keep, alpha_const, rgb, aref, failmask, fixv;
+    int atst, afail, aa, ab, ac, ad, zwr, ztest, ztst; u32 z;
+    s32 x0; float u0, dudx; s32 wmask, hmask; u32 tw; const u32 *tex;
+} Sp4;
+static int sprite4_layout_ok = -1;
+static void sprite4_init(void) {
+    int ok = 1;
+    for (int y = 0; y < 32; y++) for (int x = 0; x < 64; x += 2) ok &= swz32[y][x + 1] == swz32[y][x] + 1;
+    if (getenv("ROR_GS_NOSPRITE4")) ok = 0;      /* test aid: sprites pixel by pixel, as before */
+    sprite4_layout_ok = ok;
+}
+/* Whether the group path computes this sprite exactly as the scalar path does. */
+static int sprite4_setup(const FS *f, const SpriteSetup *j, const Vtx *b, Sp4 *k) {
+    if (sprite4_layout_ok <= 0 || !f->tex) return 0;
+    if (!(f->tme == 1 && f->mmag == 1 && f->tfx == 0 && f->wms == 0 && f->wmt == 0 && f->fbmsk == 0 && f->date == 0 && f->pabe == 0 && f->colclamp == 1 &&
+          f->fba == 0 && f->abe == 1 && f->ate == 1 && f->zte == 1 && f->need_fb == 1 && f->fge == 0)) return 0;
+    if (j->px1 - j->px0 < 8) return 0;
+    /* texture coordinates of the corner pixels: finite and far inside the integer range */
+    float ua = j->u0 + ((float)(j->px0 * 16 - j->x0) / 16.0f) * j->dudx, ub = j->u0 + ((float)((j->px1 - 1) * 16 - j->x0) / 16.0f) * j->dudx;
+    float va = j->v0 + ((float)(j->py0 * 16 - j->y0) / 16.0f) * j->dvdy, vb = j->v0 + ((float)((j->py1 - 1) * 16 - j->y0) / 16.0f) * j->dvdy;
+    if (!(ua > -4.0e6f && ua < 4.0e6f && ub > -4.0e6f && ub < 4.0e6f && va > -4.0e6f && va < 4.0e6f && vb > -4.0e6f && vb < 4.0e6f)) return 0;
+    const short cr = (short)b->r, cg = (short)b->g, cb = (short)b->b, ca = (short)b->a;
+    k->vc = _mm_setr_epi16(cr, cg, cb, ca, cr, cg, cb, ca);
+    k->rgb = _mm_setr_epi16(-1, -1, -1, 0, -1, -1, -1, 0);
+    /* alpha after the texture function: texture alpha * vertex alpha (TCC), or the vertex alpha */
+    k->alpha_keep = f->tcc ? _mm_set1_epi16(-1) : k->rgb;
+    k->alpha_const = f->tcc ? _mm_setzero_si128() : _mm_setr_epi16(0, 0, 0, ca, 0, 0, 0, ca);
+    k->aref = _mm_set1_epi16((short)f->aref);
+    k->failmask = f->afail == 1 ? _mm_set1_epi16(-1) : f->afail == 3 ? k->rgb : _mm_setzero_si128();
+    k->fixv = _mm_set1_epi16((short)f->fix);
+    k->atst = f->atst; k->afail = f->afail; k->aa = (int)f->aa; k->ab = (int)f->ab; k->ac = (int)f->ac; k->ad = (int)f->ad;
+    k->zwr = f->zwr; k->ztst = f->ztst; k->ztest = f->ztst >= 2; k->z = b->z > f->zmax ? f->zmax : b->z;
+    k->x0 = j->x0; k->u0 = j->u0; k->dudx = j->dudx; k->wmask = f->w - 1; k->hmask = f->h - 1; k->tw = f->tw; k->tex = f->tex;
+    return 1;
+}
+ALWAYS_INLINE __m128i sp4_sel(int m, __m128i s, __m128i d) { return m == 0 ? s : m == 1 ? d : _mm_setzero_si128(); }
+/* Pixels [xa, xb) of row y (xa and xb multiples of 4); tv is the row's texture coordinate. */
+static void sprite_row4(const FS *f, const Sp4 *k, const int ZK, s32 y, float tv, s32 xa, s32 xb) {
+    const __m128i zero = _mm_setzero_si128(), c255 = _mm_set1_epi16(255), c256 = _mm_set1_epi16(256), one = _mm_set1_epi16(1);
+    const u32 frow = f->fpg0 + ((u32)y >> 5) * f->fbw, zrow = f->zpg0 + ((u32)y >> f->zysh) * f->fbw;
+    const u16 *ft = swz32[y & 31], *zt = f->ztab[(u32)y & f->zymask];
+    /* the row's two texture lines and their weights, as fs_sample finds them */
+    float v = tv - 0.5f;
+    s32 iv = ifloorf(v);
+    u32 fv = f2u((v - (float)iv) * 256.0f);
+    const u32 *r0 = k->tex + ((u32)(iv & k->hmask) << k->tw), *r1 = k->tex + ((u32)((iv + 1) & k->hmask) << k->tw);
+    const __m128i wv1 = _mm_set1_epi16((short)(256 - fv)), wv2 = _mm_set1_epi16((short)fv);
+    const __m128 u0v = _mm_set1_ps(k->u0), dudxv = _mm_set1_ps(k->dudx), sixteen = _mm_set1_ps(16.0f), half = _mm_set1_ps(0.5f), f256 = _mm_set1_ps(256.0f);
+    const __m128i wmask = _mm_set1_epi32(k->wmask), step = _mm_setr_epi32(0, 16, 32, 48);
+    const u32 z = k->z;
+    for (s32 x = xa; x < xb; x += 4) {
+        unsigned zm = 15;
+        if (k->ztest) {
+            zm = 0;
+            for (int i = 0; i < 4; i++) {
+                u32 zb = z_read(ZK, z_addr(ZK, zrow, zt, (u32)(x + i)));
+                zm |= (unsigned)(k->ztst == 2 ? z >= zb : z > zb) << i;
+            }
+            if (!zm) continue;
+        }
+        /* texture coordinates */
+        __m128 tu = _mm_add_ps(u0v, _mm_mul_ps(_mm_div_ps(_mm_cvtepi32_ps(_mm_add_epi32(_mm_set1_epi32(x * 16 - k->x0), step)), sixteen), dudxv));
+        __m128 u = _mm_sub_ps(tu, half);
+        __m128i iu = _mm_cvttps_epi32(u);
+        iu = _mm_add_epi32(iu, _mm_castps_si128(_mm_cmpgt_ps(_mm_cvtepi32_ps(iu), u)));          /* floor */
+        __m128i fu = _mm_cvttps_epi32(_mm_mul_ps(_mm_sub_ps(u, _mm_cvtepi32_ps(iu)), f256));
+        _Alignas(16) u32 i0[4], i1[4];
+        _mm_store_si128((__m128i *)i0, _mm_and_si128(iu, wmask));
+        _mm_store_si128((__m128i *)i1, _mm_and_si128(_mm_sub_epi32(iu, _mm_set1_epi32(-1)), wmask));
+        __m128i t00 = _mm_setr_epi32((int)r0[i0[0]], (int)r0[i0[1]], (int)r0[i0[2]], (int)r0[i0[3]]);
+        __m128i t10 = _mm_setr_epi32((int)r0[i1[0]], (int)r0[i1[1]], (int)r0[i1[2]], (int)r0[i1[3]]);
+        __m128i t01 = _mm_setr_epi32((int)r1[i0[0]], (int)r1[i0[1]], (int)r1[i0[2]], (int)r1[i0[3]]);
+        __m128i t11 = _mm_setr_epi32((int)r1[i1[0]], (int)r1[i1[1]], (int)r1[i1[2]], (int)r1[i1[3]]);
+        __m128i q = _mm_packs_epi32(fu, fu);
+        q = _mm_unpacklo_epi16(q, q);
+        /* the frame buffer: pixels x, x+1 and x+2, x+3 are two pairs of adjacent words */
+        u32 *fp0 = vram + ((frow + ((u32)x >> 6)) & 511) * 2048 + ft[x & 63], *fp1 = vram + ((frow + ((u32)x >> 6)) & 511) * 2048 + ft[(x + 2) & 63];
+        __m128i d = _mm_unpacklo_epi64(_mm_loadl_epi64((const __m128i *)fp0), _mm_loadl_epi64((const __m128i *)fp1));
+        __m128i out[2], wm[2], ps[2];
+        for (int hlf = 0; hlf < 2; hlf++) {          /* pixels 0-1, then 2-3: eight 16-bit lanes each */
+            __m128i fu16 = hlf ? _mm_unpackhi_epi32(q, q) : _mm_unpacklo_epi32(q, q), gu16 = _mm_sub_epi16(c256, fu16);
+#define SP4_HALF(t) (hlf ? _mm_unpackhi_epi8(t, zero) : _mm_unpacklo_epi8(t, zero))
+            __m128i top = _mm_add_epi16(_mm_mullo_epi16(SP4_HALF(t00), gu16), _mm_mullo_epi16(SP4_HALF(t10), fu16));
+            __m128i bot = _mm_add_epi16(_mm_mullo_epi16(SP4_HALF(t01), gu16), _mm_mullo_epi16(SP4_HALF(t11), fu16));
+            __m128i p1l = _mm_mullo_epi16(top, wv1), p1h = _mm_mulhi_epu16(top, wv1), p2l = _mm_mullo_epi16(bot, wv2), p2h = _mm_mulhi_epu16(bot, wv2);
+            __m128i sl = _mm_add_epi16(p1l, p2l);
+            __m128i nocarry = _mm_cmpeq_epi16(_mm_subs_epu16(p1l, sl), zero);       /* all ones unless the low halves overflowed */
+            __m128i t = _mm_add_epi16(_mm_add_epi16(p1h, p2h), _mm_add_epi16(one, nocarry));
+            /* texture function: modulate */
+            __m128i s = _mm_min_epi16(_mm_srli_epi16(_mm_mullo_epi16(t, k->vc), 7), c255);
+            s = _mm_or_si128(_mm_and_si128(s, k->alpha_keep), k->alpha_const);
+            __m128i a4 = _mm_shufflehi_epi16(_mm_shufflelo_epi16(s, 0xFF), 0xFF);
+            __m128i pass;
+            switch (k->atst) {
+            case 0: pass = zero; break;
+            case 1: pass = _mm_set1_epi16(-1); break;
+            case 2: pass = _mm_cmpgt_epi16(k->aref, a4); break;
+            case 3: pass = _mm_xor_si128(_mm_cmpgt_epi16(a4, k->aref), _mm_set1_epi16(-1)); break;
+            case 4: pass = _mm_cmpeq_epi16(a4, k->aref); break;
+            case 5: pass = _mm_xor_si128(_mm_cmpgt_epi16(k->aref, a4), _mm_set1_epi16(-1)); break;
+            case 6: pass = _mm_cmpgt_epi16(a4, k->aref); break;
+            default: pass = _mm_xor_si128(_mm_cmpeq_epi16(a4, k->aref), _mm_set1_epi16(-1)); break;
+            }
+            /* blend: ((A - B) * C >> 7) + D, clamped */
+            __m128i dd = SP4_HALF(d);
+#undef SP4_HALF
+            __m128i cf = k->ac == 0 ? a4 : k->ac == 1 ? _mm_shufflehi_epi16(_mm_shufflelo_epi16(dd, 0xFF), 0xFF) : k->fixv;
+            __m128i diff = _mm_sub_epi16(sp4_sel(k->aa, s, dd), sp4_sel(k->ab, s, dd));
+            __m128i pr = _mm_or_si128(_mm_slli_epi16(_mm_mulhi_epi16(diff, cf), 9), _mm_srli_epi16(_mm_mullo_epi16(diff, cf), 7));
+            __m128i c = _mm_min_epi16(_mm_max_epi16(_mm_add_epi16(pr, sp4_sel(k->ad, s, dd)), zero), c255);
+            out[hlf] = _mm_or_si128(_mm_and_si128(c, k->rgb), _mm_andnot_si128(k->rgb, s));
+            wm[hlf] = _mm_or_si128(pass, _mm_andnot_si128(pass, k->failmask));
+            ps[hlf] = pass;
+        }
+        __m128i col = _mm_packus_epi16(out[0], out[1]), wmask8 = _mm_packs_epi16(wm[0], wm[1]);
+        if (zm != 15) wmask8 = _mm_and_si128(wmask8, _mm_cmpeq_epi32(_mm_and_si128(_mm_set1_epi32((int)zm), _mm_setr_epi32(1, 2, 4, 8)), _mm_setr_epi32(1, 2, 4, 8)));
+        __m128i res = _mm_or_si128(_mm_and_si128(wmask8, col), _mm_andnot_si128(wmask8, d));
+        _mm_storel_epi64((__m128i *)fp0, res); _mm_storel_epi64((__m128i *)fp1, _mm_unpackhi_epi64(res, res));
+        if (k->zwr) {
+            unsigned zw = k->afail == 2 ? 15u : (unsigned)_mm_movemask_ps(_mm_castsi128_ps(_mm_packs_epi16(ps[0], ps[1])));
+            zw &= zm;
+            for (int i = 0; i < 4; i++) if (zw & (1u << i)) z_write(ZK, z_addr(ZK, zrow, zt, (u32)(x + i)), z);
+        }
+    }
+}
+
 ALWAYS_INLINE void sprite_fast(const DState *st, const SpriteSetup *j, const Vtx *b, const Rows rows, const int ZK, const int A) {
     FS f = st->fs;
     fs_assume(&f, A);
     const int cr = b->r, cg = b->g, cb = b->b, ca = b->a, fog = b->f;
     const float u0 = j->u0, v0 = j->v0, dudx = j->dudx, dvdy = j->dvdy;
     const s32 x0 = j->x0, px0 = j->px0, px1 = j->px1;
+    Sp4 k4;
+    const int groups = (A & A_BASE) && (A & A_BILIN) && (A & A_NOFOG) && sprite4_setup(&f, j, b, &k4);
+    const s32 ga = groups ? (px0 + 3) & ~3 : px1, gb = groups ? px1 & ~3 : px1;        /* [ga, gb): whole groups of four */
     for (s32 y = j->py0; y < j->py1; y++) {
         if (!row_mine(rows, y)) continue;
         float tv = v0 + ((float)(y * 16 - j->y0) / 16.0f) * dvdy;
         const u32 frow = f.fpg0 + ((u32)y >> 5) * f.fbw, zrow = f.zpg0 + ((u32)y >> f.zysh) * f.fbw;
         const u16 *ft = swz32[y & 31], *zt = f.ztab[(u32)y & f.zymask];
         for (s32 x = px0; x < px1; x++) {
+            if (x == ga && gb > ga) { sprite_row4(&f, &k4, ZK, y, tv, ga, gb); x = gb - 1; continue; }
             u32 z = b->z;
             void *zp = z_addr(ZK, zrow, zt, (u32)x);
             if (!fs_ztest(&f, ZK, zp, &z)) continue;
@@ -1275,18 +1468,22 @@ static void build_state(DState *s, u64 pr) {
 }
 
 /* ---- render queue -----------------------------------------------------------------------
- * Primitives are appended to `queue` by the calling ("main") thread and
- * consumed by every worker: the screen is cut into stripes of 8 pixel rows,
- * stripe s belongs to worker stripe_owner[s] (dealt round-robin, so that
- * every worker gets a similar share of whatever part of the screen a batch
- * happens to cover), and a worker draws, for each primitive in order, only
- * the rows of its own stripes. The result is the one serial rendering would
- * give, and there are no data races, because:
+ * Primitives are appended to `queue` by the calling ("main") thread. The
+ * screen is cut into stripes of 8 pixel rows (the first one is 16 rows, see
+ * q_clut). Each stripe has a cursor into the queue; a thread that finds a
+ * stripe with entries left takes it (one thread at a time per stripe), draws
+ * the rows of that stripe for each primitive in order, and lets go of it when
+ * the queue has no more for it for now. Any worker can take any stripe, and
+ * so can the main thread while it waits in gs_sync: nobody waits for a
+ * particular thread, whatever the number of processors or whoever else is
+ * using them. The result is the one serial rendering would give, and there
+ * are no data races, because:
  *
  *  - A pixel's shading reads and writes only that pixel's own frame and depth
  *    words, plus immutable data (the Prim, its DState, the decoded texture).
- *    All pixels of one row belong to one worker, which processes primitives
- *    in submission order, so every pixel sees exactly the serial history.
+ *    All pixels of one row belong to one stripe, which gets the primitives
+ *    in submission order from one thread at a time, so every pixel sees
+ *    exactly the serial history.
  *  - Different pixels must be different memory words. Within a batch (the
  *    primitives between two barriers) all primitives share one frame/depth
  *    layout (DState.tkey), pixel -> word is injective for a layout as long as
@@ -1294,56 +1491,81 @@ static void build_state(DState *s, u64 pr) {
  *    pages are disjoint from depth pages (batch_f / batch_z). A primitive that
  *    would break one of these starts a new batch, or, when it conflicts with
  *    itself, is drawn serially by the main thread after gs_sync.
- *  - At a barrier every worker waits until all workers have arrived, so
- *    batches execute strictly one after another.
+ *  - A stripe goes past a barrier only once every stripe has arrived at it
+ *    (barrier_open), so batches execute strictly one after another.
  *  - Textures are never read from local memory by workers while it may be
  *    written: primitives sample decoded snapshots, and a snapshot of memory
  *    that queued primitives render to is produced by a PT_DECODE job that sits
- *    between two barriers (each worker decodes a share of the rows).
+ *    between two barriers (the first DEC_SHARES stripes decode a share of the
+ *    rows each).
  *  - The main thread reads or writes local memory only in pages that are not
  *    in pend_dirty (the pages queued work may touch), or after gs_sync().
  *  - Queue entries, DStates and texture snapshots are written before the
  *    entry is published (q_head, release/acquire) and are not modified or
- *    freed until a gs_sync has seen every worker finish.
- * The stripe table is fixed before the workers start. */
+ *    freed until a gs_sync has seen every stripe finish. */
 #define QCAP 32768                      /* power of two */
 #define MAXSTATES 4096
 #define MAXT 16
+#define NSTRIPE 255
+#define DEC_SHARES 32
+typedef struct { _Alignas(64) atomic_ullong pos; atomic_int busy; } Stripe;    /* pos: queue entries before this index are done for the stripe */
 typedef struct {
-    _Alignas(64) atomic_ullong pos;     /* queue entries before this index are done */
-    int idx;
-    u64 t_work, t_wait, t_idle;         /* ROR_GS_TIMING statistics */
+    _Alignas(64) int idx;
+    u64 t_work, t_idle;                 /* ROR_GS_TIMING statistics */
 } Worker;
 static int gs_timing;                   /* ROR_GS_TIMING: per-worker time accounting (printed with the ROR_FPSLOG line) */
-static u64 t_sync_wait;
-static Worker workers[MAXT];
+static u64 t_sync_wait, t_sync_work;
+static Worker workers[MAXT + 1];        /* [nthreads] is the main thread, while it draws in gs_sync */
+static Stripe stripes[NSTRIPE];
+static u8 stripe_of[256];               /* stripe of rows 8i .. 8i+7: 0, 0, 1, 2, ... */
+static atomic_int stripe_hi;            /* stripes at and above this one have nothing queued */
+static _Alignas(64) atomic_ullong bar_passed;      /* barriers before this queue index are open */
 static Prim *queue; static DState *states; static int nstates;
+/* What a stripe needs to know about a queue entry to pass over it: kind, and for primitives the first and last stripe. */
+enum { QI_PRIM, QI_BARRIER, QI_DECODE, QI_CLUT };
+static u32 *qinfo;
 static const DState *cur_st; static u64 cur_pr;
 static _Alignas(64) atomic_ullong q_head;          /* entries below it are published */
 static _Alignas(64) u64 q_tail;                    /* next entry to write (main thread) */
 static u64 q_base;                                 /* q_tail at the last gs_sync */
-static u8 stripe_owner[256];                       /* owner of rows 8s .. 8s+7 */
 static PageSet batch_f, batch_z; static u64 batch_key; static int batch_n;
 static pthread_mutex_t q_m = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t q_cv = PTHREAD_COND_INITIALIZER;
 static atomic_int q_sleepers;
+static _Alignas(64) atomic_ullong q_events;        /* counts what can give an idle thread something to do: publishing, a barrier opening */
 static int idle_spins = 1000;       /* ROR_GS_SPIN: polls before an idle worker sleeps */
 static u64 stat_sync[SY_N], stat_barriers, stat_decodes, stat_serial, stat_states, stat_xfer_px;
 
 static int q_pending(void) { return q_tail != q_base; }
-static void q_publish(void) {
-    if (atomic_load_explicit(&q_head, memory_order_relaxed) == q_tail) return;
-    atomic_store(&q_head, q_tail);
-    /* Dekker-style handshake with worker_main: a worker increments q_sleepers
-     * before re-checking q_head under the mutex, so either it sees the new
-     * head or we see it sleeping and wake it. */
+/* Something changed that may give idle threads work. Dekker-style handshake
+ * with worker_main: a worker increments q_sleepers before re-checking
+ * q_events under the mutex, so either it sees the new count or we see it
+ * sleeping and wake it. */
+static void q_wake(void) {
+    atomic_fetch_add(&q_events, 1);
     if (atomic_load(&q_sleepers)) {
         pthread_mutex_lock(&q_m);
         pthread_cond_broadcast(&q_cv);
         pthread_mutex_unlock(&q_m);
     }
 }
+static void q_publish(void) {
+    if (atomic_load_explicit(&q_head, memory_order_relaxed) == q_tail) return;
+    atomic_store(&q_head, q_tail);
+    q_wake();
+}
 static Prim *q_new(void) { return &queue[q_tail & (QCAP - 1)]; }
 static void q_commit(void) {
+    const Prim *p = &queue[q_tail & (QCAP - 1)];
+    u32 qi;
+    if (p->type == PT_BARRIER) qi = QI_BARRIER;
+    else if (p->type == PT_DECODE) qi = QI_DECODE;
+    else if (p->type == PT_CLUT) qi = QI_CLUT;
+    else {
+        u32 s0 = stripe_of[(u32)p->py0 >> 3 & 255], s1 = stripe_of[(u32)p->py1 >> 3 & 255];
+        qi = QI_PRIM | (s0 << 8) | (s1 << 16);
+        if ((int)s1 >= atomic_load_explicit(&stripe_hi, memory_order_relaxed)) atomic_store_explicit(&stripe_hi, (int)s1 + 1, memory_order_release);
+    }
+    qinfo[q_tail & (QCAP - 1)] = qi;
     q_tail++;
     if (q_tail - atomic_load_explicit(&q_head, memory_order_relaxed) >= 48) q_publish();
 }
@@ -1365,16 +1587,17 @@ static void q_decode(const TexDesc *d, u32 *px) {
 static ClutJob *q_clut(const ClutDesc *d, u32 seq) {
     ClutJob *j = malloc(sizeof *j);
     j->d = *d; j->seq = seq;
-    /* The job is run by worker 0. Normally it sits between two barriers. The
-     * common case needs none: a 32-bit CSM1 CLUT at the very start of the
-     * frame buffer the current batch draws to is that buffer's pixels (0..15,
-     * 0..15); those rows are stripes 0 and 1, so worker 0 is the only thread that
-     * writes them in this batch, and it reaches the job exactly when it has
-     * drawn everything submitted before it. (Later primitives for another
-     * target start a new batch, i.e. come after a barrier.) */
+    /* The job is run by whoever has stripe 0. Normally it sits between two
+     * barriers. The common case needs none: a 32-bit CSM1 CLUT at the very
+     * start of the frame buffer the current batch draws to is that buffer's
+     * pixels (0..15, 0..15); those rows are stripe 0 (which is 16 rows for
+     * this reason), so its thread is the only one that writes them in this
+     * batch, and it reaches the job exactly when it has drawn everything
+     * submitted before it. (Later primitives for another target start a new
+     * batch, i.e. come after a barrier.) */
     u32 fbp = (u32)(batch_key & 0xFFFF), fpsm = (u32)(batch_key >> 24) & 63;
     int inband = batch_n && d->csm == 0 && d->cpsm == PSMCT32 && d->cbp == fbp && (fpsm == PSMCT32 || fpsm == PSMCT24) &&
-                 stripe_owner[0] == 0 && stripe_owner[1] == 0 && !ps_test(&batch_z, (d->cbp >> 5) & 511);
+                 !ps_test(&batch_z, (d->cbp >> 5) & 511);
     if (!inband) q_barrier();
     else ps_set(&batch_f, (d->cbp >> 5) & 511);       /* so that using the page as depth later in this batch starts a new one */
     Prim *p = q_new(); p->type = PT_CLUT; p->clut = j; q_commit();
@@ -1383,59 +1606,94 @@ static ClutJob *q_clut(const ClutDesc *d, u32 seq) {
 }
 
 static unsigned worker_csr;            /* the calling thread's MXCSR (rounding, FTZ/DAZ): workers must compute alike */
+/* Whether every stripe has done what comes before the barrier at queue index b (self: the caller's stripe, which has). */
+static int barrier_open(u64 b, int self) {
+    if (atomic_load_explicit(&bar_passed, memory_order_acquire) > b) return 1;
+    const int hi = atomic_load_explicit(&stripe_hi, memory_order_acquire);
+    for (int s = 0; s < hi; s++)
+        if (s != self && atomic_load_explicit(&stripes[s].pos, memory_order_acquire) < b) return 0;
+    unsigned long long seen = atomic_load_explicit(&bar_passed, memory_order_relaxed);
+    while (seen <= b && !atomic_compare_exchange_weak(&bar_passed, &seen, b + 1)) { }
+    q_wake();                              /* stripes waiting at it can go on */
+    return 1;
+}
+/* One pass over the stripes: take each one that has entries left and is free,
+ * and draw them. Returns 0 if nothing could be done.
+ * A worker goes through its "home" stripes first (every nthreads-th one: the
+ * pixels of a stripe then stay in one processor's cache from one batch of
+ * primitives to the next) and takes another worker's stripe only when that
+ * one has fallen behind by more than STEAL_LAG entries. The main thread,
+ * finishing the queue in gs_sync, has no home and takes whatever is left. */
+#define STEAL_LAG 96
+static int q_work(const Worker *w) {
+    const u64 head = atomic_load_explicit(&q_head, memory_order_acquire);
+    const int hi = atomic_load_explicit(&stripe_hi, memory_order_acquire);
+    const int me = w->idx, homes = nthreads;
+    int did = 0;
+    for (int k = 0; k < 2 * hi; k++) {
+        /* first the home stripes (me, me + homes, ...), then all the others in order */
+        int s;
+        if (k < hi) { s = me + k * homes; if (me >= homes || s >= hi) { k = hi - 1; continue; } }
+        else { s = k - hi; if (me < homes && s % homes == me) continue; }
+        Stripe *st = &stripes[s];
+        const u64 at = atomic_load_explicit(&st->pos, memory_order_relaxed);
+        if (at >= head) continue;
+        if (k >= hi && me < homes && head - at <= STEAL_LAG) continue;      /* its own worker is keeping up */
+        if (atomic_exchange_explicit(&st->busy, 1, memory_order_acquire)) continue;
+        u64 pos = atomic_load_explicit(&st->pos, memory_order_relaxed);
+        const u64 start = pos;
+        const Rows rows = { stripe_of, (u8)s };
+        for (; pos < head; pos++) {
+            const u32 qi = qinfo[pos & (QCAP - 1)];
+            const int kind = (int)(qi & 255);
+            if (kind == QI_PRIM) {
+                if ((int)((qi >> 8) & 255) <= s && s <= (int)(qi >> 16)) rast_prim(&queue[pos & (QCAP - 1)], rows, 0);
+            } else if (kind == QI_BARRIER) {
+                if (!barrier_open(pos, s)) break;
+            } else if (kind == QI_DECODE) {
+                if (s < DEC_SHARES) {
+                    const Prim *p = &queue[pos & (QCAP - 1)];
+                    u32 h = 1u << p->dec.d.th;
+                    tex_decode_rows(&p->dec.d, 0, p->dec.px, h * (u32)s / DEC_SHARES, h * ((u32)s + 1) / DEC_SHARES);
+                }
+            } else if (s == 0) {
+                const Prim *p = &queue[pos & (QCAP - 1)];
+                clut_read(&p->clut->d, p->clut->val);       /* between barriers, like a decode, or in stripe 0's own rows (q_clut) */
+            }
+        }
+        atomic_store_explicit(&st->pos, pos, memory_order_release);
+        atomic_store_explicit(&st->busy, 0, memory_order_release);
+        did |= pos != start;
+    }
+    return did;
+}
 static void *worker_main(void *arg) {
-    Worker *w = arg; u64 cur = 0;
+    Worker *w = arg;
     _mm_setcsr(worker_csr);
     for (;;) {
-        u64 head = atomic_load_explicit(&q_head, memory_order_acquire);
-        if (head == cur) {
-            /* Idle. Poll for a while before sleeping: during a frame work
-             * arrives in bursts microseconds apart, and a sleeping thread
-             * takes far longer to wake than a burst takes to draw. */
-            int spins = 0; u64 t0 = gs_timing ? __builtin_ia32_rdtsc() : 0;
-            while (atomic_load_explicit(&q_head, memory_order_acquire) == cur) {
-                if (++spins < idle_spins) { __builtin_ia32_pause(); continue; }
-                pthread_mutex_lock(&q_m);
-                atomic_fetch_add(&q_sleepers, 1);
-                while (atomic_load(&q_head) == cur) pthread_cond_wait(&q_cv, &q_m);
-                atomic_fetch_sub(&q_sleepers, 1);
-                pthread_mutex_unlock(&q_m);
-            }
-            if (gs_timing) w->t_idle += __builtin_ia32_rdtsc() - t0;
-            continue;
+        u64 ev = atomic_load_explicit(&q_events, memory_order_acquire);
+        u64 t1 = gs_timing ? __builtin_ia32_rdtsc() : 0;
+        if (q_work(w)) { if (gs_timing) w->t_work += __builtin_ia32_rdtsc() - t1; continue; }
+        /* Nothing to do until more is published or a barrier opens (what is
+         * left of a stripe in another thread's hands, that thread draws).
+         * Poll for a while before sleeping: during a frame work arrives in
+         * bursts microseconds apart, and a sleeping thread takes far longer
+         * to wake than a burst takes to draw. */
+        int spins = 0;
+        while (atomic_load_explicit(&q_events, memory_order_acquire) == ev) {
+            if (++spins < idle_spins) { __builtin_ia32_pause(); continue; }
+            pthread_mutex_lock(&q_m);
+            atomic_fetch_add(&q_sleepers, 1);
+            while (atomic_load(&q_events) == ev) pthread_cond_wait(&q_cv, &q_m);
+            atomic_fetch_sub(&q_sleepers, 1);
+            pthread_mutex_unlock(&q_m);
         }
-        u64 t1 = gs_timing ? __builtin_ia32_rdtsc() : 0, tw = 0;
-        const Rows rows = { stripe_owner, (u8)w->idx };
-        for (; cur < head; cur++) {
-            const Prim *p = &queue[cur & (QCAP - 1)];
-            if (p->type == PT_BARRIER) {
-                u64 t2 = gs_timing ? __builtin_ia32_rdtsc() : 0;
-                atomic_store_explicit(&w->pos, cur, memory_order_release);
-                for (int i = 0; i < nthreads; i++) {
-                    int spins = 0;
-                    while (atomic_load_explicit(&workers[i].pos, memory_order_acquire) < cur) {
-                        if (++spins < 2000) __builtin_ia32_pause(); else { sched_yield(); spins = 0; }
-                    }
-                }
-                if (gs_timing) tw += __builtin_ia32_rdtsc() - t2;
-            } else if (p->type == PT_DECODE) {
-                u32 h = 1u << p->dec.d.th;
-                tex_decode_rows(&p->dec.d, 0, p->dec.px, h * (u32)w->idx / (u32)nthreads, h * ((u32)w->idx + 1) / (u32)nthreads);
-            } else if (p->type == PT_CLUT) {
-                if (w->idx == 0) clut_read(&p->clut->d, p->clut->val);       /* between barriers, like a decode */
-            } else {
-                int mine = 0;
-                for (s32 sp = p->py0 >> 3; sp <= p->py1 >> 3 && !mine; sp++) mine = stripe_owner[sp] == rows.me;
-                if (mine) rast_prim(p, rows, 0);
-            }
-        }
-        if (gs_timing) { w->t_wait += tw; w->t_work += __builtin_ia32_rdtsc() - t1 - tw; }
-        atomic_store_explicit(&w->pos, cur, memory_order_release);
+        if (gs_timing) w->t_idle += __builtin_ia32_rdtsc() - t1;
     }
     return 0;
 }
 
-/* Wait until everything queued has been drawn. Afterwards local memory is
+/* Finish everything queued; the caller draws too. Afterwards local memory is
  * exactly what serial rendering would have produced and the main thread may
  * use all of it. */
 static void gs_sync(int why) {
@@ -1444,14 +1702,20 @@ static void gs_sync(int why) {
 #endif
     if (!nthreads || q_tail == q_base) return;
     q_publish();
-    u64 t0 = gs_timing ? __builtin_ia32_rdtsc() : 0;
-    for (int i = 0; i < nthreads; i++) {
-        int spins = 0;
-        while (atomic_load_explicit(&workers[i].pos, memory_order_acquire) != q_tail) {
-            if (++spins < 20000) __builtin_ia32_pause(); else { sched_yield(); spins = 0; }
-        }
+    u64 t0 = gs_timing ? __builtin_ia32_rdtsc() : 0, tw = 0;
+    for (int spins = 0;;) {
+        u64 t1 = gs_timing ? __builtin_ia32_rdtsc() : 0;
+        if (q_work(&workers[nthreads])) { if (gs_timing) tw += __builtin_ia32_rdtsc() - t1; spins = 0; continue; }
+        int done = 1; const int hi = atomic_load_explicit(&stripe_hi, memory_order_relaxed);
+        for (int s = 0; s < hi && done; s++) done = atomic_load_explicit(&stripes[s].pos, memory_order_acquire) == q_tail;
+        if (done) break;
+        if (++spins < 20000) __builtin_ia32_pause(); else { sched_yield(); spins = 0; }      /* the last stripes are in other hands */
     }
-    if (gs_timing) t_sync_wait += __builtin_ia32_rdtsc() - t0;
+    if (gs_timing) { t_sync_wait += __builtin_ia32_rdtsc() - t0 - tw; t_sync_work += tw; }
+    /* every cursor to the end of the queue (those of stripes nothing was queued for stayed behind) */
+    for (int s = 0; s < NSTRIPE; s++) atomic_store_explicit(&stripes[s].pos, q_tail, memory_order_relaxed);
+    atomic_store_explicit(&bar_passed, q_tail, memory_order_relaxed);
+    atomic_store_explicit(&stripe_hi, DEC_SHARES, memory_order_release);
     for (int i = 0; i < tex_ndefer; i++) free(tex_defer[i]);
     tex_ndefer = 0;
     clut_apply_jobs();
@@ -1462,9 +1726,16 @@ static void gs_sync(int why) {
 
 static void pool_init(void) {
     const char *e = getenv("ROR_GS_THREADS");
-    /* Default: a third of the logical CPUs. More is slower in the game: the
-     * workers then share physical cores with the thread that runs the game. */
-    long n = e ? atol(e) : sysconf(_SC_NPROCESSORS_ONLN) / 3;
+    /* Default. The thread that runs the game needs a processor of its own:
+     * up to 4 logical CPUs every other one gets a worker, up to 8 all but two
+     * (measured on a 4-core / 8-thread laptop, first scene, frames per second
+     * with 2, 3, 5, 6, 7 workers: 43, 49, 51, 51.5, 49). On larger machines a
+     * third of the logical CPUs, at least 6 and at most 12: more is slower in
+     * the game there, because the workers then share physical cores with the
+     * game thread. */
+    long cpus = sysconf(_SC_NPROCESSORS_ONLN);
+    long n = e ? atol(e) : cpus <= 4 ? cpus - 1 : cpus <= 8 ? cpus - 2 : cpus / 3 > 6 ? cpus / 3 : 6;
+    if (!e && n < 1) n = 1;
     if (!e && n > 12) n = 12;
 #ifdef GS_HW
     if (hw_on) n = 0;                   /* the GPU draws; nothing is queued for workers */
@@ -1473,14 +1744,13 @@ static void pool_init(void) {
     if (n < 0) n = 0;
     states = malloc(sizeof(DState) * MAXSTATES);
     queue = malloc(sizeof(Prim) * QCAP);
-    /* Rows 0..15 go to worker 0 (q_clut relies on it); the others are dealt
-     * round-robin, with worker 0 sitting out one round to make up for it. */
-    for (int sidx = 0; sidx < 256; sidx++) {
-        long k = sidx - 2;
-        stripe_owner[sidx] = (u8)(sidx < 2 || n < 2 ? 0 : k < 2 * (n - 1) ? 1 + k % (n - 1) : (k - 2 * (n - 1)) % n);
-    }
+    qinfo = malloc(sizeof(u32) * QCAP);
+    /* Rows 0..15 are one stripe (q_clut relies on it), then 8 rows each. */
+    for (int i = 0; i < 256; i++) stripe_of[i] = (u8)(i < 2 ? 0 : i - 1);
+    atomic_store(&stripe_hi, DEC_SHARES);
     nthreads = (int)n;                  /* fixed before any worker starts */
     worker_csr = _mm_getcsr();
+    workers[n].idx = (int)n;
     for (long i = 0; i < n; i++) {
         pthread_t t;
         workers[i].idx = (int)i;
@@ -1539,6 +1809,52 @@ static int film_grain = 100;         /* --film-grain 0..100: strength of the gam
 void gs_film_grain(int pct) { film_grain = pct < 0 ? 0 : pct > 100 ? 100 : pct; }
 static int want_texfilter = -1;      /* --texture-filter: 0 original, 1 smooth, -1 auto (smooth on a discrete graphics card from --internal 2) */
 void gs_texture_filter(int mode) { want_texfilter = mode; }
+/* ---- frame skipping --------------------------------------------------------------------
+ * When the machine cannot keep up, video.c asks for frames to be left out
+ * (gs_frameskip). A frame is what the game draws between two flips of the
+ * displayed buffer, into the buffer that is hidden meanwhile. Such a frame is
+ * left out only as a whole and only when the first thing drawn into the hidden
+ * buffer is a plain fill of the whole picture (the game's clear): then nothing
+ * in it depends on what the buffer held, and nothing later depends on it
+ * having been drawn. Leaving it out means dropping every primitive that draws
+ * into that buffer until the next flip; register writes, texture uploads and
+ * primitives for other targets go on as always. The buffer then still holds
+ * the complete picture of an earlier frame, so the display shows whichever of
+ * the two buffers holds the newer picture (disp_rect). At most skip_max frames
+ * in a row are left out. Nothing here acts unless a skip was asked for:
+ * unpaced and headless runs draw every frame. */
+static int skip_want, skip_max = 2;           /* asked for by video.c; frames in a row that may be left out */
+static int skip_test; static u64 skip_test_from, skip_test_to = ~0ull;   /* ROR_FRAMESKIP_TEST=n[,from,to] (testing): ask for every n-th frame (between those vblanks), whatever the pacing says */
+static u32 skip_target = ~0u;                 /* FBP of the hidden buffer, the one the current frame is drawn into */
+static int skip_first, skip_now, skip_run;    /* its first primitive is still to come; the frame is being left out; how many in a row */
+static u32 skip_fbp[2] = { ~0u, ~0u }; static u64 skip_seq[2], skip_frame;     /* the two buffers and the number of the frame each holds */
+static u64 skip_stat_skipped, skip_stat_frames;
+void gs_frameskip(int want) { skip_want = want; }
+void gs_frameskip_stats(u64 *skipped, u64 *frames) { *skipped = skip_stat_skipped; *frames = skip_stat_frames; }
+static int disp_rect(u64 *pfb, u64 *pdp, u32 *pfbp, u32 *pfbw, u32 *ppsm, u32 *pdbx, u32 *pdby, u32 *pww, u32 *phh);
+/* The displayed buffer changed from `was` to `now`: the frame drawn into `now` is finished, the next one goes into `was`. */
+static void skip_flip(u32 was, u32 now) {
+    if (skip_fbp[0] != now && skip_fbp[1] != now) { skip_fbp[0] = was; skip_fbp[1] = now; skip_seq[0] = skip_seq[1] = 0; }   /* another pair of buffers */
+    int k = skip_fbp[1] == now;
+    skip_frame++;
+    if (!(skip_now && skip_target == now)) skip_seq[k] = skip_frame;        /* drawn: this buffer holds the newest picture */
+    skip_target = was; skip_first = 1; skip_now = 0;
+    skip_stat_frames++;
+}
+/* First primitive of a frame into the hidden buffer: is it a fill of the whole picture, and is a skip wanted? */
+static int skip_decide(int type, u64 pr, const Ctxt *c) {
+    int want = skip_want || (skip_test > 0 && skip_frame % (u64)skip_test == 0 && g_gs_frames >= skip_test_from && g_gs_frames < skip_test_to);
+    if (!want || skip_run >= skip_max) return 0;
+    if (type != 6 || (pr & 0x10) || (pr & 0x40) || c->fbmsk) return 0;                    /* an untextured, unblended sprite, all channels */
+    if ((c->test & 1) && ((c->test >> 1) & 7) != 1) return 0;                             /* alpha test off or ALWAYS */
+    if ((c->test & 0x4000) || ((c->test >> 16) & 1 && ((c->test >> 17) & 3) >= 2)) return 0;   /* no destination-alpha or depth test */
+    u64 fb, dp; u32 fbp, fbw, psm, dbx, dby, ww, hh;
+    if (!disp_rect(&fb, &dp, &fbp, &fbw, &psm, &dbx, &dby, &ww, &hh)) return 0;
+    s32 x0 = vq[0].x < vq[1].x ? vq[0].x : vq[1].x, x1 = vq[0].x < vq[1].x ? vq[1].x : vq[0].x;
+    s32 y0 = vq[0].y < vq[1].y ? vq[0].y : vq[1].y, y1 = vq[0].y < vq[1].y ? vq[1].y : vq[0].y;
+    if (c->sx0 > (s32)dbx || c->sy0 > (s32)dby || c->sx1 + 1 < (s32)(dbx + ww) || c->sy1 + 1 < (s32)(dby + hh)) return 0;   /* the scissor leaves part of the picture out */
+    return x0 <= (s32)dbx * 16 && y0 <= (s32)dby * 16 && x1 >= (s32)(dbx + ww) * 16 && y1 >= (s32)(dby + hh) * 16;
+}
 /* Widescreen (rt/wide.c): while widened 3D is being drawn, everything that
  * does not come from VU1 (PATH2/PATH3: captions, text, HUD, 2D backgrounds)
  * and goes into a display buffer is squeezed around the screen centre by
@@ -1550,6 +1866,13 @@ static void submit(int type) {
     extern int g_gif_path, g_wide_want_p1; void wide_path1(u32 fbp);
     u64 pr = r_prmodecont ? r_prim : ((r_prim & 7) | (r_prmode & ~7ull));
     const Ctxt *c = &ctxt[(pr >> 9) & 1]; float inv;
+    if (c->fbp == skip_target) {             /* frame skipping: primitives of a frame that is left out go no further */
+        if (skip_first) {
+            skip_first = 0; skip_now = skip_decide(type, pr, c);
+            if (skip_now) { skip_run++; skip_stat_skipped++; } else skip_run = 0;
+        }
+        if (skip_now) return;
+    }
     /* --film-grain: the game's film grain is a handful of full-screen sprites per
      * frame (PATH2/3) that tile a 64x64 32-bit noise texture over the picture,
      * blended with a constant: (Cs - Cd) * FIX + Cd and (Cd - Cs) * FIX + Cd,
@@ -1916,7 +2239,7 @@ static long hwi_rematch(int i, int e, int *partner) {
  * the one it is about to reuse; the game thread submits its copies (hw_flush)
  * before a package becomes visible; the presenter only reads shared images. */
 typedef struct { HwState h; int n; u8 paired; HwVertex cur[6], prev[6]; u8 fix_prev; } PPrim;
-typedef struct Pkg_ { PPrim *p; int n, cap, ok, nrt, src[HW_MAXRT], dst[HW_MAXRT], slot, fslot, pic_w, pic_game, sx, sy, sw, sh, pdx, pdy, pdw, pdh, pww, pwh; u64 t_ns, dur_ns, seq;
+typedef struct Pkg_ { u64 gpu_seq; PPrim *p; int n, cap, ok, nrt, src[HW_MAXRT], dst[HW_MAXRT], slot, fslot, pic_w, pic_game, sx, sy, sw, sh, pdx, pdy, pdw, pdh, pww, pwh; u64 t_ns, dur_ns, seq;
                  u8 *cls; int cls_cap, f_ok, f_cut, f_ovl, f_mv, f_mvds, f_ob, f_ow, f_ods; float cam[5]; } Pkg;      /* FSR 3.1: see hwf_classify */
 static Pkg hwp_pkg[4]; static u64 hwp_seq, hwp_ideal_ns, hwp_last_ideal; static Pkg *hwp_newest;
 static pthread_mutex_t hwp_mx = PTHREAD_MUTEX_INITIALIZER;
@@ -1942,7 +2265,7 @@ static Pkg *hwp_publish(const int *partner, int ok, int pic, int sx, int sy, int
      * that far behind, this frame gets no package (the game thread never
      * waits); the next one then cannot be interpolated either, having no
      * start-of-frame copy. */
-    if (atomic_load(&hwp_using) + 3 <= k) { hwi_have_start = -1; hwp_stat_dropped++; return 0; }
+    if (atomic_load(&hwp_using) + 3 <= k) { hwi_have_start = -1; hwp_stat_dropped++; g_perf[10]++; return 0; }
     hwp_seq = k;
     if (P->cap < hwi_ncur) { P->cap = hwi_ncur + 1024; P->p = realloc(P->p, sizeof(PPrim) * (size_t)P->cap); }
     P->n = hwi_ncur;
@@ -1978,7 +2301,9 @@ static Pkg *hwp_publish(const int *partner, int ok, int pic, int sx, int sy, int
     if (hw_fsr3) hwf_classify(P);
     hw_rt_save(pic, P->fslot, 1);
     hw_keep_generation();
-    { u64 f0 = plat_time_ns(); hw_flush(); hwp_pub_flush_ms = (float)(plat_time_ns() - f0) / 1e6f; }      /* everything the package refers to is submitted before it can be seen */
+    /* everything the package refers to is submitted before it can be seen; the presenter takes the package
+     * once the GPU has finished that submission (the game thread does not wait for it) */
+    { u64 f0 = plat_time_ns(); if (hw_async()) hw_flush_async(); else hw_flush(); P->gpu_seq = hw_submitted_serial(); hwp_pub_flush_ms = (float)(plat_time_ns() - f0) / 1e6f; }
     /* Start late enough that the package is there in time: one vblank after
      * the ideal time at least, more if the game thread has been finishing its
      * frames later than that (slowly forgotten). */
@@ -2199,6 +2524,7 @@ static void hwg_grab_after(int tag) {
 static void *hwp_thread(void *arg) {
     (void)arg;
     _mm_setcsr(worker_csr);
+    plat_thread_role(1);
     hw_thread_init();
     Pkg *cur = 0, *next = 0; u64 taken = 0, last_present = 0, due = 0; int shown_final = 0, lw = 0, lh = 0;
     static u64 iv[1024]; int niv = 0; u64 render_ns = 0, presents = 0, t_log = 0;
@@ -2207,7 +2533,7 @@ static void *hwp_thread(void *arg) {
     for (;;) {
         int dx, dy, dw, dh, ww, wh, linear, sat64;
         pthread_mutex_lock(&hwp_mx);
-        if (hwp_newest && hwp_newest->seq > taken) { next = hwp_newest; taken = next->seq; }
+        if (hwp_newest && hwp_newest->seq > taken && hw_serial_done(hwp_newest->gpu_seq)) { next = hwp_newest; taken = next->seq; }
         dx = hwp_par.dx; dy = hwp_par.dy; dw = hwp_par.dw; dh = hwp_par.dh; ww = hwp_par.ww; wh = hwp_par.wh; linear = hwp_par.linear; sat64 = hwp_par.sat64;
         pthread_mutex_unlock(&hwp_mx);
         u64 now = plat_time_ns();
@@ -2288,6 +2614,7 @@ static void *hwp_thread(void *arg) {
         { static int trace = -1, ntr; if (trace < 0) trace = getenv("ROR_HW_PRESENT_TRACE") ? atoi(getenv("ROR_HW_PRESENT_TRACE")) : 0;
           if (trace && (int)g_gs_frames >= trace && ntr < 400) { ntr++; rt_log("[ptrace] at %.2f ms: pkg %llu t=%.2f ok=%d prims=%d; draw %.2f ms, present %.2f ms; next pkg in %.1f ms\n", now / 1e6, (unsigned long long)cur->seq, t, cur->ok, cur->n, (t1 - now) / 1e6, (t2 - t1) / 1e6, next ? ((double)next->t_ns - (double)now) / 1e6 : -1.0); } }
         if (last_present && niv < 1024) iv[niv++] = t2 - last_present;
+        if (g_perf_on && last_present) { u64 d = t2 - last_present, b = d / 250000; g_perf_hist[b > 257 ? 257 : b]++; if (d > g_perf_pres_max) g_perf_pres_max = d; }
         if (!hw_fps_target && limit == 0 && t < 1.0f && last_present && t2 - last_present < 30000000ull && probe_n < 200) {
             probe_sum += t2 - last_present;
             if (++probe_n == 200 && hw_fps_hz > 0 && probe_sum / 200 < 800000000ull / (u64)hw_fps_hz) {
@@ -2349,7 +2676,7 @@ static void hwi_boundary(HRt *disp, u32 dbx, u32 dby, u32 ww, u32 hh) {
     hwi_frame++;
     int want = hwi_frame >= hw_interp_first && hwi_frame < hw_interp_first + hw_interp_count;
     /* match batches */
-    int *partner = malloc(sizeof(int) * (size_t)(hwi_ncur + 1)); u64 tm0 = plat_time_ns(), tm1 = 0, tm2 = 0;
+    int *partner = malloc(sizeof(int) * (size_t)(hwi_ncur + 1)); u64 tm0 = plat_time_ns(), tm1 = 0, tm2 = 0, perf_w0 = hw_stat_wait_ns;
     if (hwi_strict < 0) { hwi_strict = !(getenv("ROR_HW_INTERP_CHECK") && atoi(getenv("ROR_HW_INTERP_CHECK")) == 0); hwi_stats = getenv("ROR_HW_INTERP_STATS") != 0; }
     long tot = 0, matched = 0, snapped = 0, n_cross = 0; int j = 0, batches = 0, mb = 0, sb = 0, rb = 0;
     hwi_kbuild();
@@ -2605,12 +2932,20 @@ static void hwi_boundary(HRt *disp, u32 dbx, u32 dby, u32 ww, u32 hh) {
                                           (unsigned long long)frames, (unsigned long long)frames_bad, (unsigned long long)bads, (unsigned long long)pairs, ns_a / 1e6 / (double)frames, ns_b / 1e6 / (double)frames);
         }
     }
-    int ok = hwi_nprev > 0 && tot > 0 && matched * 10 >= tot * 7 && !hwi_uploads && !hwi_texgone && hwi_have_start;
+    /* (A texture replaced during the frame does not stand in the way: GPU textures are never rewritten, and
+     * one that is given up stays alive for the packages that can still draw with it, hw_keep_generation.) */
+    int ok = hwi_nprev > 0 && tot > 0 && matched * 10 >= tot * 7 && !hwi_uploads && hwi_have_start;
+    if (g_perf_on && hw_fps_on) {
+        g_perf[4]++;
+        if (ok) g_perf[5]++; else if (hwi_uploads) g_perf[6]++; else if (hwi_have_start <= 0) g_perf[9]++; else g_perf[8]++;
+        if (hwi_texgone) g_perf[7]++;          /* (counted, no longer a reason) */
+    }
     hwf_replay = !hwi_uploads && hwi_have_start > 0; hwf_cut = !(hwi_nprev > 0 && tot > 0 && matched * 10 >= tot * 7);
     if (hw_fps_on || hw_fsr3) {
         { static int trace = -1, ntr; if (trace < 0) trace = getenv("ROR_HW_PRESENT_TRACE") ? atoi(getenv("ROR_HW_PRESENT_TRACE")) : 0;
           if (trace && (int)g_gs_frames >= trace && ntr < 60) { ntr++; rt_log("[btrace] at %.2f ms: vblank %llu boundary, displayed fbp %x, list %d prims, picture target %d, ok %d, ideal %.2f\n", plat_time_ns() / 1e6, (unsigned long long)g_gs_frames, disp->fbp, hwi_ncur, pic, ok, hwp_ideal_ns / 1e6); } }
         Pkg *pk = hwp_publish(partner, ok, pic, (int)dbx, (int)dby, (int)ww, (int)hh);
+        if (g_perf_on) { g_perf[3] += plat_time_ns() - tm0; g_perf[11] += hw_stat_wait_ns - perf_w0; }
         if (hw_fsr3 && !hw_fps_on) { if (pk) hwf_boundary(pk); else hwf_reset = 1; }
         hwp_stat_frames++; hwp_stat_ok += ok; hwp_stat_tot += tot; hwp_stat_matched += matched;
         free(partner);
@@ -2751,7 +3086,7 @@ static void hwg_tex(DState *s) {
     hwg_cpu_needs(&s->texmask);
     s->tex = texcache_get(s);
     TexEnt *e = tex_last;
-    if (!e->hw_valid) { e->hwtex = hw_tex_create(1 << c->tw, 1 << c->th, e->px); e->hw_valid = 1; }
+    if (!e->hw_valid) { u64 t0 = g_perf_on ? plat_time_ns() : 0; e->hwtex = hw_tex_create(1 << c->tw, 1 << c->th, e->px); e->hw_valid = 1; if (g_perf_on) g_perf[2] += plat_time_ns() - t0; }
     s->hw_kind = 1; s->hw_tex = e->hwtex;
 }
 /* Translate the draw state. Returns 0 when nothing can be drawn. */
@@ -3016,21 +3351,49 @@ static void hwg_prim(const DState *st, const Prim *p) {
 }
 
 /* CLUT load whose source may be on the GPU. Returns 1 if the load was deferred. */
-static void hwg_apply_cluts(void) {
-    for (int k = 0; k < clut_njobs; k++) {
-        ClutJob *j = clut_jobs[k]; u32 px[256];
-        hw_ticket_read(hw_clut_ticket[k], px);
-        int count = j->d.n4 ? 16 : 256; u32 base = j->d.n4 ? (j->d.csa & 15) * 16 : 0;
-        for (int i = 0; i < count; i++) {
-            int jj = j->d.n4 ? i : ((i & 0xE7) | ((i & 8) << 1) | ((i & 16) >> 1));
-            u32 x = j->d.n4 ? (u32)(i & 7) : (u32)(jj & 15), y = j->d.n4 ? (u32)(i >> 3) : (u32)(jj >> 4);
-            j->val[(base + (u32)i) & 255] = px[y * 16 + x];
-        }
+static void hwg_clut_fetch(int k) {       /* the pixels of queued load k, once the GPU has copied them */
+    ClutJob *j = clut_jobs[k]; u32 px[256];
+    hw_ticket_read(hw_clut_ticket[k], px);
+    int count = j->d.n4 ? 16 : 256; u32 base = j->d.n4 ? (j->d.csa & 15) * 16 : 0;
+    for (int i = 0; i < count; i++) {
+        int jj = j->d.n4 ? i : ((i & 0xE7) | ((i & 8) << 1) | ((i & 16) >> 1));
+        u32 x = j->d.n4 ? (u32)(i & 7) : (u32)(jj & 15), y = j->d.n4 ? (u32)(i >> 3) : (u32)(jj >> 4);
+        j->val[(base + (u32)i) & 255] = px[y * 16 + x];
     }
+}
+static void hwg_apply_cluts(void) {
+    for (int k = 0; k < clut_njobs; k++) hwg_clut_fetch(k);
     clut_apply_jobs();
+}
+/* The queued loads whose pixels have arrived (the frame they were queued in was
+ * submitted without waiting and is done by now); the others stay queued, and
+ * their groups pending. Nothing waits here. */
+static void hwg_apply_ready_cluts(void) {
+    int m = 0; u16 pending = 0;
+    for (int k = 0; k < clut_njobs; k++) {
+        ClutJob *j = clut_jobs[k];
+        u16 groups = j->d.n4 ? (u16)(1u << (j->d.csa & 15)) : 0xFFFF;
+        if (!hw_ticket_ready(hw_clut_ticket[k])) {
+            for (int g = 0; g < 16; g++) if ((groups & (1u << g)) && clut_seq[g] == j->seq) pending |= (u16)(1u << g);
+            clut_jobs[m] = j; hw_clut_ticket[m++] = hw_clut_ticket[k];
+            continue;
+        }
+        hwg_clut_fetch(k);
+        for (int g = 0; g < 16; g++) if ((groups & (1u << g)) && clut_seq[g] == j->seq) memcpy(&clut[g * 16], &j->val[g * 16], 64);
+        free(j);
+    }
+    if (m != clut_njobs) clut_sig_valid = 0;
+    clut_njobs = m; clut_pending = pending;
 }
 static void hwg_sync(void) {
     if (!clut_njobs) return;
+    if (hw_async()) {
+        /* loads queued in frames that are with the GPU: waiting for those is enough, what is being
+         * recorded for the current frame need not be submitted for them */
+        hw_wait_submitted();
+        hwg_apply_ready_cluts();
+        if (!clut_njobs) return;
+    }
     hw_flush();
     hwg_apply_cluts();
 }
@@ -3530,7 +3893,7 @@ void gs_write_priv(u32 a, u64 v) {
     case 0x0020: p_smode2 = v; break;
     case 0x0070: case 0x0090: {            /* --wide: a change of the displayed buffer is the game's frame flip */
         void wide_flip(u32 fbp); int i = (a & 0xFFFF) == 0x90;
-        if (((p_pmode & 2) ? 1 : 0) == i && ((v ^ p_dispfb[i]) & 0x1FF)) wide_flip((u32)(v & 0x1FF) << 5);
+        if (((p_pmode & 2) ? 1 : 0) == i && ((v ^ p_dispfb[i]) & 0x1FF)) { wide_flip((u32)(v & 0x1FF) << 5); skip_flip((u32)(p_dispfb[i] & 0x1FF) << 5, (u32)(v & 0x1FF) << 5); }
         p_dispfb[i] = v; break;
     }
     case 0x0080: p_display[0] = v; break;
@@ -3570,10 +3933,10 @@ void gs_vblank(int start) {
             }
             if (gs_timing) {
                 char buf[512]; int o = 0;
-                for (int i = 0; i < nthreads; i++) o += snprintf(buf + o, sizeof buf - (size_t)o, " %.2f/%.2f", workers[i].t_work / 500.0 / 1e6, workers[i].t_wait / 500.0 / 1e6);
-                rt_log("[gs] Mcycles per frame: sync wait %.2f; workers work/barrier-wait:%s\n", t_sync_wait / 500.0 / 1e6, buf);
-                for (int i = 0; i < nthreads; i++) workers[i].t_work = workers[i].t_wait = workers[i].t_idle = 0;      /* (racy reset: debug only) */
-                t_sync_wait = 0;
+                for (int i = 0; i < nthreads; i++) o += snprintf(buf + o, sizeof buf - (size_t)o, " %.2f", workers[i].t_work / 500.0 / 1e6);
+                rt_log("[gs] Mcycles per frame: main thread in sync: drawing %.2f, waiting %.2f; workers drawing:%s\n", t_sync_work / 500.0 / 1e6, t_sync_wait / 500.0 / 1e6, buf);
+                for (int i = 0; i < nthreads; i++) workers[i].t_work = workers[i].t_idle = 0;      /* (racy reset: debug only) */
+                t_sync_wait = t_sync_work = 0;
             }
             memset(stat_sync, 0, sizeof stat_sync); stat_barriers = stat_decodes = stat_serial = stat_states = stat_xfer_px = 0;
         }
@@ -3595,6 +3958,11 @@ static int disp_rect(u64 *pfb, u64 *pdp, u32 *pfbp, u32 *pfbw, u32 *ppsm, u32 *p
     if (ww == 0 || hh == 0 || fbw == 0) return 0;
     if (ww > 1024) ww = 1024;
     if (hh > 1024) hh = 1024;
+    if (skip_stat_skipped && (fbp == skip_fbp[0] || fbp == skip_fbp[1])) {
+        /* frames have been left out: of the two buffers, show the one that holds the newer picture */
+        int k = fbp == skip_fbp[1], o = !k;
+        if (skip_fbp[o] != ~0u && skip_seq[o] > skip_seq[k]) { fbp = skip_fbp[o]; fb = (fb & ~0x1FFull) | (fbp >> 5); }
+    }
     *pfb = fb; *pdp = dp; *pfbp = fbp; *pfbw = fbw; *ppsm = psm; *pdbx = dbx; *pdby = dby; *pww = ww; *phh = hh;
     return 1;
 }
@@ -3613,6 +3981,20 @@ int gs_hw_show(int dx, int dy, int dw, int dh, int ww_, int wh_, int linear, con
     HRt *r = 0;
     if (ww_ > 0) { hwf_rect.dx = dx; hwf_rect.dy = dy; hwf_rect.dw = dw; hwf_rect.dh = dh; hwf_rect.ww = ww_; hwf_rect.wh = wh_; }
     if (disp_rect(&fb, &dp, &fbp, &fbw, &psm, &dbx, &dby, &ww, &hh) && (psm == PSMCT32 || psm == PSMCT24)) r = hwg_display_rt(fbp, fbw, dbx, dby, ww, hh);
+    /* Without frame interpolation and FSR 3.1 nothing needs this frame's pixels now: it is left with the GPU
+     * (hw/gs_hw.c, "Not waiting for the GPU") and the game goes on. The CLUT loads queued in frames the GPU
+     * has finished meanwhile are taken over here, the others at a later vblank (or when a texture needs them). */
+    hw_set_async(!hw_fps_on && !hw_fsr3 && !hw_interp_n);
+    if (hw_async()) {
+        hw_poll();
+        hwg_apply_ready_cluts();
+        if (ww_ > 0) {
+            hwg_grab_before();
+            hw_present(r ? r->hw : -1, (int)dbx, (int)dby, (int)ww, (int)hh, dx, dy, dw, dh, ww_, wh_, linear, sat64);
+            hwg_grab_after(100);
+        } else hw_flush_async();
+        return r != 0;
+    }
     if (ww_ > 0) {
         hwg_grab_before();
         if (r) hwf_show(r->hw, linear, dw, dh);
@@ -3648,12 +4030,21 @@ void gs_hw_vblank(int dx, int dy, int dw, int dh, int ww_, int wh_, int linear, 
     u64 ta = plat_time_ns();
     if (disp_rect(&fb, &dp, &fbp, &fbw, &psm, &dbx, &dby, &ww, &hh) && (psm == PSMCT32 || psm == PSMCT24)) hwg_display_rt(fbp, fbw, dbx, dby, ww, hh);
     u64 tb = plat_time_ns();
-    hw_flush();
+    /* With frame interpolation the game thread does not wait for the GPU here either (hw/gs_hw.c, "Not waiting
+     * for the GPU"): the frame is left with the GPU, and the presenter takes its package once that submission
+     * has finished (hw_serial_done). Palette read-backs queued in frames the GPU has finished are taken over
+     * here, the others at a later vblank, or when something needs them (hwg_sync waits). FSR 3.1 keeps the
+     * waiting path. ROR_HW_SYNC=1 waits everywhere. */
+    if (hw_fps_on && !hw_fsr3) {
+        hw_set_async(1);
+        hw_poll(); hwg_apply_ready_cluts();
+        hw_flush_async();
+    } else hw_flush();
     { static int trace = -1; static u64 last; u64 tc = plat_time_ns();
       if (trace < 0) trace = getenv("ROR_HW_PRESENT_TRACE") ? atoi(getenv("ROR_HW_PRESENT_TRACE")) : 0;
       if (trace && (int)g_gs_frames >= trace && (tc - last > 30000000ull || tc - ta > 8000000ull)) rt_log("[vtrace] vblank %llu: since last vblank call %.1f ms, late %.1f ms; boundary work %.1f ms (publish wait for GPU %.1f), flush %.1f ms\n", (unsigned long long)g_gs_frames, (tc - last) / 1e6, ((double)ta - (double)ideal_ns) / 1e6, (tb - ta) / 1e6, hwp_pub_flush_ms, (tc - tb) / 1e6);
       last = tc; }
-    if (clut_njobs) hwg_apply_cluts();
+    if (clut_njobs && !hw_async()) hwg_apply_cluts();
 }
 int gs_hw_show_pixels(int dx, int dy, int dw, int dh, int ww_, int wh_, int linear, const u8 *lut, int sat64, u32 **pixels) {
     u64 fb, dp; u32 fbp, fbw, psm, dbx, dby, ww, hh;
@@ -3688,7 +4079,7 @@ int gs_get_frame(u32 **pixels, int *w, int *h) {
     if (!disp_rect(&fb, &dp, &fbp, &fbw, &psm, &dbx, &dby, &ww, &hh)) return 0;
     tx_flush();
 #ifdef GS_HW
-    if (hw_on && (psm == PSMCT32 || psm == PSMCT24) && hwg_frame(fbp, fbw, dbx, dby, ww, hh, pixels, w, h)) return 1;
+    if (hw_on && (psm == PSMCT32 || psm == PSMCT24) && hwg_frame(fbp, fbw, dbx, dby, ww, hh, pixels, w, h)) { g_gs_frame_id++; return 1; }
 #endif
     PageSet disp; rect_pages(&disp, psm, fbp, fbw, dbx, dby, ww, hh);
     {   /* Same registers and no possible write to the displayed pages since the
@@ -3704,6 +4095,7 @@ int gs_get_frame(u32 **pixels, int *w, int *h) {
         }
         have = 1; last_sig = sig; last_fb = fb; last_dp = dp; last_mode = mode;
     }
+    g_gs_frame_id++;
     if (q_pending() && ps_meet(&disp, &pend_dirty)) gs_sync(SY_FRAME);     /* wait only if the displayed buffer is still being drawn */
     if (psm == PSMCT32 || psm == PSMCT24) {
         for (u32 y = 0; y < hh; y++) {
@@ -3755,12 +4147,15 @@ void gs_init(void) {
 #endif
     build_tables();
     build_xfer_tables();
+    sprite4_init();
     for (int i = 0; i < 512; i++) page_hgen[i] = ~0ull;
+    gs_timing = getenv("ROR_GS_TIMING") != 0;          /* (the workers read these two) */
+    { const char *e = getenv("ROR_GS_SPIN"); if (e) idle_spins = atoi(e); }
     pool_init();
     cap_init();
-    gs_timing = getenv("ROR_GS_TIMING") != 0;
-    { const char *e = getenv("ROR_GS_SPIN"); if (e) idle_spins = atoi(e); }
     { const char *e = getenv("ROR_GS_FORCE"); if (e) gs_force = atoi(e); }
     { const char *e = getenv("ROR_GSDUMP"); if (e) gs_dump_frame = strtoull(e, 0, 0); }
+    { const char *e = getenv("ROR_FRAMESKIP_TEST"); if (e) { unsigned long long a = 0, b = ~0ull; sscanf(e, "%d,%llu,%llu", &skip_test, &a, &b); skip_test_from = a; skip_test_to = b; } }
+    { const char *e = getenv("ROR_FRAMESKIP_MAX"); if (e && atoi(e) > 0) skip_max = atoi(e); }
     for (int i = 0; i < 2; i++) { ctxt[i].sx1 = 2047; ctxt[i].sy1 = 2047; ctxt[i].zpsm = PSMZ32; }
 }

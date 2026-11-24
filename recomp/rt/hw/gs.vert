@@ -12,7 +12,7 @@ layout(push_constant) uniform PC {
     uint flags; int aref; uint fogcol; uint blend;
     ivec4 region;
     vec4 tex;         /* texture width, height (native texels), texel scale, unused */
-    vec4 zp;          /* depth scale, depth max, ta0, unused */
+    vec4 zp;          /* depth scale, depth max, ta0, early-depth margin (0: the rasterizer's depth is not used) */
     uint fbmsk;
 } pc;
 layout(location = 0) in vec4 a_pos;     /* x, y, z, fog */
@@ -31,7 +31,14 @@ layout(location = 4) noperspective out vec3 v_mv;
 #endif
 void main() {
     vec2 p = a_pos.xy * pc.rt.z + 0.5;
-    gl_Position = vec4(p * pc.rt.xy - 1.0, 0.0, 1.0);
+    float zr = 0.0;
+#ifndef MV_PASS
+    /* Early depth test (gs.frag, EARLY_Z): the rasterizer interpolates a depth that is never below the one the
+     * fragment shader writes (which is floor(z) of the same vertex values): z plus a margin for the interpolation's
+     * rounding. Depth clamping is on for these pipelines, so nothing is clipped where it exceeds 1. */
+    if (pc.zp.w > 0.0) zr = (a_pos.z + pc.zp.w) * pc.zp.x;
+#endif
+    gl_Position = vec4(p * pc.rt.xy - 1.0, zr, 1.0);
     v_col = a_col; v_stq = a_stq; v_zf = a_pos.zw; v_spr = a_spr;
 #ifdef MV_PASS
     float q = ((pc.flags & 3u) == 1u && a_stq.z > 0.0) ? a_stq.z : 1.0;      /* textured with STQ */

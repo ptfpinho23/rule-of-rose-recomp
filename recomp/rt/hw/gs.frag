@@ -30,6 +30,12 @@ layout(location = 0) out vec4 o_col;
 layout(location = 0, index = 0) out vec4 o_col;
 layout(location = 0, index = 1) out vec4 o_fac;    /* blend factor (dual source) */
 #endif
+#ifdef EARLY_Z
+/* The depth written below is never above the rasterizer's own (see gs.vert), and the depth tests in use pass
+ * larger values: a fragment whose rasterized depth already fails cannot pass with the written one, so the GPU may
+ * reject it before running this shader. The picture is the same; hidden fragments cost nothing. */
+layout(depth_less) out float gl_FragDepth;
+#endif
 
 const uint F_TME = 1u, F_TEXEL = 2u, F_BILIN = 4u, F_TCC = 8u, F_FGE = 64u, F_ATE = 1024u, F_FBA = 8192u,
            F_SPRITE = 16777216u, F_MIP = 33554432u, F_SHBLEND = 16384u, F_DATE = 32768u, F_DATM = 65536u, F_COLCLAMP = 131072u, F_TEX24 = 4194304u, F_AEM = 8388608u;

@@ -3,8 +3,10 @@
  * Vulkan 1.3 (dynamic rendering, dual-source blending), loaded at run time
  * through a function table: no link dependency, hw_start() simply fails on a
  * machine without it. Everything is recorded into one command buffer that is
- * submitted and waited for at hw_flush() (once per displayed frame, or when
- * the caller needs pixels back).
+ * submitted and waited for at hw_flush() (when the caller needs pixels back),
+ * or, at the end of a displayed frame, submitted and left with the GPU while
+ * the next frame is recorded into a second one (hw_flush_async, hw_present:
+ * see "Not waiting for the GPU").
  *
  * Shaders: gs.vert / gs.frag / blit.vert / blit.frag in this directory,
  * compiled into gs_hw_spv.h by recomp/tools/gshw-shaders.sh. */
@@ -57,7 +59,7 @@ static void *lib_sym(void *l, const char *n) { return dlsym(l, n); }
     X(GetPhysicalDeviceSurfaceFormatsKHR) X(GetPhysicalDeviceSurfacePresentModesKHR)
 #define VKDFN(X) \
     X(GetDeviceQueue) X(CreateCommandPool) X(AllocateCommandBuffers) X(BeginCommandBuffer) X(EndCommandBuffer) X(QueueSubmit) \
-    X(CreateFence) X(WaitForFences) X(ResetFences) X(ResetCommandBuffer) X(CreateImage) X(GetImageMemoryRequirements) \
+    X(CreateFence) X(WaitForFences) X(GetFenceStatus) X(ResetFences) X(ResetCommandBuffer) X(CreateImage) X(GetImageMemoryRequirements) \
     X(AllocateMemory) X(BindImageMemory) X(CreateImageView) X(DestroyImage) X(DestroyImageView) X(FreeMemory) X(CreateBuffer) \
     X(GetBufferMemoryRequirements) X(BindBufferMemory) X(MapMemory) X(CreateSampler) X(CreateDescriptorSetLayout) \
     X(CreateDescriptorPool) X(AllocateDescriptorSets) X(FreeDescriptorSets) X(UpdateDescriptorSets) X(CreatePipelineLayout) \
@@ -81,16 +83,47 @@ typedef struct { float rt[4]; uint32_t flags; int32_t aref; uint32_t fogcol, ble
 #define ST_BYTES (96u << 20)
 static VkInstance inst; static VkPhysicalDevice phys; static VkDevice dev; static VkQueue queue; static uint32_t qfam;
 static TL VkCommandPool pool; static TL VkCommandBuffer cb; static TL VkFence fence; static TL int is_game;
+/* Not waiting for the GPU. A thread has three command buffers. A frame's
+ * commands can be submitted without waiting (submit_cb with async set): the
+ * buffer stays "in flight" and recording goes on in another one, so the GPU
+ * draws frame N while the caller already prepares frame N + 1. Up to two
+ * buffers are in flight (the game draws every second vblank; the vblank in
+ * between submits only the picture's presentation, which must not have to wait
+ * for the frame before it): a submit that leaves no free buffer waits for the
+ * oldest. What the GPU may still be using is left alone until then:
+ *  - vertex and staging memory: each recording takes its part of the buffer
+ *    behind the newest one in flight, up to the next one in flight or the end
+ *    (new_region; vlimit / slimit);
+ *  - textures given up (hw_tex_destroy): destroyed once the submission that was
+ *    being recorded then has completed (tex_dead_serial);
+ *  - queued reads (tickets) are readable when their submission has completed
+ *    (hw_ticket_ready after hw_poll); hw_flush() waits for everything, as before.
+ * Used by the game thread only, and only while async_on (hw_set_async). */
+typedef struct { VkCommandBuffer cb; VkFence fence; uint64_t serial; size_t va, vb, sa, sb; } Flight;     /* [va, vb), [sa, sb): its vertex / staging data */
+static TL Flight flights[2]; static TL int nflights;           /* in flight, oldest first */
+static TL VkCommandBuffer cb_spare[2]; static TL VkFence fence_spare[2]; static TL int nspare;
+static TL size_t vbase, vlimit, sbase, slimit;       /* where this recording's vertex / staging data started and must end */
+static TL uint64_t rec_serial = 1, done_serial;     /* submission being recorded; last one known complete */
+static int async_on;
+/* The game thread's submissions as other threads may see them (hw_serial_done): the fences in flight and the
+ * last number known complete. The game thread changes them, and resets a fence, only under sh_mx. */
+static pthread_mutex_t sh_mx = PTHREAD_MUTEX_INITIALIZER; static struct { VkFence fence; uint64_t serial; } sh_fl[2]; static int sh_n; static uint64_t sh_done;
 static VkPhysicalDeviceMemoryProperties memprops; static char devname[256];
 static PFN_vkGetInstanceProcAddr gipa; static int have_surface_ext, have_swapchain_ext;
 static VkSurfaceKHR surf; static VkSwapchainKHR swp; static VkImage swimg[8]; static VkImageView swview[8]; static uint32_t nsw;
-static VkFormat swfmt; static VkExtent2D swext; static VkSemaphore sem_acq, sem_done; static int sw_vsync;
+static VkFormat swfmt; static VkExtent2D swext; static int sw_vsync;
+/* Acquire / present semaphores: four pairs used in turn, because a present's commands may still be queued behind
+ * two others when the next picture is acquired (see "Not waiting for the GPU"); a pair comes round again only after
+ * the submission that used it has completed. */
+#define SW_SEMS 4
+static VkSemaphore sem_acq_[SW_SEMS], sem_done_[SW_SEMS]; static unsigned sem_k;
 static VkSampler sampler_lin; static Img lut_img; static int lut_on;
 static float pr_rcas; static int pr_bloom, sw_can_grab;        /* presentation options (hw_present_opts) */
 static TL Img st_a, st_b, gl_a, gl_b;                          /* presentation stages of the presenting thread */
 static TL int grab_want, grab_w, grab_h; static TL size_t grab_at;
 static VkSampler sampler; static VkDescriptorSetLayout dsl; static VkDescriptorPool dpool; static VkPipelineLayout playout;
-static VkShaderModule sm_vert, sm_frag, sm_bvert, sm_bfrag, sm_pfrag, sm_mvvert, sm_mvfrag, sm_ffrag; static VkPipeline blit_pipe;
+static VkShaderModule sm_vert, sm_frag, sm_frag_ez, sm_bvert, sm_bfrag, sm_pfrag, sm_mvvert, sm_mvfrag, sm_ffrag; static VkPipeline blit_pipe;
+static int have_depth_clamp, early_z;          /* early depth test (see draw_range): the device can clamp depth; not switched off by ROR_HW_NO_EARLYZ=1 */
 static int fsr_want; static float mv_zfar, mv_zinv;      /* FSR 3.1 asked for (hw_fsr3_want); depth mapping of the motion-vector pass */
 static int N = 1;
 static float uv_shift_k(void) { static float k = -1.0f; if (k < 0.0f) k = getenv("ROR_HW_UVSHIFT") ? (float)atof(getenv("ROR_HW_UVSHIFT")) : 0.0f; return k; }
@@ -102,12 +135,15 @@ static float uv_shift_k(void) { static float k = -1.0f; if (k < 0.0f) k = getenv
 static Rt rts[MAX_RT]; static int nrt;
 static Img dss[MAX_RT]; static int nds;
 static Img dsv[MAX_RT][HW_SLOTS];                 /* depth as a frame found it (frame interpolation) */
-static Img texs[MAX_TEX]; static uint8_t tex_used[MAX_TEX]; static int tex_dead[MAX_TEX], ntex_dead; static uint64_t tex_dead_gen[MAX_TEX], keep_gen;
+static Img texs[MAX_TEX]; static uint8_t tex_used[MAX_TEX]; static int tex_dead[MAX_TEX], ntex_dead; static uint64_t tex_dead_gen[MAX_TEX], tex_dead_serial[MAX_TEX], keep_gen;
 static Img dummy;
 static TL VkBuffer vbuf, sbuf, rbuf; static TL uint8_t *vmap, *smap, *rmap; static TL VkDeviceMemory rmem; static TL size_t voff, soff, rcap, roff, st_cap;
 static TL int rendering, cur_rt = -1, cur_ds = -1, recording;
 static struct { uint32_t key; VkPipeline p; } pipes[256]; static int npipes;
-static struct { size_t off; int w, h; } tickets[256]; static int ntickets;
+/* Queued reads: 256 slots of 16x16 pixels at the start of the read-back buffer. */
+#define TICKETS 256
+#define TICKET_BYTES 1024
+static struct { uint64_t serial; int used, w, h; } tickets[TICKETS]; static int ticket_next;
 uint64_t hw_stat_draws, hw_stat_copies, hw_stat_flushes, hw_stat_wait_ns;
 static int exact_afail;
 /* pending batch */
@@ -212,7 +248,8 @@ static VkShaderModule shader(const uint32_t *code, size_t bytes) {
 }
 
 /* key: blend_mode(2) blend_const(1) cmask(4) ztest(2) zwrite(1) blit(1) present(1) format(3, presentation passes)
- * mv(1: motion-vector variant of the GS shaders, RGBA32F target) fsr3(1: fsr3.frag instead of present.frag) */
+ * mv(1: motion-vector variant of the GS shaders, RGBA32F target) fsr3(1: fsr3.frag instead of present.frag)
+ * early(1: gs.frag with the early depth test, depth clamping on) */
 static VkPipeline pipeline_new(uint32_t key);
 static VkPipeline pipeline(uint32_t key) {
     static TL struct { uint32_t key; VkPipeline p; } last[8]; static TL int ln;         /* per-thread shortcut past the lock */
@@ -226,10 +263,10 @@ static VkPipeline pipeline(uint32_t key) {
 static VkPipeline pipeline_new(uint32_t key) {
     for (int i = 0; i < npipes; i++) if (pipes[i].key == key) return pipes[i].p;
     int bm = key & 3, bconst = (key >> 2) & 1, cmask = (key >> 3) & 15, ztest = (key >> 7) & 3, zwrite = (key >> 9) & 1, pres = (key >> 11) & 1, blit = ((key >> 10) & 1) | pres;
-    int mv = (key >> 15) & 1, f3 = (key >> 16) & 1;
+    int mv = (key >> 15) & 1, f3 = (key >> 16) & 1, ez = (key >> 17) & 1;
     VkPipelineShaderStageCreateInfo st[2] = {
         { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, 0, 0, VK_SHADER_STAGE_VERTEX_BIT, blit ? sm_bvert : mv ? sm_mvvert : sm_vert, "main", 0 },
-        { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, 0, 0, VK_SHADER_STAGE_FRAGMENT_BIT, f3 ? sm_ffrag : pres ? sm_pfrag : blit ? sm_bfrag : mv ? sm_mvfrag : sm_frag, "main", 0 } };
+        { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, 0, 0, VK_SHADER_STAGE_FRAGMENT_BIT, f3 ? sm_ffrag : pres ? sm_pfrag : blit ? sm_bfrag : mv ? sm_mvfrag : ez ? sm_frag_ez : sm_frag, "main", 0 } };
     VkVertexInputBindingDescription vb = { 0, sizeof(HwVertex), VK_VERTEX_INPUT_RATE_VERTEX };
     VkVertexInputAttributeDescription va[4] = { { 0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 0 }, { 1, 0, VK_FORMAT_R32G32B32_SFLOAT, 16 },
                                                 { 2, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 28 }, { 3, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 44 } };
@@ -238,6 +275,7 @@ static VkPipeline pipeline_new(uint32_t key) {
     VkPipelineViewportStateCreateInfo vp = { VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, 0, 0, 1, 0, 1, 0 };
     VkPipelineRasterizationStateCreateInfo rs = { VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
     rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE; rs.lineWidth = 1.0f;
+    rs.depthClampEnable = ez;                    /* the rasterizer's depth may exceed 1 (margin, Z beyond the buffer's range): clamp, do not clip */
     VkPipelineMultisampleStateCreateInfo ms = { VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
     ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
     VkPipelineDepthStencilStateCreateInfo dz = { VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
@@ -280,14 +318,20 @@ void hw_thread_init(void) {
     CHECK(vkCreateCommandPool(dev, &pci, 0, &pool));
     VkCommandBufferAllocateInfo cai = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, 0, pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1 };
     CHECK(vkAllocateCommandBuffers(dev, &cai, &cb));
+    cai.commandBufferCount = 2;
+    CHECK(vkAllocateCommandBuffers(dev, &cai, cb_spare));
     VkFenceCreateInfo fi = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
     CHECK(vkCreateFence(dev, &fi, 0, &fence));
+    CHECK(vkCreateFence(dev, &fi, 0, &fence_spare[0])); CHECK(vkCreateFence(dev, &fi, 0, &fence_spare[1]));
+    nspare = 2;
     VkDeviceMemory m;
     buf_create(&vbuf, &m, &vmap, VB_BYTES, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
     st_cap = is_game ? ST_BYTES : (1u << 20);
     buf_create(&sbuf, &m, &smap, st_cap, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
     rcap = 80u << 20;
     buf_create(&rbuf, &rmem, &rmap, rcap, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    roff = is_game ? (size_t)TICKETS * TICKET_BYTES : 0;
+    vlimit = VB_BYTES; slimit = st_cap;
     cur_rt = cur_ds = -1;
     qi = (!is_game && nqueues > 1) ? 1 : 0;
 }
@@ -319,7 +363,7 @@ int hw_start(int scale) {
         VkPhysicalDeviceFeatures2 f2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f13 };
         vkGetPhysicalDeviceFeatures2(pd[i], &f2);
         if (!f2.features.dualSrcBlend || !f13.dynamicRendering) continue;
-        if (want >= 0 ? (int)i == want : (best < 0 || p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU)) { best = (int)i; snprintf(devname, sizeof devname, "%s", p.deviceName); dev_discrete = p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU; }
+        if (want >= 0 ? (int)i == want : (best < 0 || p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU)) { best = (int)i; snprintf(devname, sizeof devname, "%s", p.deviceName); dev_discrete = p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU; have_depth_clamp = f2.features.depthClamp != 0; }
     }
     if (best < 0) return 0;
     phys = pd[best];
@@ -335,6 +379,8 @@ int hw_start(int scale) {
     e13.dynamicRendering = 1;
     VkPhysicalDeviceFeatures2 ef = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &e13 };
     ef.features.dualSrcBlend = 1;
+    ef.features.depthClamp = have_depth_clamp ? 1 : 0;
+    early_z = have_depth_clamp && !getenv("ROR_HW_NO_EARLYZ");
     VkDeviceCreateInfo di = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &ef };
     di.queueCreateInfoCount = 1; di.pQueueCreateInfos = &qi;
     static const char *dev_ext[4] = { "VK_KHR_swapchain" };
@@ -404,6 +450,7 @@ int hw_start(int scale) {
     VkPipelineLayoutCreateInfo pli = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, 0, 0, 2, two, 1, &pr };
     CHECK(vkCreatePipelineLayout(dev, &pli, 0, &playout));
     sm_vert = shader(spv_gs_vert, sizeof spv_gs_vert); sm_frag = shader(spv_gs_frag, sizeof spv_gs_frag);
+    sm_frag_ez = shader(spv_gs_frag_ez, sizeof spv_gs_frag_ez);
     sm_bvert = shader(spv_blit_vert, sizeof spv_blit_vert); sm_bfrag = shader(spv_blit_frag, sizeof spv_blit_frag);
     sm_pfrag = shader(spv_present_frag, sizeof spv_present_frag);
     if (fsr_want) { sm_mvvert = shader(spv_mv_vert, sizeof spv_mv_vert); sm_mvfrag = shader(spv_mv_frag, sizeof spv_mv_frag); sm_ffrag = shader(spv_fsr3_frag, sizeof spv_fsr3_frag); }
@@ -415,9 +462,52 @@ int hw_start(int scale) {
 }
 
 static void emit_batch(void);
-static void submit_cb(VkSemaphore wait, VkSemaphore signal) {
+static void wait_fence(VkFence f) {
+    struct timespec a, b; clock_gettime(CLOCK_MONOTONIC, &a);
+    CHECK(vkWaitForFences(dev, 1, &f, 1, ~0ull));
+    clock_gettime(CLOCK_MONOTONIC, &b);
+    if (is_game) hw_stat_wait_ns += (uint64_t)((b.tv_sec - a.tv_sec) * 1000000000ll + (b.tv_nsec - a.tv_nsec));
+}
+/* Textures given up: destroy the ones no submission and no retained draw list can still use. */
+static void reap_textures(void) {
+    int n = 0;
+    for (int i = 0; i < ntex_dead; i++) {
+        if ((keep_gen && keep_gen - tex_dead_gen[i] < 5) || tex_dead_serial[i] > done_serial) {
+            tex_dead[n] = tex_dead[i]; tex_dead_gen[n] = tex_dead_gen[i]; tex_dead_serial[n++] = tex_dead_serial[i]; continue;
+        }
+        img_destroy(&texs[tex_dead[i]]); tex_used[tex_dead[i]] = 0;
+    }
+    ntex_dead = n;
+}
+/* The oldest command buffer in flight is done (the caller has waited, or seen its fence signalled). */
+static void retire_oldest(void) {
+    if (is_game) { pthread_mutex_lock(&sh_mx); sh_done = flights[0].serial; sh_fl[0] = sh_fl[1]; if (sh_n) sh_n--; }
+    CHECK(vkResetFences(dev, 1, &flights[0].fence));
+    if (is_game) pthread_mutex_unlock(&sh_mx);
+    CHECK(vkResetCommandBuffer(flights[0].cb, 0));
+    cb_spare[nspare] = flights[0].cb; fence_spare[nspare++] = flights[0].fence;
+    done_serial = flights[0].serial;
+    flights[0] = flights[1]; nflights--;
+    if (is_game) reap_textures();
+}
+static void wait_oldest(void) { wait_fence(flights[0].fence); retire_oldest(); }
+static void wait_inflight(void) { while (nflights) wait_oldest(); }
+/* Where the next recording's data goes in a buffer of cap bytes: behind the newest region in flight ([a, b) of
+ * each is given, n of them), or from the start when little is left there; up to the next region in flight. */
+static void new_region(size_t *base, size_t *off, size_t *limit, size_t cap, const size_t *a, const size_t *b, int n) {
+    size_t at = n ? b[n - 1] : 0, end = cap;
+    if (cap - at < cap / 8) at = 0;
+    for (int i = 0; i < n; i++) {
+        if (a[i] == b[i]) continue;
+        if (at >= a[i] && at < b[i]) { end = at; break; }         /* no room: the first use will flush and wait */
+        if (a[i] >= at && a[i] < end) end = a[i];
+    }
+    *base = *off = at; *limit = end;
+}
+/* Submit what has been recorded. async: do not wait for it (see "Not waiting for the GPU"). */
+static void submit_cb(VkSemaphore wait, VkSemaphore signal, int async) {
     emit_batch();
-    if (!recording) return;
+    if (!recording) { if (!async) wait_inflight(); return; }
     end_rendering();
     CHECK(vkEndCommandBuffer(cb));
     VkPipelineStageFlags ws = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
@@ -426,28 +516,56 @@ static void submit_cb(VkSemaphore wait, VkSemaphore signal) {
     VkResult sr = vkQueueSubmit(queues[qi], 1, &si, fence);
     pthread_mutex_unlock(&qm[qi]);
     CHECK(sr);
-    {   struct timespec a, b; clock_gettime(CLOCK_MONOTONIC, &a);
-        CHECK(vkWaitForFences(dev, 1, &fence, 1, ~0ull));
-        clock_gettime(CLOCK_MONOTONIC, &b);
-        if (is_game) hw_stat_wait_ns += (uint64_t)((b.tv_sec - a.tv_sec) * 1000000000ll + (b.tv_nsec - a.tv_nsec));
-    }
-    CHECK(vkResetFences(dev, 1, &fence));
-    CHECK(vkResetCommandBuffer(cb, 0));
-    recording = 0; voff = soff = 0; cur_rt = cur_ds = -1;
-    if (is_game) {           /* textures given up: destroy once no retained draw list can still use them */
-        int n = 0;
-        for (int i = 0; i < ntex_dead; i++) {
-            if (keep_gen && keep_gen - tex_dead_gen[i] < 5) { tex_dead[n] = tex_dead[i]; tex_dead_gen[n++] = tex_dead_gen[i]; continue; }
-            img_destroy(&texs[tex_dead[i]]); tex_used[tex_dead[i]] = 0;
-        }
-        ntex_dead = n;
+    recording = 0; cur_rt = cur_ds = -1;
+    if (async) {
+        /* this buffer stays with the GPU; go on in another one, clear of the memory the ones in flight use */
+        if (nflights == 2) wait_oldest();
+        flights[nflights++] = (Flight){ cb, fence, rec_serial, vbase, voff, sbase, soff };
+        if (is_game) { pthread_mutex_lock(&sh_mx); sh_fl[sh_n].fence = fence; sh_fl[sh_n++].serial = rec_serial; pthread_mutex_unlock(&sh_mx); }
+        cb = cb_spare[--nspare]; fence = fence_spare[nspare];
+        size_t a[2], b[2];
+        for (int i = 0; i < nflights; i++) { a[i] = flights[i].va; b[i] = flights[i].vb; }
+        new_region(&vbase, &voff, &vlimit, VB_BYTES, a, b, nflights);
+        for (int i = 0; i < nflights; i++) { a[i] = flights[i].sa; b[i] = flights[i].sb; }
+        new_region(&sbase, &soff, &slimit, st_cap, a, b, nflights);
+        rec_serial++;
+    } else {
+        wait_inflight();
+        wait_fence(fence);
+        CHECK(vkResetFences(dev, 1, &fence));
+        CHECK(vkResetCommandBuffer(cb, 0));
+        done_serial = rec_serial++;
+        if (is_game) { pthread_mutex_lock(&sh_mx); sh_done = done_serial; pthread_mutex_unlock(&sh_mx); }
+        voff = soff = vbase = sbase = 0; vlimit = VB_BYTES; slimit = st_cap;
+        if (is_game) reap_textures();        /* textures given up: destroy once no retained draw list can still use them */
     }
     hw_stat_flushes++;
 }
 int hw_flush_sites[16], hw_flush_counts[16];
 void hw_flush_at(int site) {
     if (is_game && recording) for (int i = 0; i < 16; i++) if (hw_flush_sites[i] == site || !hw_flush_sites[i]) { hw_flush_sites[i] = site; hw_flush_counts[i]++; break; }
-    submit_cb(VK_NULL_HANDLE, VK_NULL_HANDLE);
+    submit_cb(VK_NULL_HANDLE, VK_NULL_HANDLE, 0);
+}
+/* The end of a frame nobody reads back: submit, and wait only for the frame before it. */
+void hw_flush_async(void) { submit_cb(VK_NULL_HANDLE, VK_NULL_HANDLE, async_on && is_game); }
+void hw_set_async(int on) {
+    static int never = -1;
+    if (never < 0) never = getenv("ROR_HW_SYNC") != 0;       /* ROR_HW_SYNC=1 (testing): wait for every submit, as before */
+    async_on = on && !never;
+}
+int hw_async(void) { return async_on; }
+/* Take note of the frames submitted without waiting that the GPU has finished by now (their queued reads are then ready). */
+void hw_poll(void) { while (nflights && vkGetFenceStatus(dev, flights[0].fence) == VK_SUCCESS) retire_oldest(); }
+/* Wait for the frames submitted without waiting; what is being recorded stays as it is. */
+void hw_wait_submitted(void) { wait_inflight(); }
+uint64_t hw_submitted_serial(void) { return rec_serial - 1; }
+int hw_serial_done(uint64_t serial) {
+    int done;
+    pthread_mutex_lock(&sh_mx);
+    done = serial <= sh_done;
+    for (int i = 0; i < sh_n && !done; i++) if (sh_fl[i].serial >= serial && vkGetFenceStatus(dev, sh_fl[i].fence) == VK_SUCCESS) done = 1;     /* the queue runs them in order */
+    pthread_mutex_unlock(&sh_mx);
+    return done;
 }
 
 /* ---- presentation ------------------------------------------------------------- */
@@ -512,11 +630,12 @@ int hw_swap_attach(void *a, void *b, int vsync) {
     if (!ok) return 0;
     sw_vsync = vsync;
     VkSemaphoreCreateInfo sci = { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
-    CHECK(vkCreateSemaphore(dev, &sci, 0, &sem_acq)); CHECK(vkCreateSemaphore(dev, &sci, 0, &sem_done));
+    for (int i = 0; i < SW_SEMS; i++) { CHECK(vkCreateSemaphore(dev, &sci, 0, &sem_acq_[i])); CHECK(vkCreateSemaphore(dev, &sci, 0, &sem_done_[i])); }
     return swap_create(640, 480);
 }
+static uint64_t lut_gen;                 /* goes up with every change of the colour table (present_draw: is a kept result still right?) */
 void hw_set_lut(const uint8_t *lut) {
-    lut_on = lut != 0;
+    lut_on = lut != 0; lut_gen++;
     if (!lut) return;
     uint32_t px[256];
     for (int i = 0; i < 256; i++) px[i] = lut[i] * 0x010101u | 0xFF000000u;
@@ -854,6 +973,17 @@ static void present_draw(Rt *r, VkImageView view, int tw, int th, int fmtsel, in
         return;
     }
     float full[4] = { 0, 0, (float)dw, (float)dh };
+    /* The game draws a new picture every second vblank at most. When the target has not been drawn to since this
+     * thread last scaled it (Rt.ver) and nothing about the scaling has changed, the stages still hold the result:
+     * only the last pass, onto the new swapchain image, is needed. */
+    static TL struct { Rt *r; uint64_t ver, lut; int sx, sy, sw, sh, dw, dh, filter, sat64, bloom, lut_on, valid; float rcas; } done;
+    if (!up && done.valid && done.r == r && done.ver == r->ver && done.lut == lut_gen && done.sx == sx && done.sy == sy && done.sw == sw && done.sh == sh &&
+        done.dw == dw && done.dh == dh && done.filter == filter && done.sat64 == sat64 && done.bloom == pr_bloom && done.lut_on == lut_on && done.rcas == pr_rcas &&
+        st_a.img && st_b.img && st_b.w == dw && st_b.h == dh && (!bloom || gl_a.img)) {
+        ppass(view, tw, th, fmtsel, 1, dx, dy, dw, dh, st_b.set, bloom ? gl_a.set_lin : VK_NULL_HANDLE, full, dst, 0, bloom, 64, 3, 0.0f);
+        return;
+    }
+    done.valid = 0;
     stage_img(&st_a, dw, dh, 1); stage_img(&st_b, dw, dh, 0);
     int mode = filter == 2 ? (sw * N < dw ? 2 : sw * N > dw ? 3 : 0) : filter;
     if (up) {                       /* stage B <- the upscaled picture: colour controls only */
@@ -882,6 +1012,10 @@ static void present_draw(Rt *r, VkImageView view, int tw, int th, int fmtsel, in
         to_layout(&gl_a, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     }
     ppass(view, tw, th, fmtsel, 1, dx, dy, dw, dh, st_b.set, bloom ? gl_a.set_lin : VK_NULL_HANDLE, full, dst, 0, bloom, 64, 3, 0.0f);
+    if (!up) {
+        done.r = r; done.ver = r->ver; done.lut = lut_gen; done.sx = sx; done.sy = sy; done.sw = sw; done.sh = sh; done.dw = dw; done.dh = dh;
+        done.filter = filter; done.sat64 = sat64; done.bloom = pr_bloom; done.lut_on = lut_on; done.rcas = pr_rcas; done.valid = 1;
+    }
 }
 const uint32_t *hw_present_pixels(int rt, int sx, int sy, int sw, int sh, int dx, int dy, int dw, int dh, int ww, int wh, int linear, int sat64) {
     static TL Img off;
@@ -911,6 +1045,7 @@ void hw_present(int rt, int sx, int sy, int sw, int sh, int dx, int dy, int dw, 
     }
     if (!swp) return;
     uint32_t idx = 0;
+    VkSemaphore sem_acq = sem_acq_[sem_k % SW_SEMS], sem_done = sem_done_[sem_k % SW_SEMS];
     VkResult ar = vkAcquireNextImageKHR(dev, swp, ~0ull, sem_acq, VK_NULL_HANDLE, &idx);
     if (ar == VK_ERROR_OUT_OF_DATE_KHR) {
         hw_flush();
@@ -933,13 +1068,14 @@ void hw_present(int rt, int sx, int sy, int sw, int sh, int dx, int dy, int dw, 
         grab_at = roff; grab_w = (int)swext.width; grab_h = (int)swext.height; grabbed = 1;
     } else sw_barrier(swimg[idx], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
     grab_want = grabbed ? 2 : 0;
-    submit_cb(sem_acq, sem_done);
+    sem_k++;
+    submit_cb(sem_acq, sem_done, async_on && is_game && !grabbed);
     VkPresentInfoKHR pi = { VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, 0, 1, &sem_done, 1, &swp, &idx, 0 };
     pthread_mutex_lock(&qm[qi]);
     vkQueuePresentKHR(queues[qi], &pi);
     pthread_mutex_unlock(&qm[qi]);
 }
-static void need_staging(size_t bytes) { if (soff + bytes > st_cap) hw_flush(); if (bytes > st_cap) die("staging too small", 0); }
+static void need_staging(size_t bytes) { if (soff + bytes > slimit) hw_flush(); if (bytes > st_cap) die("staging too small", 0); }
 
 int hw_rt_create(int w, int h) {
     if (nrt == MAX_RT) die("too many render targets", 0);
@@ -1054,11 +1190,11 @@ void hw_rt_upload(int rt, int x, int y, int w, int h, const uint32_t *rgba) {
     rendering = 0; cur_rt = -1;
     r->ver++;
 }
-static size_t queue_native_read(int rt, int x, int y, int w, int h) {       /* returns offset in the read-back buffer */
+static void queue_native_read(int rt, int x, int y, int w, int h, size_t at) {       /* at: offset in the read-back buffer */
     Rt *r = &rts[rt];
     emit_batch(); end_rendering(); begin_cb();
     size_t bytes = (size_t)w * (size_t)h * 4;
-    if (roff + bytes > rcap) die("read-back buffer full", 0);
+    if (at + bytes > rcap) die("read-back buffer full", 0);
     to_layout(&r->col, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     Img *src = &r->col; int sx = x, sy = y;
     if (N > 1) {            /* reduce to native size first: the sample of each block is its first sub-pixel (the GS sample point) */
@@ -1073,28 +1209,30 @@ static size_t queue_native_read(int rt, int x, int y, int w, int h) {       /* r
         to_layout(&r->up, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         src = &r->up;
     }
-    VkBufferImageCopy bc = { roff, 0, 0, { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, { sx, sy, 0 }, { (uint32_t)w, (uint32_t)h, 1 } };
+    VkBufferImageCopy bc = { at, 0, 0, { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, { sx, sy, 0 }, { (uint32_t)w, (uint32_t)h, 1 } };
     vkCmdCopyImageToBuffer(cb, src->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rbuf, 1, &bc);
-    size_t at = roff; roff += (bytes + 15) & ~(size_t)15;
-    return at;
 }
 void hw_rt_download(int rt, int x, int y, int w, int h, uint32_t *rgba) {
-    size_t save = roff;
-    size_t at = queue_native_read(rt, x, y, w, h);
+    queue_native_read(rt, x, y, w, h, roff);
     hw_flush();
-    memcpy(rgba, rmap + at, (size_t)w * (size_t)h * 4);
-    roff = save;
+    memcpy(rgba, rmap + roff, (size_t)w * (size_t)h * 4);
 }
 int hw_rt_copy_async(int rt, int x, int y, int w, int h) {
-    if (ntickets == 256) return -1;
-    tickets[ntickets].off = queue_native_read(rt, x, y, w, h); tickets[ntickets].w = w; tickets[ntickets].h = h;
-    return ntickets++;
+    if ((size_t)w * (size_t)h * 4 > TICKET_BYTES) return -1;
+    int t = -1;
+    for (int i = 0; i < TICKETS && t < 0; i++) if (!tickets[(ticket_next + i) % TICKETS].used) t = (ticket_next + i) % TICKETS;
+    if (t < 0) return -1;
+    ticket_next = (t + 1) % TICKETS;
+    queue_native_read(rt, x, y, w, h, (size_t)t * TICKET_BYTES);
+    tickets[t].used = 1; tickets[t].w = w; tickets[t].h = h; tickets[t].serial = rec_serial;
+    return t;
 }
+int hw_ticket_ready(int ticket) { return tickets[ticket].serial <= done_serial; }
 void hw_ticket_read(int ticket, uint32_t *rgba) {
-    memcpy(rgba, rmap + tickets[ticket].off, (size_t)tickets[ticket].w * (size_t)tickets[ticket].h * 4);
-    if (ticket == ntickets - 1) {           /* last one handed out has been collected: recycle the buffer */
-        ntickets = 0; roff = 0;
-    }
+    if (tickets[ticket].serial >= rec_serial) hw_flush();          /* still being recorded */
+    else while (tickets[ticket].serial > done_serial && nflights) wait_oldest();
+    memcpy(rgba, rmap + (size_t)ticket * TICKET_BYTES, (size_t)tickets[ticket].w * (size_t)tickets[ticket].h * 4);
+    tickets[ticket].used = 0;
 }
 const uint32_t *hw_rt_read_scaled(int rt, int x, int y, int w, int h) {
     Rt *r = &rts[rt];
@@ -1251,7 +1389,7 @@ int hw_tex_create(int w, int h, const uint32_t *rgba) {
     to_layout(&texs[id], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     return id;
 }
-void hw_tex_destroy(int tex) { if (tex >= 0 && tex_used[tex] == 1) { tex_used[tex] = 2; tex_dead_gen[ntex_dead] = keep_gen; tex_dead[ntex_dead++] = tex; } }
+void hw_tex_destroy(int tex) { if (tex >= 0 && tex_used[tex] == 1) { tex_used[tex] = 2; tex_dead_gen[ntex_dead] = keep_gen; tex_dead_serial[ntex_dead] = rec_serial; tex_dead[ntex_dead++] = tex; } }
 void hw_keep_generation(void) { keep_gen++; }
 
 /* ---- drawing ---------------------------------------------------------------- */
@@ -1270,7 +1408,12 @@ static void draw_range(const HwState *s, size_t first, int count, int passmode, 
     Rt *r = &rts[s->rt];
     begin_rendering(s->rt, s->ds);
     const int N = r->n;                           /* the target's own scale (shadows the renderer's) */
-    uint32_t key = (uint32_t)s->blend_mode | ((uint32_t)s->blend_const << 2) | ((uint32_t)cmask << 3) | ((uint32_t)s->ztest << 7) | ((uint32_t)zwrite << 9) | (r->mv ? 1u << 15 : 0u);
+    /* Early depth test: with a depth test that can fail (GEQUAL, GREATER) and a 16- or 24-bit depth buffer, the
+     * rasterizer gets z plus a margin (1 step of a 16-bit depth, 8 of a 24-bit one: more than its interpolation
+     * can be off by) and the fragment shader declares that it only lowers it. Not for 32-bit depth, whose steps
+     * a float cannot hold. */
+    float zmargin = early_z && !r->mv && s->ds >= 0 && s->ztest >= 2 ? (s->zscale == 1.0f / 65536.0f ? 1.0f : s->zscale == 1.0f / 16777216.0f ? 8.0f : 0.0f) : 0.0f;
+    uint32_t key = (uint32_t)s->blend_mode | ((uint32_t)s->blend_const << 2) | ((uint32_t)cmask << 3) | ((uint32_t)s->ztest << 7) | ((uint32_t)zwrite << 9) | (r->mv ? 1u << 15 : 0u) | (zmargin > 0.0f ? 1u << 17 : 0u);
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline(key));
     VkDescriptorSet sets[2] = { tex ? tex->set : dummy.set, dst ? dst->set : dummy.set };
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, playout, 0, 2, sets, 0, 0);
@@ -1291,7 +1434,7 @@ static void draw_range(const HwState *s, size_t first, int count, int passmode, 
     memcpy(pc.region, s->region, sizeof pc.region);
     pc.tex[0] = s->texw; pc.tex[1] = s->texh; pc.tex[2] = s->tex_kind == 2 ? (float)rts[s->tex].n : 1.0f;
     pc.zp[0] = s->zscale; pc.zp[1] = s->zmax; pc.zp[2] = s->ta0;
-    if (r->mv) { pc.zp[3] = mv_zfar; pc.tex[3] = mv_zinv; }
+    if (r->mv) { pc.zp[3] = mv_zfar; pc.tex[3] = mv_zinv; } else pc.zp[3] = zmargin;
     pc.fbmsk = s->fbmsk;
     vkCmdPushConstants(cb, playout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, &pc);
     vkCmdDraw(cb, (uint32_t)count, 1, (uint32_t)(first / sizeof(HwVertex)), 0);
@@ -1356,7 +1499,7 @@ static void emit_batch(void) {
 void hw_draw(const HwState *s, const HwVertex *v, int n) {
     size_t bytes = (size_t)n * sizeof(HwVertex);
     if (bcount && memcmp(s, &bstate, sizeof *s) != 0) emit_batch();
-    if (voff + bytes > VB_BYTES) hw_flush();
+    if (voff + bytes > vlimit) hw_flush();
     if (!bcount) { bstate = *s; bfirst = voff; }
     memcpy(vmap + voff, v, bytes);
     voff += bytes; bcount += n;

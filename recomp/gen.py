@@ -132,6 +132,24 @@ class Emitter:
             return f'rt_invalid(c, 0x{a:x}u);'
         return self.stmt(i)
 
+    def spin_loop(self, t, src):
+        """A backward branch at src to t that closes a loop which only reads the
+        COP0 Status register and computes on registers (the game's idle thread
+        waits like this): nothing in it changes until the cycle counter runs out,
+        so the iterations up to that point can be taken in one step."""
+        seen_mfc0 = False
+        for a in range(t, src + 8, 4):
+            i = self.p.code.get(a)
+            if i is None or i.mn is None:
+                return False
+            if a == src:
+                continue                    # the branch itself
+            if i.mn == 'mfc0' and i.rd == 12:
+                seen_mfc0 = True
+            elif i.mn not in ('sync', 'nop', 'and', 'andi', 'or', 'ori'):
+                return False
+        return seen_mfc0
+
     def function(self, entry):
         p = self.p
         nodes = p.walk(entry)
@@ -142,6 +160,8 @@ class Emitter:
 
         def goto(src, t):
             tick = f'TICK({(src - t) // 4 + 2}); ' if t <= src else ''
+            if t <= src and self.spin_loop(t, src):
+                tick = f'TICK_SPIN({(src - t) // 4 + 2}); '
             if t in nodes:
                 labels.add(t)
                 return f'{tick}goto L_{t:08x};'

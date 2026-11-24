@@ -138,6 +138,11 @@ void vu0_callms(Ctx *c, u32 addr);
 #define SX32(v) ((u64)(s64)(s32)(v))
 
 #define TICK(n) do { if (UNLIKELY((c->cycles -= (n)) < 0)) rt_tick(c); } while (0)
+/* The branch back in a loop that only polls the COP0 Status register (gen.py, spin_loop; the game's idle thread):
+ * every iteration costs n cycles and changes nothing until the counter runs out, so all the iterations before the
+ * one in which it does are taken at once. The counter and everything else are then exactly what running them one
+ * by one gives. */
+#define TICK_SPIN(n) do { if (c->cycles >= (n)) c->cycles %= (n); TICK(n); } while (0)
 
 /* ---- unaligned loads/stores (little-endian) ------------------------------ */
 static inline void op_lwl(Ctx *c, int rt, u32 a) {

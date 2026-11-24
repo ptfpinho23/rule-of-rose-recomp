@@ -13,6 +13,9 @@ for s in gs.vert gs.frag blit.vert blit.frag present.frag; do
   "$G" -V --quiet --vn $n -o "$T/$n.h" "$R/recomp/rt/hw/$s"
   grep -v '^\s*//' "$T/$n.h" | sed "s/^const uint32_t/static const uint32_t/" >> "$H"
 done
+# gs.frag with the early depth test (pipelines whose depth format lets the rasterizer's depth bound the written one)
+"$G" -V --quiet -DEARLY_Z --vn spv_gs_frag_ez -o "$T/ez.h" "$R/recomp/rt/hw/gs.frag"
+grep -v '^\s*//' "$T/ez.h" | sed "s/^const uint32_t/static const uint32_t/" >> "$H"
 # FSR 3.1 (--filter fsr3): the motion-vector variants of the GS shaders and the passes around the upscaler
 "$G" -V --quiet -DMV_PASS --vn spv_mv_vert -o "$T/mvv.h" "$R/recomp/rt/hw/gs.vert"
 "$G" -V --quiet -DMV_PASS --vn spv_mv_frag -o "$T/mvf.h" "$R/recomp/rt/hw/gs.frag"
