@@ -21,6 +21,7 @@
 #include <QScreen>
 #include <QSettings>
 #include <QStandardPaths>
+#include <QThread>
 #include <QTimer>
 #include <QUrl>
 #include <QWindow>
@@ -222,14 +223,10 @@ QString shapeName(const QSize &z)
 }
 
 // The renderer a fresh install starts with, and how the GPU choice is named.
-// (Windows machines nearly always have a Vulkan GPU driver; a Linux system
-// without one falls back to a slow CPU implementation of Vulkan. Without
-// Vulkan the game uses its software renderer by itself.)
-#ifdef Q_OS_WIN
-const char *const kDefaultRenderer = "gpu";
-#else
-const char *const kDefaultRenderer = "software";
-#endif
+// What main() found out about the graphics hardware (see gpuprobe.h).
+GpuInfo g_gpu;
+int g_threads = 0;
+
 const char *const kGpuLabel = "GPU (Vulkan)";
 
 } // namespace
@@ -342,7 +339,14 @@ QWidget *MainWindow::buildOptions()
     // selects it; choosing Software puts the frame rate back to Original.
     // Nothing here is ever greyed out because of the other tab, and no
     // contradictory combination is saved.
-    bool gpuSaved = s.value("video/renderer", kDefaultRenderer).toString() == "gpu";
+    // Fresh-install defaults, from what this machine has (a saved choice
+    // always wins): a graphics card gets the GPU renderer - at 4x for a
+    // separate card, 2x for graphics built into the processor - and anything
+    // else the software renderer.
+    const bool realGpu = g_gpu.kind == GpuInfo::Discrete || g_gpu.kind == GpuInfo::Integrated;
+    const QString rendererDefault = realGpu ? "gpu" : "software";
+    const int internalDefault = g_gpu.kind == GpuInfo::Integrated ? 2 : 4;
+    bool gpuSaved = s.value("video/renderer", rendererDefault).toString() == "gpu";
     QString fpsSaved = s.value("video/fps", "0").toString();
     if (!gpuSaved && fpsSaved != "0") {
         fpsSaved = "0";
@@ -365,12 +369,15 @@ QWidget *MainWindow::buildOptions()
     });
     connect(m_fps, &Dropdown::changed, this, [this](int) {
         QSettings().setValue("video/fps", m_fps->currentValue());
-        if (m_fps->currentValue() != "0")
+        if (m_fps->currentValue() != "0") {
             m_renderer->setCurrent(1);
+            QSettings().setValue("video/renderer", "gpu");   // now the player's own choice, not a default
+        }
     });
     connect(m_vsync, &QAbstractButton::toggled, this, [this](bool on) {
         QSettings().setValue("video/vsync", on);
         m_renderer->setCurrent(1);
+        QSettings().setValue("video/renderer", "gpu");   // now the player's own choice, not a default
     });
 
     // --- Quality ------------------------------------------------------------
@@ -381,10 +388,11 @@ QWidget *MainWindow::buildOptions()
     m_internalLabel = row(q, 1, "Internal resolution", m_internal);
     row(q, 2, "Upscaling", m_filter);
     m_sharp = sliderRow(q, 3, "Sharpness", "video/sharpness", 0, 100, 60, Plain, &m_sharpLabel);
-    m_qualityNote = helper(q, 4 * rowH + 10, {});
-    m_fsrNote = helper(q, 4 * rowH + 32, {});
-    m_fsrNote2 = helper(q, 4 * rowH + 54, {});
-    helper(q, 4 * rowH + 76, "Internal resolution sizes are for the game's 512 × 448 picture.");
+    m_gpuLine = helper(q, 4 * rowH + 8, {});
+    m_qualityNote = helper(q, 4 * rowH + 30, {});
+    m_fsrNote = helper(q, 4 * rowH + 52, {});
+    m_fsrNote2 = helper(q, 4 * rowH + 74, {});
+    helper(q, 4 * rowH + 96, "Internal resolution sizes are for the game's 512 × 448 picture.");
     {
         // The GPU renderer draws the PS2 picture (512 x 448 in this game) N times larger.
         QList<Dropdown::Item> items;
@@ -396,7 +404,7 @@ QWidget *MainWindow::buildOptions()
         m_internal->setItems(items);
         m_internal->setDisabledText("GPU renderer only");
         m_internal->setCurrentValue("4");
-        m_internal->setCurrentValue(s.value("video/internal", 4).toString());
+        m_internal->setCurrentValue(s.value("video/internal", internalDefault).toString());
         connect(m_internal, &Dropdown::changed, this, [this](int) {
             QSettings().setValue("video/internal", m_internal->currentValue().toInt());
             updateOptionStates();
@@ -446,8 +454,10 @@ QWidget *MainWindow::buildOptions()
     m_res->setDisabledText(deskLabel);
     m_res->setCurrentValue("1280x960");
     m_res->setCurrentValue(saved);
-    connect(m_res, &Dropdown::changed, this,
-            [this](int) { QSettings().setValue("video/res", m_res->currentValue()); });
+    connect(m_res, &Dropdown::changed, this, [this](int) {
+        QSettings().setValue("video/res", m_res->currentValue());
+        updateOptionStates();
+    });
 
     m_mode->setCurrent(s.value("video/fullscreen", false).toBool() ? 1 : 0);
     m_stretch->setChecked(s.value("video/aspect", "4:3").toString() == "stretch");
@@ -456,10 +466,27 @@ QWidget *MainWindow::buildOptions()
     // FSR 3.1 belongs to the GPU renderer: choosing it selects GPU, choosing
     // Software goes back to FSR 1.0, and a saved Software + FSR 3.1 is put
     // right here. Where FSR 3.1 is not offered, a saved one shows as FSR 1.0.
+    // Default upscaling is FSR 1.0 - except with the software renderer where
+    // it would be too much for the processor: an output larger than
+    // 1920 x 1080, or fewer than 8 processor threads. Bilinear then.
+    const int threads = g_threads > 0 ? g_threads : QThread::idealThreadCount();
+    const QSize outNow = outputSize();
+    const bool heavyFsr = m_renderer->current() == 0 &&
+                          (qint64(outNow.width()) * outNow.height() > 1920 * 1080 || threads < 8);
+    const QString filterDefault = heavyFsr ? "bilinear" : "fsr";
     int filter = 2;
     for (int i = 0; i < kFilterCount; ++i)
-        if (s.value("video/filter", "fsr").toString() == kFilters[i])
+        if (s.value("video/filter", filterDefault).toString() == kFilters[i])
             filter = i;
+    m_defaultsLine = QString("renderer=%1 (%2), internal=%3 (%4), filter=%5 (%6); %7 processor threads, output %8x%9")
+                         .arg(m_renderer->current() ? "gpu" : "software",
+                              s.contains("video/renderer") ? "saved" : "default")
+                         .arg(m_internal->currentValue(), s.contains("video/internal") ? "saved" : "default")
+                         .arg(kFilters[filter], s.contains("video/filter") ? "saved" : "default")
+                         .arg(threads).arg(outNow.width()).arg(outNow.height());
+    note(QString("graphics: %1%2").arg(GpuInfo::kindName(g_gpu.kind),
+                                        g_gpu.name.isEmpty() ? QString() : " - " + g_gpu.name));
+    note("settings at start: " + m_defaultsLine);
     if (filter == 3 && m_renderer->current() == 0) {
         filter = 2;
         s.setValue("video/filter", kFilters[filter]);
@@ -475,8 +502,10 @@ QWidget *MainWindow::buildOptions()
             [](int i) { QSettings().setValue("video/wide", kWide[i]); });
     connect(m_filter, &Segmented::changed, this, [this](int i) {
         QSettings().setValue("video/filter", kFilters[i]);
-        if (i == 3)
+        if (i == 3) {
             m_renderer->setCurrent(1);
+            QSettings().setValue("video/renderer", "gpu");   // now the player's own choice, not a default
+        }
         updateOptionStates();
     });
 
@@ -568,14 +597,29 @@ void MainWindow::updateOptionStates()
                   : QString("Choosing a frame rate, or changing V-Sync, switches to the GPU renderer."));
     setElided(m_fsrNote, fsr3 ? QString("FSR 3.1 renders at a low internal resolution and reconstructs detail over time.")
                               : QString("FSR 1.0: sharper upscaling of the picture to the chosen resolution."));
+    // With the software renderer FSR 1.0 is worked out on the processor,
+    // which is a lot at a large output size.
+    const QSize out = outputSize();
+    const bool bigOut = qint64(out.width()) * out.height() > 1920 * 1080;
     setElided(m_fsrNote2,
-              !fsr3 ? QString()
-              : m_internal->currentValue().toInt() > 2
-                    ? QString("FSR 3.1 is meant for 1× or 2× internal resolution; above that, FSR 1.0 is sharper.")
-                    : QString("Best at 1× or 2× internal resolution. Windows and the GPU renderer only."));
+              fsr3 ? (m_internal->currentValue().toInt() > 2
+                          ? QString("FSR 3.1 is meant for 1× or 2× internal resolution; above that, FSR 1.0 is sharper.")
+                          : QString("Best at 1× or 2× internal resolution. Windows and the GPU renderer only."))
+              : !gpu && m_filter->current() == 2 && bigOut
+                    ? QString("With Software, FSR 1.0 is demanding at this picture size; Bilinear is lighter.")
+                    : QString());
+    const bool card = g_gpu.kind == GpuInfo::Discrete || g_gpu.kind == GpuInfo::Integrated;
+    setElided(m_gpuLine,
+              card ? "Graphics card: " + g_gpu.name
+              : g_gpu.kind == GpuInfo::Cpu
+                    ? QString("No graphics card driver for Vulkan found (only %1, which runs on the processor).").arg(g_gpu.name)
+                    : QString("No Vulkan graphics driver found - the game uses the software renderer."));
     setElided(m_qualityNote,
-              gpu ? QString("GPU needs Vulkan 1.3 (else the game uses Software). Above 50 Hz, frames are interpolated.")
-                  : QString("Software runs at the original 50 Hz; higher frame rates use the GPU renderer."));
+              !gpu ? QString("Software runs at the original 50 Hz; higher frame rates use the GPU renderer.")
+              : card ? QString("Above 50 Hz, the extra frames are interpolated.")
+              : g_gpu.kind == GpuInfo::Cpu
+                    ? QString("The GPU renderer will be slow here: it would run on the processor. Software is faster.")
+                    : QString("The GPU renderer needs a Vulkan 1.3 graphics driver; without one the game uses Software."));
 }
 
 // The game's command line for the current options. A switch is passed only
@@ -824,6 +868,20 @@ const char *const kBuilder = "ror-build";
 }
 
 void MainWindow::setGameDir(const QString &dir) { g_gameDir = dir; }
+
+void MainWindow::setGraphics(const GpuInfo &gpu, int threads)
+{
+    g_gpu = gpu;
+    g_threads = threads;
+}
+
+// Fullscreen, and the "Desktop" resolution, use the screen's own size.
+QSize MainWindow::outputSize() const
+{
+    const QString res = m_mode->current() == 1 ? QString("desktop") : m_res->currentValue();
+    const QStringList wh = (res == "desktop" ? m_desktopRes : res).split('x');
+    return QSize(wh.value(0).toInt(), wh.value(1).toInt());
+}
 
 QString MainWindow::gameDir()
 {
@@ -1180,6 +1238,9 @@ void MainWindow::play()
     if (m_gameState == NeedsBuild) {
         m_playAfterBuild = saidPlay;      // PLAY was pressed: go on to the game afterwards
         if (m_dryRun) {
+            printf("[dry-run] graphics: %s%s%s\n[dry-run] settings: %s\n", GpuInfo::kindName(g_gpu.kind),
+                   g_gpu.name.isEmpty() ? "" : " - ", g_gpu.name.toLocal8Bit().constData(),
+                   m_defaultsLine.toLocal8Bit().constData());
             printf("[dry-run] action: prepare the game first\n[dry-run] builder: %s\n",
                    builderPath().toLocal8Bit().constData());
             for (const QString &a : QStringList{"--iso", QDir::toNativeSeparators(m_disc.path),
@@ -1235,6 +1296,9 @@ void MainWindow::play()
 
     if (m_dryRun) {
         // --dry-run: say exactly what would be started, and stop there.
+        printf("[dry-run] graphics: %s%s%s\n[dry-run] settings: %s\n", GpuInfo::kindName(g_gpu.kind),
+               g_gpu.name.isEmpty() ? "" : " - ", g_gpu.name.toLocal8Bit().constData(),
+               m_defaultsLine.toLocal8Bit().constData());
         printf("[dry-run] program: %s\n[dry-run] cwd: %s\n", game.toLocal8Bit().constData(),
                workDir.toLocal8Bit().constData());
         for (const QString &a : args)

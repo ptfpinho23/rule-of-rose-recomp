@@ -16,6 +16,9 @@
 //                                 with its result (0 ready, 1 failed/cancelled);
 //                                 --cancel-after MS cancels it; with --grab,
 //                                 the picture is taken --grab-after MS into it
+//   --fake-gpu none|cpu|integrated|discrete, --fake-threads N
+//                                 pretend this graphics hardware / processor
+//                                 was found (tests of the defaults)
 //   --dry-run                     PLAY prints the game command line and ROR_*
 //                                 environment on stdout instead of starting it
 //   --show PANEL                  with --grab: open a panel first: options,
@@ -30,7 +33,9 @@
 #include <QSettings>
 #include <QTimer>
 #include <cstdio>
+#include <cstring>
 
+#include "gpuprobe.h"
 #include "mainwindow.h"
 #include "style.h"
 
@@ -56,6 +61,12 @@ static void preloadXcbRuntime()
 
 int main(int argc, char **argv)
 {
+    // "--probe-gpu": this process is the helper that asks the Vulkan driver
+    // what is there (gpuprobe.cpp). Nothing else is started for it.
+    for (int i = 1; i < argc; ++i)
+        if (!strcmp(argv[i], "--probe-gpu"))
+            return gpuProbeChildMain();
+
 #ifdef Q_OS_LINUX
     // Only the xcb (X11) platform plugin is shipped; it also works under
     // XWayland. An explicit QT_QPA_PLATFORM still wins.
@@ -88,6 +99,8 @@ int main(int argc, char **argv)
     QString iso, grabPath, showPanel;
     bool autoplay = false, exitWithGame = false, hover = false, dryRun = false;
     QStringList sets, extra;
+    QString fakeGpu;
+    int fakeThreads = 0;
     bool prepare = false;
     int cancelAfter = 0, grabAfter = 0;
     const QStringList args = QCoreApplication::arguments();
@@ -103,6 +116,10 @@ int main(int argc, char **argv)
             hover = true;
         else if (a == "--dry-run")
             dryRun = true;
+        else if (a == "--fake-gpu" && i + 1 < args.size())
+            fakeGpu = args[++i];
+        else if (a == "--fake-threads" && i + 1 < args.size())
+            fakeThreads = args[++i].toInt();
         else if (a == "--set" && i + 1 < args.size())
             sets << args[++i];
         else if (a == "--prepare")
@@ -142,6 +159,30 @@ int main(int argc, char **argv)
             return QProcess::execute(QCoreApplication::applicationFilePath(), args.mid(1));
         }
     }
+
+    // Which graphics hardware is there? A helper process asks the Vulkan
+    // driver, so that a driver which crashes or hangs cannot take the
+    // launcher with it; it normally answers in a fraction of a second and is
+    // given 2.5 s. The answer only chooses the defaults of a fresh install.
+    GpuInfo gpu;
+    if (!fakeGpu.isEmpty()) {
+        GpuInfo::parseKind(fakeGpu, &gpu.kind);
+        if (gpu.kind != GpuInfo::None)
+            gpu.name = "Test device";
+    } else {
+        QProcess probe;
+        probe.setProgram(QCoreApplication::applicationFilePath());
+        probe.setArguments({"--probe-gpu"});
+        probe.setStandardErrorFile(QProcess::nullDevice());
+        probe.start();
+        if (probe.waitForFinished(2500) && probe.exitStatus() == QProcess::NormalExit)
+            gpu = parseGpuProbeOutput(probe.readAllStandardOutput());
+        else if (probe.state() != QProcess::NotRunning) {
+            probe.kill();
+            probe.waitForFinished(1000);
+        }
+    }
+    MainWindow::setGraphics(gpu, fakeThreads);
 
     MainWindow w(iso);
     if (const QScreen *scr = QGuiApplication::primaryScreen()) {     // centred, fully on screen

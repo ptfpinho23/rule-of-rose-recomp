@@ -5,6 +5,7 @@
 #include <QWidget>
 
 #include "discinfo.h"
+#include "gpuprobe.h"
 
 class Dropdown;
 class GlyphButton;
@@ -35,6 +36,11 @@ public:
 
     // Where a game built on this PC lives (see the "prepare" step in the
     // .cpp). Default: <per-user application data>/game.
+    // The graphics hardware found at start (main() sets it before the window
+    // is made), and the number of processor threads to assume (0 = ask the
+    // system; a test override otherwise).
+    static void setGraphics(const GpuInfo &gpu, int threads = 0);
+
     static void setGameDir(const QString &dir);
     static QString gameDir();
 
@@ -154,7 +160,9 @@ private:
     Slider *m_deadzone = nullptr;
     QLabel *m_deadzoneLabel = nullptr;
     QLabel *m_displayNote = nullptr;
-    QLabel *m_fsrNote = nullptr, *m_fsrNote2 = nullptr;
+    QLabel *m_fsrNote = nullptr, *m_fsrNote2 = nullptr, *m_gpuLine = nullptr;
+    QString m_defaultsLine;          // what the fresh-install defaults came out as (log, --dry-run)
+    QSize outputSize() const;        // the size the picture is upscaled to with the current choices
     Slider *m_grain = nullptr;
     QLabel *m_fpsLabel = nullptr, *m_vsyncLabel = nullptr, *m_internalLabel = nullptr,
            *m_qualityNote = nullptr;

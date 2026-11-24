@@ -21,6 +21,7 @@ qt_add_executable(ror_launcher
   mainwindow.cpp mainwindow.h
   style.cpp style.h
   discinfo.cpp discinfo.h
+  gpuprobe.cpp gpuprobe.h
   widgets.cpp widgets.h
   resources.qrc
 )
