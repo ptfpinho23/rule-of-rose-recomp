@@ -161,7 +161,13 @@ private:
     QLabel *m_deadzoneLabel = nullptr;
     QLabel *m_displayNote = nullptr;
     QLabel *m_fsrNote = nullptr, *m_fsrNote2 = nullptr, *m_gpuLine = nullptr;
-    QString m_defaultsLine;          // what the fresh-install defaults came out as (log, --dry-run)
+    QLabel *m_texLabel = nullptr;
+    Toggle *m_texSmooth = nullptr;   // "Smooth distant textures"
+    // Settings the player has not chosen follow the renderer and the
+    // internal resolution (see applyFollowingDefaults in the .cpp).
+    void applyFollowingDefaults();
+    int defaultFilterIndex() const;
+    QString settingsLine() const;    // for the log and --dry-run
     QSize outputSize() const;        // the size the picture is upscaled to with the current choices
     Slider *m_grain = nullptr;
     QLabel *m_fpsLabel = nullptr, *m_vsyncLabel = nullptr, *m_internalLabel = nullptr,

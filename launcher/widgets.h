@@ -78,6 +78,7 @@ class Toggle : public HoverButton {
     Q_OBJECT
 public:
     explicit Toggle(QWidget *parent = nullptr);
+    void showChecked(bool on);         // display only: no toggled(), no animation
     QSize sizeHint() const override { return {46, 24}; }
 
 protected:
@@ -94,7 +95,8 @@ class Segmented : public QWidget {
 public:
     explicit Segmented(const QStringList &items, QWidget *parent = nullptr);
     int current() const { return m_current; }
-    void setCurrent(int i);
+    void setCurrent(int i);            // as a click: emits changed()
+    void showCurrent(int i);           // display only (a default that follows other settings)
     QSize sizeHint() const override;
 
 signals:
@@ -125,11 +127,19 @@ public:
     Slider(int min, int max, int def, QWidget *parent = nullptr);
     int value() const { return m_value; }
     int defaultValue() const { return m_def; }
-    void setValue(int v);
+    void setValue(int v);              // as the player moving it: emits changed()
+    // Show a value without it counting as the player's choice (a default that
+    // follows other settings, or a saved value being loaded). It may lie
+    // above the current maximum: the handle then sits at the end and the
+    // value is kept until the player moves the slider.
+    void showValue(int v);
+    void setDefault(int v) { m_def = v; update(); }
+    void setMaximum(int v) { m_max = v; update(); }
     QSize sizeHint() const override { return {230, 26}; }
 
 signals:
-    void changed(int value);
+    void changed(int value);           // the player changed it
+    void shown(int value);             // the displayed value changed, for any reason
 
 protected:
     void paintEvent(QPaintEvent *) override;

@@ -169,15 +169,23 @@ In the launcher
              (original 50 Hz, match the display, or 60-240 by interpolating
              frames) and V-Sync. Frame rate and V-Sync belong to the GPU
              renderer: choosing one switches the renderer to GPU by itself.
-    Quality  Renderer: Software, or GPU (Vulkan 1.3). The launcher starts
-             with Software on Linux; without Vulkan the game uses Software
-             by itself. Choosing Software sets the frame rate back to the
-             original. Internal resolution
-             (GPU: draws the PS2 picture 1x to 8x larger), Upscaling
+    Quality  Renderer: Software, or GPU (Vulkan 1.3). The launcher looks at
+             the graphics hardware and starts with GPU at 4x on a separate
+             graphics card, GPU at 1x on graphics built into the processor,
+             and Software otherwise (then with Bilinear instead of FSR 1.0
+             on a small processor or a large picture). Without Vulkan the
+             game uses Software by itself. Choosing Software sets the frame
+             rate back to the original. Internal resolution (GPU: draws the
+             PS2 picture 1x to 8x larger), Smooth distant textures (GPU: far
+             floors and walls shimmer less; off is the original look;
+             untouched, the game decides), Upscaling
              (Nearest, Bilinear, or FSR 1.0 = AMD FidelityFX Super
              Resolution), Sharpness (FSR)
     Image    Brightness, Contrast, Gamma, Saturation, Bloom, Film grain
              (the game's own grain overlay; 100% original, 0% none)
+             Until you set them yourself, Film grain starts at 50% and
+             Sharpness at 50 (of at most 75) with the GPU renderer at 2x
+             and above, where both stand out more; otherwise 100% and 60.
              (double-click a slider, or Reset, for the defaults)
     Game     Sound on/off; Memory card inserted or not (without a card the
              game cannot save or load); Gamepad (Auto, Xbox, PlayStation,
@@ -215,6 +223,9 @@ Running the game without the launcher
   --gamma 50..200         100 = 1.00; higher brightens midtones
   --saturation 0..200     (default 100)       --bloom 0..100   (default 0)
   --film-grain 0..100     the game's film grain (default 100 = original)
+  --texture-filter auto|original|smooth   gpu: filtering of distant textures
+                          (default auto: smooth from --internal 2 on a
+                          separate graphics card, original otherwise)
   --pad auto|xinput|playstation|off   which gamepad (default auto)
   --pad-deadzone 0..90    stick dead zone in percent (default 24)
   ROR_MC_DIR=dir   memory card folder        ROR_NO_MC=1     no memory card
@@ -327,11 +338,16 @@ In the launcher
              (original 50 Hz, match the display, or 60-240 by interpolating
              frames) and V-Sync. Frame rate and V-Sync belong to the GPU
              renderer: choosing one switches the renderer to GPU by itself.
-    Quality  Renderer: Software, or GPU (Vulkan 1.3). The launcher starts
-             with GPU on Windows; without Vulkan the game uses Software
-             by itself. Choosing Software sets the frame rate back to the
-             original. Internal resolution
-             (GPU: draws the PS2 picture 1x to 8x larger), Upscaling
+    Quality  Renderer: Software, or GPU (Vulkan 1.3). The launcher looks at
+             the graphics hardware and starts with GPU at 4x on a separate
+             graphics card, GPU at 1x on graphics built into the processor,
+             and Software otherwise (then with Bilinear instead of FSR 1.0
+             on a small processor or a large picture). Without Vulkan the
+             game uses Software by itself. Choosing Software sets the frame
+             rate back to the original. Internal resolution (GPU: draws the
+             PS2 picture 1x to 8x larger), Smooth distant textures (GPU: far
+             floors and walls shimmer less; off is the original look;
+             untouched, the game decides), Upscaling
              (Nearest, Bilinear, FSR 1.0 = AMD FidelityFX Super
              Resolution, or FSR 3.1 = temporal upscaling: renders at a low
              internal resolution and reconstructs detail over time; GPU
@@ -339,6 +355,9 @@ In the launcher
              movies use FSR 1.0), Sharpness (FSR)
     Image    Brightness, Contrast, Gamma, Saturation, Bloom, Film grain
              (the game's own grain overlay; 100% original, 0% none)
+             Until you set them yourself, Film grain starts at 50% and
+             Sharpness at 50 (of at most 75) with the GPU renderer at 2x
+             and above, where both stand out more; otherwise 100% and 60.
              (double-click a slider, or Reset, for the defaults)
     Game     Sound on/off; Memory card inserted or not (without a card the
              game cannot save or load); Gamepad (Auto, Xbox, PlayStation,
@@ -378,6 +397,9 @@ Running the game without the launcher
   --gamma 50..200         100 = 1.00; higher brightens midtones
   --saturation 0..200     (default 100)       --bloom 0..100   (default 0)
   --film-grain 0..100     the game's film grain (default 100 = original)
+  --texture-filter auto|original|smooth   gpu: filtering of distant textures
+                          (default auto: smooth from --internal 2 on a
+                          separate graphics card, original otherwise)
   --pad auto|xinput|playstation|off   which gamepad (default auto)
   --pad-deadzone 0..90    stick dead zone in percent (default 24)
   set ROR_MC_DIR=dir   memory card folder      set ROR_NO_MC=1   no memory card

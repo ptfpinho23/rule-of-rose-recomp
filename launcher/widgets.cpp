@@ -8,6 +8,7 @@
 #include <QLabel>
 #include <QMouseEvent>
 #include <QPainter>
+#include <QSignalBlocker>
 #include <QPainterPath>
 #include <QVariantAnimation>
 
@@ -238,6 +239,15 @@ Toggle::Toggle(QWidget *parent) : HoverButton(parent)
     });
 }
 
+void Toggle::showChecked(bool on)
+{
+    const QSignalBlocker quiet(this);
+    setChecked(on);
+    m_slide->stop();
+    m_pos = on ? 1 : 0;
+    update();
+}
+
 void Toggle::paintEvent(QPaintEvent *)
 {
     QPainter p(this);
@@ -273,6 +283,12 @@ Segmented::Segmented(const QStringList &items, QWidget *parent)
 }
 
 QSize Segmented::sizeHint() const { return {int(m_items.size()) * m_cell + 1, 34}; }
+
+void Segmented::showCurrent(int i)
+{
+    m_current = qBound(0, i, int(m_items.size()) - 1);
+    update();
+}
 
 void Segmented::setCurrent(int i)
 {
@@ -372,7 +388,17 @@ void Slider::setValue(int v)
         return;
     m_value = v;
     update();
+    emit shown(v);
     emit changed(v);
+}
+
+void Slider::showValue(int v)
+{
+    if (v == m_value)
+        return;
+    m_value = v;
+    update();
+    emit shown(v);
 }
 
 void Slider::setFromX(qreal x)
@@ -426,12 +452,12 @@ void Slider::paintEvent(QPaintEvent *)
     const bool en = isEnabled();
     const qreal y = qRound(height() / 2.0) + 0.5;
     const qreal x0 = kKnob / 2, x1 = width() - kKnob / 2;
-    const qreal t = qreal(m_value - m_min) / (m_max - m_min);
+    const qreal t = qBound(0.0, qreal(m_value - m_min) / (m_max - m_min), 1.0);
     const qreal x = x0 + (x1 - x0) * t;
     // Track, a tick at the default, the filled part, the handle.
     p.setPen(QPen(alpha(chalk, en ? 0.24 : 0.10), 1));
     p.drawLine(QPointF(x0, y), QPointF(x1, y));
-    const qreal xd = x0 + (x1 - x0) * qreal(m_def - m_min) / (m_max - m_min);
+    const qreal xd = x0 + (x1 - x0) * qBound(0.0, qreal(m_def - m_min) / (m_max - m_min), 1.0);
     p.drawLine(QPointF(qRound(xd) + 0.5, y - 4), QPointF(qRound(xd) + 0.5, y + 4));
     if (en) {
         p.setPen(QPen(rose, 2, Qt::SolidLine, Qt::FlatCap));

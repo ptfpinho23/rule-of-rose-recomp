@@ -26,6 +26,7 @@
 #include <QUrl>
 #include <QWindow>
 #include <algorithm>
+#include <utility>
 #include <cstdio>
 #ifdef Q_OS_WIN
 #include <qt_windows.h>
@@ -262,7 +263,7 @@ QWidget *MainWindow::buildControls()
 // saved to QSettings here; play() turns them into game switches.
 QWidget *MainWindow::buildOptions()
 {
-    const int w = 560, rowH = 46, tabH = 50, pageH = 6 * rowH + 52;
+    const int w = 560, rowH = 46, tabH = 50, pageH = 6 * rowH + 74;
     auto *root = new QWidget;
     root->resize(w, tabH + pageH);
 
@@ -296,13 +297,11 @@ QWidget *MainWindow::buildOptions()
         auto *val = makeLabel(page, serif(17, SemiBold, 0.3), chalkDim);
         val->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
         val->setGeometry(w - 60, i * rowH, 60, rowH - 2);
-        sl->setValue(QSettings().value(key, def).toInt());
+        sl->showValue(QSettings().value(key, def).toInt());
         val->setText(readout(kind, sl->value()));
         const QString k = key;
-        connect(sl, &Slider::changed, this, [val, kind, k](int v) {
-            val->setText(readout(kind, v));
-            QSettings().setValue(k, v);
-        });
+        connect(sl, &Slider::shown, this, [val, kind](int v) { val->setText(readout(kind, v)); });
+        connect(sl, &Slider::changed, this, [k](int v) { QSettings().setValue(k, v); });
         if (labelOut)
             *labelOut = l;
         return sl;
@@ -387,13 +386,18 @@ QWidget *MainWindow::buildOptions()
     m_filter = new Segmented(QStringList({"Nearest", "Bilinear", "FSR 1.0", "FSR 3.1"}).mid(0, kFilterCount));
     row(q, 0, "Renderer", m_renderer);
     m_internalLabel = row(q, 1, "Internal resolution", m_internal);
-    row(q, 2, "Upscaling", m_filter);
-    m_sharp = sliderRow(q, 3, "Sharpness", "video/sharpness", 0, 100, 60, Plain, &m_sharpLabel);
-    m_gpuLine = helper(q, 4 * rowH + 8, {});
-    m_qualityNote = helper(q, 4 * rowH + 30, {});
-    m_fsrNote = helper(q, 4 * rowH + 52, {});
-    m_fsrNote2 = helper(q, 4 * rowH + 74, {});
-    helper(q, 4 * rowH + 96, "Internal resolution sizes are for the game's 512 × 448 picture.");
+    m_texSmooth = new Toggle;
+    m_texLabel = row(q, 2, "Smooth distant textures", m_texSmooth);
+    row(q, 3, "Upscaling", m_filter);
+    m_sharp = sliderRow(q, 4, "Sharpness", "video/sharpness", 0, 100, 60, Plain, &m_sharpLabel);
+    m_gpuLine = helper(q, 5 * rowH + 8, {});
+    m_qualityNote = helper(q, 5 * rowH + 30, {});
+    m_fsrNote = helper(q, 5 * rowH + 52, {});
+    m_fsrNote2 = helper(q, 5 * rowH + 74, {});
+    helper(q, 5 * rowH + 96, "Smooth distant textures: far floors and walls shimmer less; off is the original look.");
+    connect(m_texSmooth, &QAbstractButton::toggled, this, [](bool on) {
+        QSettings().setValue("video/texture_filter", on ? "smooth" : "original");
+    });
     {
         // The GPU renderer draws the PS2 picture (512 x 448 in this game) N times larger.
         QList<Dropdown::Item> items;
@@ -467,27 +471,10 @@ QWidget *MainWindow::buildOptions()
     // FSR 3.1 belongs to the GPU renderer: choosing it selects GPU, choosing
     // Software goes back to FSR 1.0, and a saved Software + FSR 3.1 is put
     // right here. Where FSR 3.1 is not offered, a saved one shows as FSR 1.0.
-    // Default upscaling is FSR 1.0 - except with the software renderer where
-    // it would be too much for the processor: an output larger than
-    // 1920 x 1080, or fewer than 8 processor threads. Bilinear then.
-    const int threads = g_threads > 0 ? g_threads : QThread::idealThreadCount();
-    const QSize outNow = outputSize();
-    const bool heavyFsr = m_renderer->current() == 0 &&
-                          (qint64(outNow.width()) * outNow.height() > 1920 * 1080 || threads < 8);
-    const QString filterDefault = heavyFsr ? "bilinear" : "fsr";
-    int filter = 2;
+    int filter = defaultFilterIndex();
     for (int i = 0; i < kFilterCount; ++i)
-        if (s.value("video/filter", filterDefault).toString() == kFilters[i])
+        if (s.value("video/filter").toString() == kFilters[i])
             filter = i;
-    m_defaultsLine = QString("renderer=%1 (%2), internal=%3 (%4), filter=%5 (%6); %7 processor threads, output %8x%9")
-                         .arg(m_renderer->current() ? "gpu" : "software",
-                              s.contains("video/renderer") ? "saved" : "default")
-                         .arg(m_internal->currentValue(), s.contains("video/internal") ? "saved" : "default")
-                         .arg(kFilters[filter], s.contains("video/filter") ? "saved" : "default")
-                         .arg(threads).arg(outNow.width()).arg(outNow.height());
-    note(QString("graphics: %1%2").arg(GpuInfo::kindName(g_gpu.kind),
-                                        g_gpu.name.isEmpty() ? QString() : " - " + g_gpu.name));
-    note("settings at start: " + m_defaultsLine);
     if (filter == 3 && m_renderer->current() == 0) {
         filter = 2;
         s.setValue("video/filter", kFilters[filter]);
@@ -521,8 +508,17 @@ QWidget *MainWindow::buildOptions()
     auto *reset = new LinkButton("Reset", LinkButton::Inline, im);
     reset->move(w - reset->width(), 6 * rowH + 8);
     connect(reset, &QAbstractButton::clicked, this, [this]() {
-        for (Slider *sl : {m_bright, m_contrast, m_gamma, m_saturation, m_bloom, m_grain})
-            sl->setValue(sl->defaultValue());
+        // Back to "not chosen": the saved values go, the sliders show their
+        // defaults (film grain's follows the renderer, see below).
+        const std::pair<Slider *, const char *> all[] = {
+            {m_bright, "video/brightness"}, {m_contrast, "video/contrast"}, {m_gamma, "video/gamma"},
+            {m_saturation, "video/saturation"}, {m_bloom, "video/bloom"}, {m_grain, "video/film_grain"}};
+        QSettings st;
+        for (const auto &[sl, key] : all) {
+            st.remove(key);
+            sl->showValue(sl->defaultValue());
+        }
+        applyFollowingDefaults();
     });
     helper(im, 6 * rowH + 10, "Film grain is the game's own; 100% is the original, 0% removes it.")
         ->resize(w - 80, 22);
@@ -563,6 +559,9 @@ QWidget *MainWindow::buildOptions()
     });
 
     updateOptionStates();
+    note(QString("graphics: %1%2").arg(GpuInfo::kindName(g_gpu.kind),
+                                        g_gpu.name.isEmpty() ? QString() : " - " + g_gpu.name));
+    note("settings at start: " + settingsLine());
     selectOptionsTab(0);
     return root;
 }
@@ -575,11 +574,80 @@ void MainWindow::selectOptionsTab(int index)
     }
 }
 
+// The upscaling a fresh install starts with: FSR 1.0 - except with the
+// software renderer where that would be too much for the processor (an
+// output larger than 1920 x 1080, or fewer than 8 processor threads): then
+// Bilinear. With the GPU renderer it is always FSR 1.0, which runs on the
+// graphics chip there.
+int MainWindow::defaultFilterIndex() const
+{
+    const int threads = g_threads > 0 ? g_threads : QThread::idealThreadCount();
+    const QSize out = outputSize();
+    const bool heavy = m_renderer->current() == 0 &&
+                       (qint64(out.width()) * out.height() > 1920 * 1080 || threads < 8);
+    return heavy ? 1 : 2;
+}
+
+// Settings the player has not chosen follow the renderer and the internal
+// resolution, also while the panel is open. With the GPU renderer at 2x and
+// above the picture is sharp enough that the game's film grain and the
+// sharpening stand out: grain defaults to 50 %, sharpness to 50 with a
+// range that ends at 75. At 1x, and with Software, the original values
+// stay (grain 100 %, sharpness 60, range to 100). A saved value is never
+// changed; a saved sharpness above the range is kept until the slider moves.
+void MainWindow::applyFollowingDefaults()
+{
+    if (!m_grain || !m_sharp || !m_texSmooth)
+        return;                                    // the panel is still being built
+    const QSettings s;
+    const bool gpu = m_renderer->current() == 1;
+    const int internal = m_internal->currentValue().toInt();
+    const bool fine = gpu && internal >= 2;
+
+    if (!s.contains("video/filter") && m_filter->current() != 3)
+        m_filter->showCurrent(defaultFilterIndex());
+
+    m_grain->setDefault(fine ? 50 : 100);
+    if (!s.contains("video/film_grain"))
+        m_grain->showValue(m_grain->defaultValue());
+
+    m_sharp->setMaximum(fine ? 75 : 100);
+    m_sharp->setDefault(fine ? 50 : 60);
+    if (!s.contains("video/sharpness"))
+        m_sharp->showValue(m_sharp->defaultValue());
+
+    // Untouched, the game decides ("auto": smooth from 2x on a separate
+    // graphics card); the switch shows what that comes to.
+    if (!s.contains("video/texture_filter"))
+        m_texSmooth->showChecked(fine && g_gpu.kind == GpuInfo::Discrete);
+    else
+        m_texSmooth->showChecked(s.value("video/texture_filter").toString() == "smooth");
+}
+
+QString MainWindow::settingsLine() const
+{
+    const QSettings s;
+    auto how = [&s](const char *key) { return s.contains(key) ? "saved" : "default"; };
+    const QSize out = outputSize();
+    return QString("renderer=%1 (%2), internal=%3 (%4), filter=%5 (%6), sharpness=%7 (%8), "
+                   "film grain=%9 (%10), texture filter=%11; %12 processor threads, output %13x%14")
+        .arg(m_renderer->current() ? "gpu" : "software", how("video/renderer"))
+        .arg(m_internal->currentValue(), how("video/internal"))
+        .arg(kFilters[m_filter->current()], how("video/filter"))
+        .arg(m_sharp->value()).arg(how("video/sharpness"))
+        .arg(m_grain->value()).arg(how("video/film_grain"))
+        .arg(s.contains("video/texture_filter") ? s.value("video/texture_filter").toString() + " (saved)"
+                                                : QString("auto (default)"))
+        .arg(g_threads > 0 ? g_threads : QThread::idealThreadCount())
+        .arg(out.width()).arg(out.height());
+}
+
 // What applies depends on the renderer and the mode: fullscreen uses the
 // desktop's size; internal resolution, frame rate and V-Sync are the GPU
 // renderer's; sharpness is FSR's.
 void MainWindow::updateOptionStates()
 {
+    applyFollowingDefaults();
     const bool windowed = m_mode->current() == 0, fsr = m_filter->current() >= 2;
     const bool fsr3 = m_filter->current() == 3;
     const bool gpu = m_renderer->current() == 1;
@@ -588,6 +656,8 @@ void MainWindow::updateOptionStates()
     setColor(m_resLabel, windowed ? on : off);
     m_internal->setEnabled(gpu);
     setColor(m_internalLabel, gpu ? on : off);
+    m_texSmooth->setEnabled(gpu);
+    setColor(m_texLabel, gpu ? on : off);
     m_sharp->setEnabled(fsr);
     setColor(m_sharpLabel, fsr ? on : off);
     const bool pad = m_pad->current() != 3;
@@ -661,6 +731,9 @@ QStringList MainWindow::gameArguments() const
     opt("--saturation", m_saturation->value(), 100);
     opt("--bloom", m_bloom->value(), 0);
     opt("--film-grain", m_grain->value(), 100);
+    // Only a choice the player made is passed; otherwise the game decides.
+    if (gpu && QSettings().contains("video/texture_filter"))
+        args << "--texture-filter" << (m_texSmooth->isChecked() ? "smooth" : "original");
     if (m_pad->current() > 0)                // Auto is the game's default
         args << "--pad" << kPadKinds[m_pad->current()];
     if (m_pad->current() != 3)
@@ -727,6 +800,16 @@ void MainWindow::testSet(const QString &name, const QString &value)
     }
     else if (name == "internal")
         m_internal->setCurrentValue(value);
+    else if (name == "texture")
+        m_texSmooth->setChecked(value == "1" || value == "on");
+    else if (name == "grain")
+        m_grain->setValue(value.toInt());
+    else if (name == "sharpness")
+        m_sharp->setValue(value.toInt());
+    else if (name == "reset-image")
+        for (LinkButton *b : findChildren<LinkButton *>())
+            if (b->text() == "Reset")
+                b->click();
     else if (name == "vsync")
         m_vsync->setChecked(value == "1" || value == "on");
 }
@@ -1241,7 +1324,7 @@ void MainWindow::play()
         if (m_dryRun) {
             printf("[dry-run] graphics: %s%s%s\n[dry-run] settings: %s\n", GpuInfo::kindName(g_gpu.kind),
                    g_gpu.name.isEmpty() ? "" : " - ", g_gpu.name.toLocal8Bit().constData(),
-                   m_defaultsLine.toLocal8Bit().constData());
+                   settingsLine().toLocal8Bit().constData());
             printf("[dry-run] action: prepare the game first\n[dry-run] builder: %s\n",
                    builderPath().toLocal8Bit().constData());
             for (const QString &a : QStringList{"--iso", QDir::toNativeSeparators(m_disc.path),
@@ -1299,7 +1382,7 @@ void MainWindow::play()
         // --dry-run: say exactly what would be started, and stop there.
         printf("[dry-run] graphics: %s%s%s\n[dry-run] settings: %s\n", GpuInfo::kindName(g_gpu.kind),
                g_gpu.name.isEmpty() ? "" : " - ", g_gpu.name.toLocal8Bit().constData(),
-               m_defaultsLine.toLocal8Bit().constData());
+               settingsLine().toLocal8Bit().constData());
         printf("[dry-run] program: %s\n[dry-run] cwd: %s\n", game.toLocal8Bit().constData(),
                workDir.toLocal8Bit().constData());
         for (const QString &a : args)

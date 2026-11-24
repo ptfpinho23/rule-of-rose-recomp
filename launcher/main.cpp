@@ -9,7 +9,8 @@
 //   --set NAME=VALUE              operate a control as a click would, before
 //                                 --show / --autoplay (renderer=gpu|software,
 //                                 fps=0|display|N, vsync=0|1, filter=NAME,
-//                                 internal=N); repeatable
+//                                 internal=N, texture=0|1, grain=N,
+//                                 sharpness=N, reset-image); repeatable
 //   --extra-arg X                 append X to the game's command line (tests,
 //                                 e.g. --extra-arg --frames --extra-arg 400)
 //   --prepare                     run the "prepare the game" step now and exit
