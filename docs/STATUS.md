@@ -47,7 +47,8 @@ uphill from it.
   `--internal 1`.
 - `--bloom` is accepted but too weak to see in this game.
 - DualShock 3 is not supported on Windows. Old DirectInput-only joysticks are
-  not picked up. There is no button remapping and only one pad.
+  not picked up. There is no button remapping, and the game has one player:
+  several connected pads all act as that one pad.
 
 ## Things that are not bugs
 

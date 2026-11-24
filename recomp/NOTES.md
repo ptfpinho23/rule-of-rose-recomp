@@ -561,14 +561,16 @@ gap in the GPU renderer section above.
   Triggers count as L2/R2 from 64/255.
 - `rt/pad_xinput.c` (Windows): `LoadLibraryEx(..., LOAD_LIBRARY_SEARCH_SYSTEM32)`
   of xinput1_4.dll, then xinput1_3.dll, then xinput9_1_0.dll; no import in the
-  .exe. First connected slot of 4; empty slots are re-asked once per second.
+  .exe. All four slots are read and merged (since 2026-11-24; before: the
+  first connected one); empty slots are re-asked once per second.
   `XInputSetState`: big motor -> left (low frequency), small -> right.
 - `rt/pad_evdev.c` (Linux): `/dev/input/event*` with `<linux/input.h>` (from
   linux-libc-dev in `tools/debs/qtdev`, added to build.sh's include path
   after the others). Gamepad = reports BTN_SOUTH; checked in
   `/sys/class/input/eventN/device/capabilities/key` before opening, so
   keyboards/mice are not opened and a gamepad that cannot be opened gets one
-  log line. Lowest event number wins; rescan once per second while there is
+  log line. (Device choice was replaced on 2026-11-24, see "Linux gamepads:
+  classification, all pads merged" below.) Rescan once per second while there is
   none; state by EVIOCGKEY/EVIOCGABS per frame; unplug = read/ioctl error.
   Codes 0x133/0x134 are X/Y for xpad-style devices and top/left for Sony
   (054c) and Nintendo (057e). Right stick on ABS_RX/RY (triggers ABS_Z/RZ) or,
@@ -1064,3 +1066,141 @@ Pinned downloads and their SHA-256 are in `release/fetch.sh`.
   current folder in a normal run (checked from a read-only folder). Without
   it, it creates `saves/mc0` beside itself. `--shots` and the debug dumps
   write under the current folder.
+
+## Linux gamepads: classification, all pads merged, diagnostics (2026-11-24)
+
+Reported: an Xbox controller does not work on Linux (no log available). No
+input devices exist on the development machine, so the cause was looked for
+in the sources and in a simulation (`recomp/tools/padsim.sh`).
+
+### What was wrong in `rt/pad_evdev.c`
+- It took the lowest-numbered event node that reports BTN_SOUTH and stopped.
+  Virtual devices made by key remappers and similar tools declare the whole
+  key range (BTN_SOUTH included) and exist before a pad is plugged in, so
+  they have lower numbers: the game then held on to a device that never
+  reports a button and never looked at the pad. The simulation reproduces
+  this with the old file (scenario 1: the device in use is "keyd virtual
+  keyboard", no input arrives) — this is the most likely cause of the report,
+  but without a log from an affected machine it is not proven.
+- Only one device was ever used, so any wrong pick was final.
+- A node that could not be opened was reported only for EACCES, once, in a
+  line that did not name the remedy; other nodes left no trace in the log.
+
+### Checked against the sources
+- udev `input_id` (systemd `src/udev/udev-builtin-input_id.c`): a joystick
+  has buttons in BTN_JOYSTICK..BTN_DIGI (or BTN_DPAD_*, BTN_TRIGGER_HAPPY*) or
+  axes ABS_RX..; "Joystick un-detection. Some keyboards have random joystick
+  buttons set": with 4 or more of ten well-known keyboard keys it is a
+  keyboard. With absolute axes and a mouse button it is an absolute mouse.
+- SDL `SDL_EVDEV_GuessDeviceClass`: joystick = ABS_X and ABS_Y plus
+  BTN_TRIGGER / BTN_A / BTN_1 or a further axis; accelerometer and button-pad
+  properties decide first.
+- Access: systemd `rules.d/50-udev-default.rules.in` has `SUBSYSTEM=="input",
+  GROUP="input"` (and mode 0664 only for `js[0-9]*`); `70-uaccess.rules.in`
+  has `SUBSYSTEM=="input", ENV{ID_INPUT_JOYSTICK}=="?*", TAG+="uaccess"`. So
+  the user of the active local logind session gets an ACL on joystick event
+  nodes; without such a session (no logind, a container, ssh) the node is
+  root:input 0660 and the open fails unless the user is in the input group.
+- EVIOCGRAB (kernel `drivers/input/evdev.c`): events go only to the grabbing
+  client (`client = rcu_dereference(evdev->grab); if (client)
+  evdev_pass_values(client, ...)`), but EVIOCGKEY / EVIOCGABS are answered
+  from the device's own state (`evdev_handle_get_val(client, dev, EV_KEY,
+  dev->key, ...)`, `bitmap_copy(mem, bits, maxbit)`). This file reads state,
+  not events, so a grabbed pad still reports; if the physical pad and a
+  virtual copy both report, the merged state is the same as one.
+- Xbox drivers: xpad registers BTN_A/B/X/Y, BTN_START/SELECT, BTN_THUMBL/R,
+  BTN_TL/TR, BTN_MODE, ABS_X/Y/RX/RY (-32768..32767), triggers ABS_Z/RZ
+  (0..255, 0..1023 for Xbox One) or BTN_TL2/TR2, D-pad ABS_HAT0X/Y or
+  BTN_DPAD_*; xone and xpadneo the same with 0..1023 triggers. BTN_X is code
+  0x133 and BTN_Y 0x134 in all three, which the existing mapping assumed.
+  On the generic HID mapping (hid-input: buttons from BTN_GAMEPAD upwards in
+  usage order) a Bluetooth pad has its right stick on ABS_Z/RZ and triggers
+  on ABS_BRAKE/GAS; that was handled already.
+- The sysfs bitmap parser was correct for the kernel's format
+  (`input_print_bitmap`: unsigned long words, highest first, leading zero
+  words skipped); the simulation now produces that format from the device
+  tables, e.g. an xpad key bitmap `7cdb000000000000 0 0 0 0`.
+
+### What changed
+- Classification (`why_not_gamepad`): BTN_SOUTH, and stick or hat axes or the
+  four BTN_DPAD_* buttons, and none of: 4 of udev's well-known keyboard keys
+  (or KEY_A + KEY_SPACE + KEY_ENTER), REL_X + REL_Y, mouse / touch / pen
+  buttons, the accelerometer / pointer / button-pad properties. From sysfs
+  first (capabilities/{ev,key,abs,rel}, properties, name, id/*), and again
+  from the opened device; without sysfs, from the device alone.
+- Every gamepad is opened (up to 8) and the states are merged: buttons OR,
+  triggers maximum, each stick from the device with the largest deflection.
+  /dev/input is looked through once per second also while pads are open; a
+  node is classified again only when its inode or change time is new (udev
+  applying the ACL changes the latter). Devices are dropped one by one on
+  read errors. Vibration goes to every pad that has FF_RUMBLE. `--pad
+  xinput|playstation` filter per device. `hpad_kind` is that of the
+  lowest-numbered pad.
+- Sticks are scaled around the middle of the declared range (0..255 rests at
+  128 and now gives exactly 0; before it gave 128 of 32767).
+- Ten buttons numbered in sequence without BTN_SELECT / BTN_START (codes
+  0x130..0x139 on the generic HID mapping) are taken as A B X Y LB RB Back
+  Start LS RS. BTN_TRIGGER_HAPPY1..4 are the D-pad when there is neither a
+  hat nor BTN_DPAD_*. Both are from the mapping rules, not from a device.
+- Windows, the analogous case: `pad_xinput.c` used the first connected XInput
+  slot; it now reads all four and merges them the same way. `pad_hid.c`
+  already goes on past devices it cannot use. Unchanged: in `auto` a Sony pad
+  is read directly only while XInput reports no pad at all.
+
+### Log lines (support: ask for the `[pad]` lines of game.log)
+```
+[pad] evdev: /dev/input/event17 "Microsoft X-Box 360 pad" 045e:028e: used as gamepad (xbox layout, vibration)
+[pad] evdev: /dev/input/event2 "keyd virtual keyboard" 0fac:0ade: skipped, has keyboard keys too (a keyboard or a virtual device)
+[pad] evdev: /dev/input/event5 "Microsoft X-Box 360 pad" 045e:028e: is a gamepad but cannot be opened: permission denied for /dev/input/event5. Fix: log out and in again, or 'sudo usermod -aG input $USER' and log in again, or a udev rule with TAG+="uaccess" for this device
+[pad] evdev: /dev/input/event17 "Microsoft X-Box 360 pad" 045e:028e: disconnected
+[pad] gamepad: Microsoft X-Box 360 pad (evdev, 1 device, /dev/input/event17 045e:028e; kind xbox; stick dead zone 24 %)
+[pad] no gamepad found (evdev: 3 input devices in /dev/input, no gamepad among them); keyboard only until one is connected
+```
+One `evdev:` line per node that has joystick-range buttons, when its verdict
+changes. Other skip reasons: `has mouse axes too`, `has mouse or touch
+buttons too`, `gamepad buttons but no stick or D-pad axes`, `joystick buttons
+but no gamepad layout (no BTN_SOUTH)`, `motion sensor of a controller`,
+`touchpad or pointer`, `skipped by --pad playstation (not a Sony device)`,
+`skipped, 8 gamepads are in use already`; `is a gamepad but cannot be opened:
+<error text>`. With several pads the `gamepad:` line names the first "and N
+more". Other statuses in the `no gamepad found` line: `evdev: /dev/input does
+not exist`, `evdev: N gamepads present but not accessible, see the lines
+above`. `ROR_PAD_DEBUG=1` adds a line for every node, for each opened pad
+`bus BBBB, keys <codes>; axes <code>[min..max] ...`, and on every change
+`[pad] evdev: eventN state: buttons XXXX lt .. rt .. lx .. ly .. rx .. ry ..;
+keys down: <codes>; axes: <code>=<value> ...`.
+
+### Simulation: `recomp/tools/padsim.sh [pad_evdev.c [N]]`
+Builds `pad_evdev.c` and `pad.c` unchanged with `padsim.c`; the linker's
+`--wrap` redirects opendir / readdir / closedir / stat / fopen / open / close
+/ read / write / ioctl for `/dev/input/event*` and `/sys/class/input/event*`
+to a table of devices whose capabilities, IDs, properties and ranges are
+those the drivers register. 13 scenarios, 42 checks: key-remapper keyboard
+before an xpad (with the state carried through `pad.c` to the PS2 word and a
+vibration request back), Xbox One ranges, Bluetooth generic layout,
+sequential buttons, DualSense with its motion and touchpad nodes, a node
+without access that becomes accessible, hot-plug / unplug / replug of three
+pads, a silent pad plus Steam's virtual pad, the two `--pad` filters, no
+sysfs and read-only open, no gamepad / no /dev/input, the debug output.
+Result: all pass with the new file; with the file of the previous commit
+(`git show 654409c:recomp/rt/pad_evdev.c > old.c; padsim.sh old.c`) 10 of 13
+fail, among them scenario 1 with `the device in use is the Xbox pad (name
+"keyd virtual keyboard")`.
+
+### Verification of the build
+Standard script to 16000 (16 PNG + WAV): identical for the previous binary,
+a build of the same sources with the old pad files, and the new build, on
+Linux and Windows (frame_016000 ed535164..., audio.wav 670b42cf...); the same
+script given as `ROR_PAD_FAKE` (recomp/tools/padfake.py) gives the same md5s
+on both; `ROR_PAD_SELFTEST=1` all ok and identical on both; Windows window
+run of 300 frames in 6.07 s with the usual `no gamepad found` line.
+
+### Not verifiable here
+No controller and no /dev/input on the development machine: the new code has
+run only against the simulated devices. Whether the reported failure was the
+device choice, missing access rights or something else is not known until a
+`[pad]` log from an affected system is seen. The simulated capability sets
+come from the driver sources, not from captures of real devices; the
+sequential-button and BTN_TRIGGER_HAPPY rules and the merged XInput slots
+have never met hardware. Not done: reading `/dev/input/js*` (world-readable
+by default) as a fallback when the event node is not accessible.

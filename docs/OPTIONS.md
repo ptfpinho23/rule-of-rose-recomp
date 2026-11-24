@@ -24,7 +24,7 @@ ror-game --iso PATH [--scale 1..4 | --res WxH] [--wide 16:9] [picture options]
 | `--renderer software\|gpu` | `software` is the CPU renderer (the default when started without the launcher). `gpu` draws with Vulkan 1.3 at a multiple of the PS2 resolution; if no suitable Vulkan device is found the software renderer is used |
 | `--internal 1..8` | GPU renderer only: internal resolution as a multiple of 512x448 (default 4 = 2048x1792) |
 | `--vsync 0\|1` | GPU renderer only: tear-free presentation (default 1) |
-| `--pad auto\|off\|xinput\|playstation` | gamepad: `auto` (default) uses the first one found, `off` ignores gamepads; `xinput` / `playstation` restrict it to XInput pads or to PlayStation pads (Linux: to non-Sony / Sony devices) |
+| `--pad auto\|off\|xinput\|playstation` | gamepad: `auto` (default) uses the gamepads it finds, `off` ignores gamepads; `xinput` / `playstation` restrict it to XInput pads or to PlayStation pads (Linux: to non-Sony / Sony devices) |
 | `--pad-deadzone 0..90` | part of the stick travel around the centre that is ignored, in percent (default 24); the rest of the travel is the full analog range |
 | `--fps 0\|display\|25..1000` | GPU renderer only (experimental): frame interpolation. `0` (default) shows the game's own 25 pictures per second; `display` presents in-between pictures at the monitor's refresh rate; a number presents at most that many per second. Adds one game frame (40 ms) plus 20-60 ms of picture delay |
 
@@ -44,4 +44,5 @@ four folders above it.
 | `ROR_MC_DIR=dir` | memory-card folder (default `saves/mc0` beside the executable) |
 | `ROR_NO_MC=1` | start with no memory card inserted |
 | `ROR_NOAUDIO=1` | no sound |
+| `ROR_PAD_DEBUG=1` | Linux: log every input device, the capabilities of each gamepad and every change of its state (see [CONTROLS.md](CONTROLS.md)) |
 | `ROR_WIDE=16:9` | same as `--wide` (the command line wins) |
