@@ -9,7 +9,8 @@ typedef struct HwVertex_ { float x, y, z, fog; float s, t, q; float r, g, b, a; 
 enum { HWB_OFF, HWB_MIX, HWB_ADD, HWB_REVSUB };          /* fixed-function blend: Cs*F + Cd*(1-F), Cs*F + Cd, Cd - Cs*F */
 enum { HWF_TME = 1, HWF_TEXEL = 2, HWF_BILIN = 4, HWF_TCC = 8, HWF_TFX_SHIFT = 4, HWF_FGE = 64, HWF_ATST_SHIFT = 7, HWF_ATE = 1024,
        HWF_PASS_SHIFT = 11, HWF_FBA = 8192, HWF_SHBLEND = 16384, HWF_DATE = 32768, HWF_DATM = 65536, HWF_COLCLAMP = 131072,
-       HWF_WMS_SHIFT = 18, HWF_WMT_SHIFT = 20, HWF_TEX24 = 1 << 22, HWF_AEM = 1 << 23, HWF_SPRITE = 1 << 24 };
+       HWF_WMS_SHIFT = 18, HWF_WMT_SHIFT = 20, HWF_TEX24 = 1 << 22, HWF_AEM = 1 << 23, HWF_SPRITE = 1 << 24,
+       HWF_MIP = 1 << 25 /* set by the layer itself: minified texels are filtered from mip levels */ };
 /* (HwState.afail 4 / 5, motion-vector targets only: draw the failing / the passing fragments as reactive values) */
 typedef struct HwState_ {
     int rt, ds;                       /* colour and depth target */
@@ -34,6 +35,7 @@ void hw_set_lut(const uint8_t *lut);                  /* 256-entry colour table 
 const uint32_t *hw_present_pixels(int rt, int sx, int sy, int sw, int sh, int dx, int dy, int dw, int dh, int ww, int wh, int filter /* 0 nearest, 1 bilinear, 2 FSR 1.0, 3 = 2 unless hw_fsr3_show was called */, int sat64);
 void hw_present(int rt, int sx, int sy, int sw, int sh, int dx, int dy, int dw, int dh, int ww, int wh, int filter /* 0 nearest, 1 bilinear, 2 FSR 1.0 */, int sat64);
 const char *hw_device_name(void);
+int  hw_device_discrete(void);                         /* 1: a discrete graphics card (not integrated graphics, not a software driver) */
 int  hw_rt_create(int w, int h);                      /* native size; contents undefined */
 int  hw_ds_create(int w, int h);                      /* depth, cleared to 0 */
 void hw_ds_clear(int ds);
@@ -52,6 +54,7 @@ void hw_ds_save(int ds, int slot);                    /* the same for a depth bu
 void hw_ds_load(int dst, int src, int slot);
 void hw_keep_generation(void);                        /* one more retained draw list exists: textures given up stay alive for 5 of these */
 int  hw_rt_count(void);
+void hw_tex_filter(int smooth);                       /* 1: textures created from now on get mip levels and are filtered when minified (--texture-filter smooth) */
 int  hw_tex_create(int w, int h, const uint32_t *rgba);
 void hw_tex_destroy(int tex);                         /* deferred until the GPU is idle */
 void hw_draw(const HwState *s, const HwVertex *v, int n);                        /* triangle list */

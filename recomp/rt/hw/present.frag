@@ -109,6 +109,16 @@ vec3 bilinear(vec2 uv) {        /* uv in source texels */
     vec2 lo = pc.src.xy + 0.5, hi = pc.src.xy + pc.src.zw - 0.5;
     return texture(u_tex, clamp(uv, lo, hi) / vec2(textureSize(u_tex, 0))).rgb;
 }
+/* Filter 0 ("nearest"): every output pixel that lies inside one source texel
+ * shows that texel; a pixel that straddles two shows them in proportion. At
+ * whole-number scales this is plain nearest; in between it avoids texels of
+ * unequal width. u_tex has the bilinear sampler. */
+vec3 sharp(vec2 uv) {
+    vec2 k = pc.dst.zw / pc.src.zw;
+    vec2 fl = floor(uv), d = uv - fl - 0.5, e = 0.5 - abs(d);
+    vec2 off = sign(d) * max(vec2(0.0), 0.5 - e * max(k, vec2(1.0)));
+    return bilinear(fl + 0.5 + off);
+}
 vec3 area(vec2 op) {            /* mean of the source texels under the output pixel (bilinear taps, each 2x2 texels) */
     vec2 sc = pc.src.zw / pc.dst.zw, a = pc.src.xy + op * sc;
     ivec2 n = clamp(ivec2(ceil(sc * 0.5)), ivec2(1), ivec2(8));
@@ -136,12 +146,11 @@ void main() {
     int pass = pc.opt.w;
     if (pass == 0) {
         vec2 uv = pc.src.xy + op / pc.dst.zw * pc.src.zw;
-        vec3 c = pc.opt.x != 0 ? bilinear(uv) : texelFetch(u_tex, ivec2(clamp(uv, pc.src.xy, pc.src.xy + pc.src.zw - 1.0)), 0).rgb;
+        vec3 c = pc.opt.x != 0 ? bilinear(uv) : sharp(uv);
         o_col = vec4(vec3(colour(ivec3(c * 255.0 + 0.5))) / 255.0, 1.0);
     } else if (pass == 1) {
         vec2 uv = pc.src.xy + op / pc.dst.zw * pc.src.zw;
-        vec3 c = pc.opt.x == 2 ? easu(floor(op)) : pc.opt.x == 3 ? area(floor(op)) : pc.opt.x == 1 ? bilinear(uv)
-                 : texelFetch(u_tex, ivec2(clamp(uv, pc.src.xy, pc.src.xy + pc.src.zw - 1.0)), 0).rgb;
+        vec3 c = pc.opt.x == 2 ? easu(floor(op)) : pc.opt.x == 3 ? area(floor(op)) : pc.opt.x == 1 ? bilinear(uv) : sharp(uv);
         o_col = vec4(c, 1.0);
     } else if (pass == 2) {
         vec3 c = clamp(rcas(ivec2(op)), 0.0, 1.0);

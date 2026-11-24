@@ -1314,3 +1314,108 @@ vertices interpolated, and every 250 frames the time spent.
 - The detector sees values outside both neighbouring pictures; a wrong
   triangle with the colours of its surroundings is invisible to it (and
   mostly to the eye).
+
+## Flicker and grain without interpolation; texture filter; nearest scaling (2026-11-24)
+
+Reported on the GPU renderer at `--internal 4`, FSR 1.0 with `--sharpness
+88`, 3840x2160 stretched, no `--fps`: "super grainy and flickers".
+
+### What changes from frame to frame
+Six consecutive presented pictures while the character stands at the bus stop
+(vblanks 21386-21391, swapchain grabs, luma, mean absolute difference between
+two game frames over the middle of the picture):
+
+| setting | mean difference |
+|---|---|
+| FSR 1.0, sharpness 88, grain 100 | 2.19 |
+| sharpness 0, grain 100 | 2.04 |
+| bilinear, grain 100 | 2.00 |
+| nearest, grain 100 | 2.03 |
+| sharpness 88, grain 0 | 0.03 |
+| sharpness 0, grain 0 | 0.03 |
+| sharpness 50, grain 50 | 1.20 |
+| 1920x1080: sharpness 88, grain 100 | 2.27 |
+| 1920x1080: sharpness 50, grain 50 | 1.20 |
+
+- With the picture standing still, practically all of the change is the
+  game's film grain: a new noise pattern every game frame, 25 times a second.
+  Without it two frames differ by 0.03.
+- Sharpening adds 7% to that; within one picture RCAS at 88 raises
+  pixel-to-pixel contrast 1.9 times over no sharpening (1.0 / 1.18 / 1.31 /
+  1.91 at 0 / 25 / 50 / 88), grain included, without ringing.
+- The grain is already drawn per native pixel and filtered bilinearly; at 4x
+  it is soft blobs four device pixels wide over an otherwise clean picture,
+  which is why it stands out more than at 1x.
+- No field or half-line alternation: each game frame is presented for two
+  vblanks and the two pictures are byte-identical. Without `--fps` the
+  display gets 25 different pictures a second whatever its refresh rate;
+  motion at that rate on a 240 Hz panel is the remaining "flicker", and
+  frame interpolation is what addresses it.
+- Moving: textures seen from afar are minified (the game asks for bilinear
+  filtering and has no mip levels), so the ground far away turns into a
+  crawling dot pattern. At 4x most of the picture is magnified and the effect
+  is confined to the distance; at 2x and 1x it covers more.
+
+### `--texture-filter auto|original|smooth` (GPU renderer)
+- `hw_tex_filter(1)` makes `hw_tex_create` build mip levels: 2x2 means on the
+  CPU, colour weighted by alpha (the colour under transparent texels does not
+  leak into the edges of cut-out shapes), alpha the plain mean.
+- `draw_range` sets `HWF_MIP` for a draw when the texture has levels, is a
+  decoded texture (not a render target), the game filters it bilinearly, the
+  primitive is a triangle with perspective coordinates (no sprite, no texel
+  coordinates) and both wrap modes are repeat or clamp (no region modes).
+- `gs.frag`: with `HWF_MIP`, a fragment whose footprint is longer than one
+  texel in some screen direction takes up to four trilinear samples along the
+  long axis from the levels that fit the short axis (`texl`). Every other
+  fragment, and every draw without the flag, runs the code that was there:
+  magnified texels, sprites, text, menus, render-target reads and region
+  wraps are unchanged.
+- `auto` (default): smooth from `--internal 2` on a discrete graphics card,
+  original otherwise. `ROR_HW_TEXFILTER=original|smooth` does the same for the
+  replay tool.
+- Cost. RTX 3090, unthrottled, walk, 500-frame blocks: no difference outside
+  the run-to-run spread at 4x (112-144 fps original, 103-150 smooth) and 2x
+  (145-181 / 141-177); the game thread limits both. Software Vulkan driver
+  (llvmpipe), 30 frames of the walk replayed 12 times: 6.67 s -> 7.96 s at
+  1x, 14.6 -> 17.2 at 2x, 35.4 -> 42.0 at 4x, i.e. 18-19% more frame time
+  where the fragment stage is the limit. That is why `auto` leaves integrated
+  graphics on `original`.
+- Effect at 4x (walk, grain off, sharpness 0): fine-detail energy in the
+  distant third of the picture 0.69 -> 0.58, the dot pattern on the far
+  ground is gone; frame-to-frame difference of the whole picture while
+  walking 5.36 -> 5.27 (most of it is the motion itself).
+
+### `--filter nearest` on the GPU renderer
+`present.frag` `sharp()`: an output pixel inside one source texel shows that
+texel, one that straddles two mixes them by coverage (bilinear sampler,
+coordinate pulled to the texel centre). Whole-number scales give the same
+picture as before (checked at exactly 2x: identical file); other sizes no
+longer have texels of unequal width. It is still blocks: at 1x in a large
+window bilinear or FSR 1.0 look better, and both are cheap on the GPU path.
+The software path (`post.c`) is not touched.
+
+### Checks
+- GPU at 1x with the defaults, and at 4x with `--texture-filter original`:
+  46 shots over 23,000 frames identical to the previous build.
+- Software renderer: 16 frames and audio of the standard run identical on
+  Linux and Windows to the previous build.
+
+### For whoever rebases onto this
+All changes are in: `gs.frag` (function `texl`, one block before the bilinear
+sampling), `present.frag` (function `sharp`, two call sites), `gs_hw.c`
+(`Img.levels`, `img_levels` in `img_create`, level count in `to_layout`, mip
+generation in `hw_tex_create`, one line in `draw_range`, `hw_tex_filter`,
+`hw_device_discrete`, sampler set choice in `present_draw`), `gs_hw.h`,
+`gs.c` (`want_texfilter`, `gs_texture_filter`, the call after `hw_start`),
+`main.c` (the switch). `gs_hw_spv.h` is generated
+(`recomp/tools/gshw-shaders.sh`).
+
+### Not done / not known
+- Film-grain default and sharpness default are not changed in the runtime
+  (`--film-grain 100`, `--sharpness 60` stay the meaning of "as before");
+  proposed launcher values are in the hand-over.
+- Alpha-tested cut-outs use the mip levels like everything else; their edges
+  get softer with distance instead of popping. Not compared against real
+  hardware or other scenes than the walk and the bus stop.
+- No integrated GPU was available: the cost there is inferred from the
+  software driver.

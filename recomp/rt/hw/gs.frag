@@ -32,7 +32,7 @@ layout(location = 0, index = 1) out vec4 o_fac;    /* blend factor (dual source)
 #endif
 
 const uint F_TME = 1u, F_TEXEL = 2u, F_BILIN = 4u, F_TCC = 8u, F_FGE = 64u, F_ATE = 1024u, F_FBA = 8192u,
-           F_SPRITE = 16777216u, F_SHBLEND = 16384u, F_DATE = 32768u, F_DATM = 65536u, F_COLCLAMP = 131072u, F_TEX24 = 4194304u, F_AEM = 8388608u;
+           F_SPRITE = 16777216u, F_MIP = 33554432u, F_SHBLEND = 16384u, F_DATE = 32768u, F_DATM = 65536u, F_COLCLAMP = 131072u, F_TEX24 = 4194304u, F_AEM = 8388608u;
 
 int wrap(int i, uint mode, int size, int mn, int mx, int sc) {
     if (mode == 0u) return i & (size * sc - 1);
@@ -48,6 +48,16 @@ ivec4 texel(ivec2 t) {
     ivec4 c = ivec4(texelFetch(u_tex, t, 0) * 255.0 + 0.5);
     if ((pc.flags & F_TEX24) != 0u) c.a = ((pc.flags & F_AEM) != 0u && c.rgb == ivec3(0)) ? 0 : int(pc.zp.z);
     return c;
+}
+/* --texture-filter smooth: one bilinear sample of mip level l at level-0 position uv (repeat or clamp only) */
+vec4 texl(vec2 uv, int l) {
+    ivec2 size = max(ivec2(pc.tex.xy) >> l, ivec2(1));
+    vec2 p = uv / float(1 << l) - 0.5, fl = floor(p), f = p - fl;
+    ivec2 i0 = ivec2(fl), i1 = i0 + 1;
+    if (((pc.flags >> 18) & 3u) == 0u) { i0.x &= size.x - 1; i1.x &= size.x - 1; } else { i0.x = clamp(i0.x, 0, size.x - 1); i1.x = clamp(i1.x, 0, size.x - 1); }
+    if (((pc.flags >> 20) & 3u) == 0u) { i0.y &= size.y - 1; i1.y &= size.y - 1; } else { i0.y = clamp(i0.y, 0, size.y - 1); i1.y = clamp(i1.y, 0, size.y - 1); }
+    return mix(mix(texelFetch(u_tex, i0, l), texelFetch(u_tex, ivec2(i1.x, i0.y), l), f.x),
+               mix(texelFetch(u_tex, ivec2(i0.x, i1.y), l), texelFetch(u_tex, i1, l), f.x), f.y);
 }
 int sel(uint m, int s, int d) { return m == 0u ? s : m == 1u ? d : 0; }
 
@@ -67,6 +77,27 @@ void main() {
         }
         uv *= pc.tex.z;
         ivec4 t;
+        /* Minified textures (more than one texel per fragment along some screen
+         * direction): the GS samples four texels and skips the rest, which
+         * crawls when anything moves. F_MIP: the footprint is covered instead,
+         * up to four trilinear samples along its long axis from the mip levels
+         * that fit its short axis. Magnified texels take the usual path below. */
+        vec2 gx = dFdx(uv), gy = dFdy(uv);
+        float px = dot(gx, gx), py = dot(gy, gy), pmax = max(px, py);
+        if ((pc.flags & F_MIP) != 0u && pmax > 1.0) {
+            float pmin = max(min(px, py), 1.0e-6);
+            float n = clamp(ceil(sqrt(pmax / pmin)), 1.0, 4.0);
+            float lod = clamp(0.5 * log2(pmax / (n * n)), 0.0, float(textureQueryLevels(u_tex) - 1));
+            int l0 = int(lod), l1 = min(l0 + 1, textureQueryLevels(u_tex) - 1);
+            vec2 axis = px > py ? gx : gy;
+            vec4 s = vec4(0.0);
+            for (float k = 0.0; k < n; k += 1.0) {
+                vec2 q = uv + axis * ((k + 0.5) / n - 0.5);
+                s += mix(texl(q, l0), texl(q, l1), lod - float(l0));
+            }
+            t = ivec4(s / n * 255.0 + 0.5);
+            if ((pc.flags & F_TEX24) != 0u) t.a = int(pc.zp.z);
+        } else
         if ((pc.flags & F_BILIN) == 0u) t = texel(ivec2(floor(uv)));
         else {
             uv -= 0.5;

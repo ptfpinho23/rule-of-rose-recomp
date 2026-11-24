@@ -1536,6 +1536,8 @@ static void dump_prim(const DState *st, int type) {
 static void submit1(int type);
 static int film_grain = 100;         /* --film-grain 0..100: strength of the game's film grain, 100 = as the game draws it */
 void gs_film_grain(int pct) { film_grain = pct < 0 ? 0 : pct > 100 ? 100 : pct; }
+static int want_texfilter = -1;      /* --texture-filter: 0 original, 1 smooth, -1 auto (smooth on a discrete graphics card from --internal 2) */
+void gs_texture_filter(int mode) { want_texfilter = mode; }
 /* Widescreen (rt/wide.c): while widened 3D is being drawn, everything that
  * does not come from VU1 (PATH2/PATH3: captions, text, HUD, 2D backgrounds)
  * and goes into a display buffer is squeezed around the screen centre by
@@ -3728,6 +3730,8 @@ void gs_init(void) {
 #ifdef GS_HW
     {   const char *e = getenv("ROR_GS_HW");        /* replay tool: internal resolution scale; unset or 0: software */
         if (e && atoi(e) > 0) gs_renderer(1, atoi(e));
+        e = getenv("ROR_HW_TEXFILTER");               /* replay tool: original | smooth (as --texture-filter) */
+        if (e) want_texfilter = !strcmp(e, "smooth") ? 1 : !strcmp(e, "original") ? 0 : -1;
         if (want_gpu) {
             hw_scale = want_internal;
             hw_shblend = getenv("ROR_HW_SHBLEND") != 0;
@@ -3736,7 +3740,14 @@ void gs_init(void) {
             if (getenv("ROR_HW_INTERP")) sscanf(getenv("ROR_HW_INTERP"), "%d,%d,%d", &hw_interp_n, &hw_interp_first, &hw_interp_count);
             if (want_fsr3) hw_fsr3_want();
             if (getenv("ROR_FSR3_OVL")) hwf_ovl_scale = atoi(getenv("ROR_FSR3_OVL"));
-            if (hw_start(hw_scale)) { hw_on = 1; rt_log("[gs] hardware renderer on %s, %dx\n", hw_device_name(), hw_scale); if (want_fsr3) hw_fsr3 = hw_fsr3_init(); }
+            if (hw_start(hw_scale)) {
+                /* auto: where the picture gains (from 2x) and the extra texture reads cost nothing measurable (a discrete card;
+                 * +18% frame time on a software driver, so not on integrated graphics unless asked for) */
+                int smooth = want_texfilter < 0 ? hw_scale >= 2 && hw_device_discrete() : want_texfilter;
+                hw_on = 1; hw_tex_filter(smooth);
+                rt_log("[gs] hardware renderer on %s, %dx, texture filter %s\n", hw_device_name(), hw_scale, smooth ? "smooth" : "original");
+                if (want_fsr3) hw_fsr3 = hw_fsr3_init();
+            }
             else rt_log("[gs] GPU renderer not available (no Vulkan 1.3 device with the needed features): using the software renderer\n");
         }
     }

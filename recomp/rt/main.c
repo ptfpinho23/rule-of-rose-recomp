@@ -49,6 +49,7 @@ static void usage(const char *prog) {
         "          [--renderer software|gpu] [--internal 1-8] [--vsync 0|1] [--fps 0|display|25-1000]\n"
         "          [--wide off|16:9|21:9|32:9|W:H|ratio]   (widescreen 3D; ratio 1.0-3.6, 4:3 = off)\n"
         "          [--film-grain 0-100]   (the game's film grain; 100 = original, 0 = off)\n"
+        "          [--texture-filter auto|original|smooth]   (GPU renderer: smooth filters distant textures; auto = smooth from --internal 2 on a discrete graphics card)\n"
         "          [--pad auto|off|xinput|playstation] [--pad-deadzone 0-90]   (gamepad; stick dead zone in percent, default 24)\n"
         "          [--no-window] [--no-sync] [--frames N] [--shots N] [--post-shots] [--script s] [--elf path] [--interp] [-v]\n", prog);
 }
@@ -81,6 +82,11 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--wide") && i + 1 < argc) {
             int wide_set(const char *v);
             if (!wide_set(argv[++i])) { fprintf(stderr, "%s: bad value for --wide: %s\n", argv[0], argv[i]); usage(argv[0]); return 2; }
+        }
+        else if (!strcmp(argv[i], "--texture-filter") && i + 1 < argc) {
+            void gs_texture_filter(int mode); const char *v = argv[++i];
+            if (!strcmp(v, "original")) gs_texture_filter(0); else if (!strcmp(v, "smooth")) gs_texture_filter(1); else if (!strcmp(v, "auto")) gs_texture_filter(-1);
+            else { fprintf(stderr, "%s: bad value for --texture-filter: %s\n", argv[0], v); usage(argv[0]); return 2; }
         }
         else if (!strcmp(argv[i], "--film-grain") && i + 1 < argc) {
             char *e; long n = strtol(argv[++i], &e, 10);

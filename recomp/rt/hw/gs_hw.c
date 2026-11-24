@@ -70,7 +70,7 @@ static void *lib_sym(void *l, const char *n) { return dlsym(l, n); }
 VKFN(X) VKDFN(X)
 #undef X
 
-typedef struct { VkImage img; VkDeviceMemory mem; VkImageView view; VkImageLayout layout; VkDescriptorSet set, set_lin; int w, h, depth; } Img;
+typedef struct { VkImage img; VkDeviceMemory mem; VkImageView view; VkImageLayout layout; VkDescriptorSet set, set_lin; int w, h, depth, levels; } Img;   /* levels: mip levels (textures of --texture-filter smooth), else 1 */
 #define HW_SLOTS 4
 typedef struct { Img col, copy, up, sv[HW_SLOTS], fin[HW_SLOTS]; int w, h; uint64_t ver, copy_ver; int n, mv; } Rt;        /* w, h native; col/copy at device size (n = its scale: N except the FSR 3.1 2D layer), up native; mv: motion-vector target */
 typedef struct { float rt[4]; uint32_t flags; int32_t aref; uint32_t fogcol, blend; int32_t region[4]; float tex[4], zp[4]; uint32_t fbmsk; } PushC;
@@ -136,18 +136,19 @@ static void to_layout(Img *im, VkImageLayout nl) {       /* outside rendering on
     b.oldLayout = im->layout; b.newLayout = nl;
     b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     b.image = im->img;
-    b.subresourceRange = (VkImageSubresourceRange){ im->depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    b.subresourceRange = (VkImageSubresourceRange){ im->depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, 0, (uint32_t)(im->levels > 1 ? im->levels : 1), 0, 1 };
     vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, 0, 0, 0, 1, &b);
     im->layout = nl;
 }
+static int img_levels = 1;                       /* mip levels of the next img_create (hw_tex_create sets and resets it) */
 static void img_create(Img *im, int w, int h, int depth, int sampled) {
     memset(im, 0, sizeof *im);
-    im->w = w; im->h = h; im->depth = depth;
+    im->w = w; im->h = h; im->depth = depth; im->levels = img_levels;
     VkImageCreateInfo ci = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
     int f16 = depth == 2;                         /* 2: half-float colour (presentation stage) */
     if (f16) { depth = 0; im->depth = 0; }
     ci.imageType = VK_IMAGE_TYPE_2D; ci.format = depth ? VK_FORMAT_D32_SFLOAT : f16 ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
-    ci.extent = (VkExtent3D){ (uint32_t)w, (uint32_t)h, 1 }; ci.mipLevels = 1; ci.arrayLayers = 1; ci.samples = VK_SAMPLE_COUNT_1_BIT;
+    ci.extent = (VkExtent3D){ (uint32_t)w, (uint32_t)h, 1 }; ci.mipLevels = (uint32_t)img_levels; ci.arrayLayers = 1; ci.samples = VK_SAMPLE_COUNT_1_BIT;
     ci.tiling = VK_IMAGE_TILING_OPTIMAL;
     ci.usage = depth ? (VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT)
                      : (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
@@ -159,7 +160,7 @@ static void img_create(Img *im, int w, int h, int depth, int sampled) {
     CHECK(vkBindImageMemory(dev, im->img, im->mem, 0));
     VkImageViewCreateInfo vi = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
     vi.image = im->img; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = ci.format;
-    vi.subresourceRange = (VkImageSubresourceRange){ depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    vi.subresourceRange = (VkImageSubresourceRange){ depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, 0, (uint32_t)img_levels, 0, 1 };
     CHECK(vkCreateImageView(dev, &vi, 0, &im->view));
     im->layout = VK_IMAGE_LAYOUT_UNDEFINED;
     if (sampled) {
@@ -269,7 +270,9 @@ static VkPipeline pipeline_new(uint32_t key) {
     return p;
 }
 
+static int dev_discrete;
 const char *hw_device_name(void) { return devname; }
+int hw_device_discrete(void) { return dev_discrete; }
 /* Per-thread recording state: called by hw_start for the game thread and by
  * any other thread before it uses the layer. */
 void hw_thread_init(void) {
@@ -316,7 +319,7 @@ int hw_start(int scale) {
         VkPhysicalDeviceFeatures2 f2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f13 };
         vkGetPhysicalDeviceFeatures2(pd[i], &f2);
         if (!f2.features.dualSrcBlend || !f13.dynamicRendering) continue;
-        if (want >= 0 ? (int)i == want : (best < 0 || p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU)) { best = (int)i; snprintf(devname, sizeof devname, "%s", p.deviceName); }
+        if (want >= 0 ? (int)i == want : (best < 0 || p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU)) { best = (int)i; snprintf(devname, sizeof devname, "%s", p.deviceName); dev_discrete = p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU; }
     }
     if (best < 0) return 0;
     phys = pd[best];
@@ -846,7 +849,7 @@ static void present_draw(Rt *r, VkImageView view, int tw, int th, int fmtsel, in
     if (filter == 3) filter = 2;
     int bloom = pr_bloom > 0, chain = r && dw > 0 && dh > 0 && (filter == 2 || bloom);
     if (!chain) {
-        ppass(view, tw, th, fmtsel, 1, dx, dy, dw, dh, r ? (filter ? r->col.set_lin : r->col.set) : VK_NULL_HANDLE, lut_on ? lut_img.set : VK_NULL_HANDLE,
+        ppass(view, tw, th, fmtsel, 1, dx, dy, dw, dh, r ? r->col.set_lin : VK_NULL_HANDLE, lut_on ? lut_img.set : VK_NULL_HANDLE,
               src, dst, filter != 0, lut_on, sat64, 0, 0.0f);
         return;
     }
@@ -858,7 +861,7 @@ static void present_draw(Rt *r, VkImageView view, int tw, int th, int fmtsel, in
         ppass(st_b.view, dw, dh, 1, 0, 0, 0, dw, dh, up->set, lut_on ? lut_img.set : VK_NULL_HANDLE, full, full, 0, lut_on, sat64, 2, 0.0f);
     } else {
     to_layout(&st_a, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-    ppass(st_a.view, dw, dh, 2, 0, 0, 0, dw, dh, mode == 0 || mode == 2 ? r->col.set : r->col.set_lin, VK_NULL_HANDLE, src, full, mode, 0, 64, 1, 0.0f);
+    ppass(st_a.view, dw, dh, 2, 0, 0, 0, dw, dh, mode == 2 ? r->col.set : r->col.set_lin, VK_NULL_HANDLE, src, full, mode, 0, 64, 1, 0.0f);
     to_layout(&st_a, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL); to_layout(&st_b, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     ppass(st_b.view, dw, dh, 1, 0, 0, 0, dw, dh, st_a.set, lut_on ? lut_img.set : VK_NULL_HANDLE, full, full, 0, lut_on, sat64, 2, filter == 2 ? pr_rcas : 0.0f);
     }
@@ -1201,6 +1204,8 @@ const uint32_t *hw_grab_result(int *w, int *h, int *bgra) {
     grab_want = 0; *w = grab_w; *h = grab_h; *bgra = swfmt == VK_FORMAT_B8G8R8A8_UNORM || swfmt == VK_FORMAT_B8G8R8A8_SRGB;
     return (const uint32_t *)(rmap + grab_at);
 }
+static int tex_smooth;
+void hw_tex_filter(int smooth) { tex_smooth = smooth; }
 int hw_tex_create(int w, int h, const uint32_t *rgba) {
     int id = -1;
     for (int i = 0; i < MAX_TEX; i++) if (!tex_used[i]) { id = i; break; }
@@ -1208,8 +1213,41 @@ int hw_tex_create(int w, int h, const uint32_t *rgba) {
     if (id < 0) die("too many textures", 0);
     emit_batch();
     tex_used[id] = 1;
+    if (tex_smooth) { int m = w > h ? w : h; img_levels = 1; while (m > 1) { m >>= 1; img_levels++; } }
     img_create(&texs[id], w, h, 0, 1);
+    img_levels = 1;
     upload_img(&texs[id], 0, 0, w, h, rgba);
+    if (texs[id].levels > 1) {
+        /* Mip levels: 2x2 means made here. Colour is weighted by alpha, so that
+         * the colour stored under transparent texels (often black) does not
+         * darken the edges of cut-out shapes; alpha itself is the plain mean
+         * (coverage). Textures whose alpha is the same everywhere get plain
+         * means. */
+        static TL uint32_t *mb; static TL size_t mcap;
+        size_t need = (size_t)w * (size_t)h + 16;
+        if (mcap < need) { mcap = need; free(mb); mb = malloc(mcap * 4); }
+        const uint32_t *src = rgba; uint32_t *dstp = mb; int sw = w, sh = h;
+        for (int l = 1; l < texs[id].levels; l++) {
+            int dw = sw > 1 ? sw / 2 : 1, dh = sh > 1 ? sh / 2 : 1, ix = sw > 1, iy = sh > 1;
+            for (int y = 0; y < dh; y++) for (int x = 0; x < dw; x++) {
+                const uint32_t p[4] = { src[(size_t)(2 * y) * sw + 2 * x], src[(size_t)(2 * y) * sw + 2 * x + ix], src[(size_t)(2 * y + iy) * sw + 2 * x], src[(size_t)(2 * y + iy) * sw + 2 * x + ix] };
+                uint32_t a = (p[0] >> 24) + (p[1] >> 24) + (p[2] >> 24) + (p[3] >> 24), o = ((a + 2) >> 2) << 24;
+                for (int c = 0; c < 24; c += 8) {
+                    uint32_t v = a ? (((p[0] >> c) & 255) * (p[0] >> 24) + ((p[1] >> c) & 255) * (p[1] >> 24) + ((p[2] >> c) & 255) * (p[2] >> 24) + ((p[3] >> c) & 255) * (p[3] >> 24) + a / 2) / a
+                                   : (((p[0] >> c) & 255) + ((p[1] >> c) & 255) + ((p[2] >> c) & 255) + ((p[3] >> c) & 255) + 2) >> 2;
+                    o |= v << c;
+                }
+                dstp[(size_t)y * dw + x] = o;
+            }
+            size_t bytes = (size_t)dw * (size_t)dh * 4;
+            need_staging(bytes); begin_cb();
+            memcpy(smap + soff, dstp, bytes);
+            VkBufferImageCopy bc = { soff, 0, 0, { VK_IMAGE_ASPECT_COLOR_BIT, (uint32_t)l, 0, 1 }, { 0, 0, 0 }, { (uint32_t)dw, (uint32_t)dh, 1 } };
+            vkCmdCopyBufferToImage(cb, sbuf, texs[id].img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bc);
+            soff += (bytes + 15) & ~(size_t)15;
+            src = dstp; dstp += (size_t)dw * dh; sw = dw; sh = dh;
+        }
+    }
     to_layout(&texs[id], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     return id;
 }
@@ -1247,7 +1285,9 @@ static void draw_range(const HwState *s, size_t first, int count, int passmode, 
     vkCmdSetBlendConstants(cb, bc);
     PushC pc; memset(&pc, 0, sizeof pc);
     pc.rt[0] = 2.0f / (float)r->col.w; pc.rt[1] = 2.0f / (float)r->col.h; pc.rt[2] = (float)N; pc.rt[3] = (0.5f - 0.5f * (float)N) * uv_shift_k();
-    pc.flags = s->flags | ((uint32_t)passmode << HWF_PASS_SHIFT); pc.aref = s->aref; pc.fogcol = s->fogcol; pc.blend = s->blend;
+    pc.flags = s->flags | ((uint32_t)passmode << HWF_PASS_SHIFT); pc.aref = s->aref;
+    /* --texture-filter smooth: textures the game filters bilinearly, on triangles with perspective coordinates, repeating or clamped to the whole texture */
+    if (tex && tex->levels > 1 && s->tex_kind == 1 && (s->flags & (HWF_BILIN | HWF_SPRITE | HWF_TEXEL)) == HWF_BILIN && ((s->flags >> HWF_WMS_SHIFT) & 3) < 2 && ((s->flags >> HWF_WMT_SHIFT) & 3) < 2) pc.flags |= HWF_MIP; pc.fogcol = s->fogcol; pc.blend = s->blend;
     memcpy(pc.region, s->region, sizeof pc.region);
     pc.tex[0] = s->texw; pc.tex[1] = s->texh; pc.tex[2] = s->tex_kind == 2 ? (float)rts[s->tex].n : 1.0f;
     pc.zp[0] = s->zscale; pc.zp[1] = s->zmax; pc.zp[2] = s->ta0;
