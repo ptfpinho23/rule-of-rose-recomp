@@ -341,11 +341,12 @@ QWidget *MainWindow::buildOptions()
     // contradictory combination is saved.
     // Fresh-install defaults, from what this machine has (a saved choice
     // always wins): a graphics card gets the GPU renderer - at 4x for a
-    // separate card, 2x for graphics built into the processor - and anything
-    // else the software renderer.
+    // separate card, 1x for graphics built into the processor (those run out
+    // of fill rate above 1x: an Intel UHD 620 reached 48 pictures a second
+    // at 1x and 16 at 2x) - and anything else the software renderer.
     const bool realGpu = g_gpu.kind == GpuInfo::Discrete || g_gpu.kind == GpuInfo::Integrated;
     const QString rendererDefault = realGpu ? "gpu" : "software";
-    const int internalDefault = g_gpu.kind == GpuInfo::Integrated ? 2 : 4;
+    const int internalDefault = g_gpu.kind == GpuInfo::Integrated ? 1 : 4;
     bool gpuSaved = s.value("video/renderer", rendererDefault).toString() == "gpu";
     QString fpsSaved = s.value("video/fps", "0").toString();
     if (!gpuSaved && fpsSaved != "0") {
