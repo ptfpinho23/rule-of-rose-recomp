@@ -95,11 +95,19 @@ jobs:
             build/release/SHA256SUMS.txt
           if-no-files-found: error
 
+      - name: Release notes (this version's section of CHANGELOG.md)
+        if: github.ref_type == 'tag'
+        run: |
+          v="${{ steps.version.outputs.version }}"
+          awk -v v="## $v" '$0 == v { on = 1; next } /^## / { on = 0 } on' CHANGELOG.md > build/release/notes.md
+          [ -s build/release/notes.md ] || echo "Release $v" > build/release/notes.md
+          cat build/release/notes.md
+
       - name: Publish the release
         if: github.ref_type == 'tag'
         uses: softprops/action-gh-release@v2
         with:
-          generate_release_notes: true
+          body_path: build/release/notes.md
           files: |
             build/release/RuleOfRose-*.tar.gz
             build/release/RuleOfRose-*.zip

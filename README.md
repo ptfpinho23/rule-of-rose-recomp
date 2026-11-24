@@ -59,7 +59,8 @@ and gamepad layout is on the launcher's Controls screen and in
   can fill in the frames in between, up to your monitor's refresh rate.
 - **Widescreen.** 16:9, 21:9 and 32:9, showing more of the scene to the sides
   instead of stretching it.
-- **Upscaling.** AMD FSR 1.0, and FSR 3.1 on Windows.
+- **Upscaling.** AMD FSR 1.0, and on Windows FSR 3.1 and NVIDIA DLSS (you add
+  NVIDIA's files yourself, see [docs/OPTIONS.md](docs/OPTIONS.md)).
 - **Picture settings.** Brightness, contrast, gamma, saturation, bloom, and
   how strong the game's film grain is.
 - **Controllers.** Keyboard, Xbox pads, DualShock 4 and DualSense.
@@ -69,12 +70,12 @@ and gamepad layout is on the launcher's Controls screen and in
 
 - **Playing further.** Only the opening and the first area have been played;
   later areas, combat and saving at a save point come next.
-- **DLSS.** NVIDIA's upscaler as another choice beside FSR 1.0 and FSR 3.1.
+- **Frame generation.** FSR and DLSS frame generation on top of the upscalers.
 - **More graphics cards.** The high-resolution renderer has been tried on one
   card so far (RTX 3090); AMD and Intel cards and Linux Vulkan drivers are
   still to be checked.
-- **Controllers.** Xbox and PlayStation pads are supported but have not been
-  tried with real hardware yet.
+- **Controllers.** A DualSense has been played with; Xbox pads and the
+  DualShock 4 still need trying on real hardware.
 - **Sound.** Reverb, and a comparison with a real console.
 - **Widescreen** beyond the first area.
 
