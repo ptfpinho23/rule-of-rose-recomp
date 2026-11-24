@@ -33,7 +33,8 @@ void video_script(const char *s) {
 static int win_scale = 2, res_w, res_h, want_fullscreen, post_shots;
 static int want_gpu, gpu_internal = 4, gpu_vsync = 1, gpu_swap;      /* --renderer gpu, --internal, --vsync; gpu_swap: presenting through the swapchain */
 static int gpu_fps, gpu_interp;          /* --fps: 0 off, -1 display rate, N; gpu_interp: the presenter thread is running */
-static int want_fsr3;                    /* --filter fsr3: FSR 3.1 temporal upscaling on the GPU renderer; everywhere else it is --filter fsr */
+static int want_fsr3;                    /* --filter fsr3 (1) / dlss (2): temporal upscaling on the GPU renderer, FSR 3.1 or DLSS; everywhere else it is --filter fsr */
+static int want_fg;                      /* --framegen fsr (1) / dlss (2): frame generation on the GPU renderer */
 static u64 pace_next;                    /* ideal time of the next emulated vblank (50 Hz pacing clock) */
 /* --frameskip auto|off. auto: while the game runs behind its 50 Hz clock in a window, the renderer leaves out
  * whole frames (gs_frameskip) so that game speed and sound stay right and only the picture rate drops.
@@ -82,7 +83,11 @@ int video_option(const char *name, const char *value) {
         if (!value || strlen(value) != 1 || value[0] < '1' || value[0] > '4') return 0;
         win_scale = value[0] - '0'; return 1;
     }
-    if (!strcmp(name, "filter")) { want_fsr3 = value && !strcmp(value, "fsr3"); if (want_fsr3) value = "fsr"; }
+    if (!strcmp(name, "filter")) { want_fsr3 = value && !strcmp(value, "fsr3") ? 1 : value && !strcmp(value, "dlss") ? 2 : 0; if (want_fsr3) value = "fsr"; }
+    if (!strcmp(name, "framegen")) {
+        if (value && !strcmp(value, "off")) want_fg = 0; else if (value && !strcmp(value, "fsr")) want_fg = 1; else if (value && !strcmp(value, "dlss")) want_fg = 2; else return 0;
+        return 1;
+    }
     return post_set(&post_cfg, name, value);
 }
 /* GPU path: scaling filter number for gs_hw_show (also hands over sharpness and bloom). */
@@ -127,8 +132,10 @@ static int post_frame(const u32 *px, int w, int h, int ow, int oh) {
 void video_config(int window, int shots, int frames, int nosync) {
     want_window = window; shot_every = shots; max_frames = frames; no_sync = nosync;
     gs_renderer(want_gpu, gpu_internal);        /* takes effect in gs_init (hw_init, called next) */
-    gs_fsr3(want_gpu && want_fsr3);
-    if (want_fsr3 && !want_gpu) rt_log("[video] --filter fsr3 (FSR 3.1) needs --renderer gpu: using FSR 1.0\n");
+    gs_fsr3(want_gpu ? want_fsr3 : 0);
+    gs_framegen(want_gpu ? want_fg : 0);
+    if (want_fsr3 && !want_gpu) rt_log("[video] --filter %s needs --renderer gpu: using FSR 1.0\n", want_fsr3 == 2 ? "dlss (DLSS)" : "fsr3 (FSR 3.1)");
+    if (want_fg && !want_gpu) rt_log("[video] --framegen needs --renderer gpu: frame generation off\n");
     if (wide_aspect() > 0) rt_log("[video] widescreen: 3D scenes are rendered and shown at %.3f:1; movies and menus stay 4:3\n", wide_aspect());
     audio_init(!nosync);
 }
@@ -195,7 +202,8 @@ void save_png(const char *path, const u32 *px, int w, int h) {
 extern int g_perf_on; extern u64 g_perf[12]; extern u32 g_perf_hist[258]; extern u64 g_perf_pres_max;
 extern int g_vu_stat; extern u64 g_vu_stat_ticks[5];
 extern u64 hw_stat_wait_ns __attribute__((weak));
-typedef struct { u64 n, late, slip, maxi, ns, vu, gs1, tex, pair, gpu, gpu_show, gpu_pair, show, sleep, texn, pres, o8, o16, pmax, fr[7], starved; double amin; u32 hist[258]; } PerfAcc;
+#include "vinterp.h"
+typedef struct { u64 n, late, slip, maxi, ns, vu, gs1, tex, pair, gpu, gpu_show, gpu_pair, show, sleep, texn, pres, o8, o16, pmax, fr[7], starved, vi[VIS_N]; double amin; u32 hist[258]; } PerfAcc;
 static int perf_sites[16];
 static PerfAcc perf_sec, perf_all; static double perf_tick_ns; static u64 perf_show_ns, perf_sleep_ns, perf_show_gpu, perf_slip; static int perf_paced; static double perf_audio = 60.0;
 static double perf_pct(const u32 *h, u64 n, double q) { u64 want = (u64)((double)n * q), c = 0; for (int i = 0; i < 258; i++) { c += h[i]; if (c > want) return (i + 0.5) * 0.25; } return 0; }
@@ -213,6 +221,20 @@ static void perf_line(const char *tag, const PerfAcc *a, double secs) {
            secs > 0 ? (double)a->pres / secs : 0.0, perf_pct(a->hist, a->pres, 0.5), perf_pct(a->hist, a->pres, 0.95), perf_pct(a->hist, a->pres, 0.99), a->pmax / 1e6,
            (unsigned long long)a->o8, (unsigned long long)a->o16, (unsigned long long)a->fr[0], (unsigned long long)a->fr[1], (unsigned long long)a->fr[2],
            (unsigned long long)a->fr[4], (unsigned long long)a->fr[5], (unsigned long long)a->fr[6], (unsigned long long)a->fr[3], a->amin, (unsigned long long)a->starved);
+    /* --interp auto|inputs (rt/vinterp.c). frames: game frames with VU1 work; used: previous positions taken from the VU1 inputs; cut: camera
+     * cuts (real frames only); fallback: frames paired the old way as a whole (no previous frame, other micro program: prog, recording
+     * incomplete). runs: VU1 program starts, how many gave their vertices exact previous positions, and why the others did not (no partner
+     * in the previous frame, other vertex structure, other texture coordinates). prims: VU1 triangles, and those placed by the inputs
+     * (jump: refused, moved half a picture; new: behind the camera, turned over or of another size in the previous frame; clip: fans from the program's clipper). keys: passes of the VU1 program at key times, mean ms each on a worker thread, runs of those
+     * passes that kept the structure of the real frame, passes left out because the workers were behind; match: ms per game frame on the game thread. */
+    if (a->vi[VIS_FRAMES]) rt_log("[perf] %s inputs: frames %llu used %llu cut %llu fallback %llu (prog %llu) | runs %llu ok %.2f%% nopartner %llu struct %llu uv %llu | prims %llu ok %.2f%% jump %llu new %llu clip %llu"
+           " | keys %llu %.2f ms runs ok %.2f%% dropped %llu | match %.2f ms\n", tag, (unsigned long long)a->vi[VIS_FRAMES], (unsigned long long)a->vi[VIS_USED], (unsigned long long)a->vi[VIS_CUT],
+           (unsigned long long)a->vi[VIS_FALLBACK], (unsigned long long)a->vi[VIS_UNKNOWN], (unsigned long long)a->vi[VIS_RUNS], a->vi[VIS_RUNS] ? 100.0 * (double)a->vi[VIS_RUNS_OK] / (double)a->vi[VIS_RUNS] : 0.0,
+           (unsigned long long)a->vi[VIS_RUNS_NOPARTNER], (unsigned long long)a->vi[VIS_RUNS_STRUCT], (unsigned long long)a->vi[VIS_RUNS_UV],
+           (unsigned long long)a->vi[VIS_PRIMS], a->vi[VIS_PRIMS] ? 100.0 * (double)a->vi[VIS_PRIMS_OK] / (double)a->vi[VIS_PRIMS] : 0.0, (unsigned long long)a->vi[VIS_RUNS_JUMP], (unsigned long long)a->vi[VIS_PRIMS_NEW], (unsigned long long)a->vi[VIS_PRIMS_CLIP],
+           (unsigned long long)a->vi[VIS_PASSES], a->vi[VIS_PASSES] ? (double)a->vi[VIS_PASS_NS] / 1e6 / (double)a->vi[VIS_PASSES] : 0.0,
+           a->vi[VIS_KEYRUNS] ? 100.0 * (double)a->vi[VIS_KEYRUNS_OK] / (double)a->vi[VIS_KEYRUNS] : 0.0, (unsigned long long)a->vi[VIS_PASS_DROPPED],
+           a->vi[VIS_FRAMES] ? (double)a->vi[VIS_MATCH_NS] / 1e6 / (double)a->vi[VIS_FRAMES] : 0.0);
 }
 static void perf_exit(void) { if (perf_all.n) perf_line("total", &perf_all, (double)perf_all.ns / 1e9); }
 static void perf_tick(void) {
@@ -245,6 +267,7 @@ static void perf_tick(void) {
     if (a->n < 50) return;
     for (int i = 0; i < 258; i++) { u32 c = g_perf_hist[i]; g_perf_hist[i] = 0; a->hist[i] = c; a->pres += c; if (i >= 34) a->o8 += c; if (i >= 67) a->o16 += c; }
     a->pmax = g_perf_pres_max; g_perf_pres_max = 0;
+    for (int i = 0; i < VIS_N; i++) a->vi[i] = __atomic_exchange_n(&g_vi_stat[i], 0, __ATOMIC_RELAXED);
     { char tag[32]; snprintf(tag, sizeof tag, "%llu", (unsigned long long)frame_no); perf_line(tag, a, (double)a->ns / 1e9); }
     if (g_perf_on > 1) { extern int hw_flush_sites[16], hw_flush_counts[16] __attribute__((weak)); char b[256]; int o = 0; b[0] = 0;
         if (&hw_flush_counts[0]) for (int i = 0; i < 16; i++) if (perf_sites[i]) { o += snprintf(b + o, sizeof b - (size_t)o, " %d:%d", hw_flush_sites[i], perf_sites[i]); perf_sites[i] = 0; }
@@ -254,6 +277,7 @@ static void perf_tick(void) {
     t->n += a->n; t->late += a->late; if (a->slip > t->slip) t->slip = a->slip; t->gpu_show += a->gpu_show; t->gpu_pair += a->gpu_pair; if (a->maxi > t->maxi) t->maxi = a->maxi; t->ns += a->ns; t->vu += a->vu; t->gs1 += a->gs1; t->tex += a->tex; t->pair += a->pair; t->gpu += a->gpu;
     t->show += a->show; t->sleep += a->sleep; t->texn += a->texn; t->pres += a->pres; t->o8 += a->o8; t->o16 += a->o16; if (a->pmax > t->pmax) t->pmax = a->pmax;
     for (int i = 0; i < 7; i++) t->fr[i] += a->fr[i];
+    for (int i = 0; i < VIS_N; i++) t->vi[i] += a->vi[i];
     for (int i = 0; i < 258; i++) t->hist[i] += a->hist[i];
     t->starved += a->starved; if (a->amin < t->amin) t->amin = a->amin;
     memset(a, 0, sizeof *a); a->amin = 100.0;
@@ -349,7 +373,9 @@ void video_present(void) {
             else { rt_log("[video] no display; running without a window\n"); want_window = 0; }
         }
         if (win_open) {
-            vwin_pump(&pad_buttons);
+            /* A scripted run takes nothing from the window: the keyboard would add to the script, and a window that loses
+             * the focus releases every held button (a second window opening is enough), which changes the game's course. */
+            { u16 scripted = pad_buttons; vwin_pump(&pad_buttons); if (script_n) pad_buttons = scripted; }
             /* A real gamepad is read only here: in a window, and not in a scripted run. */
             pad_update(frame_no, pad_buttons, script_n == 0);
             int ow = sw, oh = sh;

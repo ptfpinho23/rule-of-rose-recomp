@@ -35,7 +35,11 @@ int  gs_hw_active(void);                              /* 1 when the GPU renderer
  * filter number is then 3; where FSR 3.1 is not available (one log line says
  * why) 3 behaves as 2. Without a window, gs_hw_fsr3_rect tells every frame
  * where the picture goes in the output (the upscaler works across frames). */
-void gs_fsr3(int want);
+void gs_fsr3(int want);                    /* 0 no, 1 FSR 3.1, 2 DLSS (NVIDIA Streamline DLLs beside the program; then FSR 3.1, then FSR 1.0) */
+/* --framegen, before gs_init: 1 = AMD FSR 3 frame generation on the pictures of
+ * the temporal upscaler (AMD FidelityFX DLL), 2 = DLSS Frame Generation (only
+ * reported: see "DLSS" in hw/gs_hw.c). Where it cannot run: one log line, off. */
+void gs_framegen(int kind);
 void gs_hw_fsr3_rect(int dx, int dy, int dw, int dh, int ww, int wh);
 /* Presentation through a swapchain on the game window (a, b: Display* and
  * Window, or HINSTANCE and HWND). Returns 0 if that is not possible; the

@@ -16,6 +16,10 @@
  *     two builds (or one build with and without a code path, e.g.
  *     ROR_GS_NOSPRITE4=1) can be compared on state combinations the game never
  *     uses. The image hash depends on SEED.
+ * -res WxH -png DIR [-pngfrom N]: GPU renderer only: the presentation pass at that
+ *     output size, off screen, saved as DIR/out_NNNNN.png for every vblank from N on
+ *     (what --post-shots gives in the game). With it: -filter nearest|bilinear|fsr|
+ *     fsr3|dlss (default fsr), -sharp 0..100 (60), -fg fsr|dlss (--framegen).
  * frames.raw: per frame "u32 w, u32 h, w*h u32 pixels" (w = h = 0: display off).
  * Build/run with recomp/tools/gsreplay.sh. */
 #define _POSIX_C_SOURCE 200809L
@@ -171,6 +175,7 @@ static u64 fuzz_reg(u8 reg, u64 d) {
 }
 int main(int argc, char **argv) {
     const char *cap = 0, *out = 0; int loops = 1, max_frames = 0, coalesce = 0, fpsm = -1, zpsm = -1; u64 fuzz = 0;
+    const char *png_dir = 0; int res_w = 0, res_h = 0, png_from = 0, filter = 2, sharp = 60, tu = 0, fg = 0;
     static u8 cbuf[1u << 22];
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-o") && i + 1 < argc) out = argv[++i];
@@ -181,6 +186,16 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-fpsm") && i + 1 < argc) fpsm = (int)strtol(argv[++i], 0, 0);
         else if (!strcmp(argv[i], "-zpsm") && i + 1 < argc) zpsm = (int)strtol(argv[++i], 0, 0);
         else if (!strcmp(argv[i], "-fuzz") && i + 1 < argc) fuzz = strtoull(argv[++i], 0, 0) * 0x9E3779B97F4A7C15ull + 1;
+        else if (!strcmp(argv[i], "-res") && i + 1 < argc) sscanf(argv[++i], "%dx%d", &res_w, &res_h);
+        else if (!strcmp(argv[i], "-png") && i + 1 < argc) png_dir = argv[++i];
+        else if (!strcmp(argv[i], "-pngfrom") && i + 1 < argc) png_from = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-sharp") && i + 1 < argc) sharp = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-fg") && i + 1 < argc) { const char *v = argv[++i]; fg = !strcmp(v, "fsr") ? 1 : !strcmp(v, "dlss") ? 2 : 0; }
+        else if (!strcmp(argv[i], "-filter") && i + 1 < argc) {
+            const char *v = argv[++i];
+            filter = !strcmp(v, "nearest") ? 0 : !strcmp(v, "bilinear") ? 1 : 2;
+            tu = !strcmp(v, "fsr3") ? 1 : !strcmp(v, "dlss") ? 2 : 0; if (tu) filter = 3;
+        }
         else cap = argv[i];
     }
     if (!cap) { fprintf(stderr, "usage: gsreplay CAP [-o frames.raw] [-n loops] [-f frames]\n"); return 2; }
@@ -189,7 +204,14 @@ int main(int argc, char **argv) {
     char magic[8];
     if (fread(magic, 1, 8, f) != 8 || memcmp(magic, "GSCAP001", 8)) { fprintf(stderr, "%s: not a capture\n", cap); return 1; }
     _mm_setcsr(_mm_getcsr() | 0x8040);       /* FTZ | DAZ, as the game runs (main.c) */
+    gs_fsr3(tu);
+#ifndef GSREPLAY_NO_FRAMEGEN       /* (building against a gs.c from before --framegen, for comparisons) */
+    gs_framegen(fg);
+#endif
     gs_init();
+#ifdef GS_HW
+    if (res_w > 0 && hw_on) { gs_hw_present_opts(filter >= 2 && sharp > 0 ? exp2f(-(float)(100 - sharp) / 50.0f) : 0.0f, 0); gs_hw_fsr3_rect(0, 0, res_w, res_h, res_w, res_h); }
+#endif
     long snap_pos = ftell(f);
     if (!gs_snapshot(f, 0)) { fprintf(stderr, "%s: truncated snapshot\n", cap); return 1; }
     long ev_pos = ftell(f);
@@ -263,6 +285,17 @@ int main(int argc, char **argv) {
                 gs_vblank(start);
                 if (!start) continue;
                 u32 *px; int w = 0, h = 0;
+#ifdef GS_HW
+                if (res_w > 0 && hw_on) {              /* the picture as it would be presented */
+                    u32 *gp;
+                    gs_hw_fsr3_rect(0, 0, res_w, res_h, res_w, res_h);
+                    if (gs_hw_show_pixels(0, 0, res_w, res_h, res_w, res_h, filter, 0, 64, &gp) && png_dir && loop == 0 && frames >= png_from) {
+                        char path[600]; snprintf(path, sizeof path, "%s/out_%05d.png", png_dir, frames);
+                        save_png(path, gp, res_w, res_h);
+                    }
+                    w = h = 0; px = 0;
+                } else
+#endif
                 if (!gs_get_frame(&px, &w, &h)) w = h = 0;
                 double t1 = now_ms();
                 if (nt < 100000) times[nt++] = t1 - t0;

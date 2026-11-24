@@ -21,6 +21,7 @@
  * The vector operations themselves are shared with COP2 (vu_ops.h). */
 #include "vu.h"
 #include "gs.h"
+#include "vinterp.h"
 #include <stddef.h>
 #include <time.h>
 #include <emmintrin.h>
@@ -43,7 +44,10 @@ static __attribute__((noinline)) void vu_kick_timed(const u8 *mem, u32 addr, u32
     gif_write_path1(mem, addr, mask);
     g_vu_stat_ticks[1] += __builtin_ia32_rdtsc() - t0;
 }
-#define VU_KICK(mem, addr, mask) do { if (UNLIKELY(g_vu_stat)) vu_kick_timed(mem, addr, mask); else gif_write_path1(mem, addr, mask); } while (0)
+/* XGKICK. A VU that is not g_vu1 is a private instance of rt/vinterp.c's worker passes (struct VUW below): its
+ * packets go to that module, not to the GS. (In the generated code v is &g_vu1, a constant: the test folds away.) */
+#define VU_KICK(v, mem, addr, mask) do { if (UNLIKELY((v) != &g_vu1)) vu_w_kick(v, mem, addr, mask); else if (UNLIKELY(g_vu_stat)) vu_kick_timed(mem, addr, mask); else gif_write_path1(mem, addr, mask); } while (0)
+static void vu_w_kick(VU *v, const u8 *mem, u32 addr, u32 mask);
 void vu_stat_report(void) {            /* called by vif_write(1), outside its timed section */
     static u64 next, t_last, c_last; static double ns_per_tick;
     u64 plat_time_ns(void);         /* plat.h (the tools that include this file supply their own) */
@@ -79,7 +83,9 @@ void vu_init(void) {
 /* Micro memory of VU n was (or may have been) written. The predecoded records
  * validate themselves; the generated code is only used while micro memory is
  * the program it was generated from, which is re-established here. */
-void vu_micro_changed(int n) { if (n) vu1_image_state = 0; }
+static u64 vu1_gen;
+void vu_micro_changed(int n) { if (n) { vu1_image_state = 0; __atomic_fetch_add(&vu1_gen, 1, __ATOMIC_RELAXED); } }
+u64 vu1_micro_gen(void) { return __atomic_load_n(&vu1_gen, __ATOMIC_RELAXED); }
 
 /* Debug: ROR_VUDUMP=<frame> writes, for every VU1 program start in that
  * frame, <dir>/vu1_<k>.bin = registers + data memory + micro memory
@@ -377,7 +383,7 @@ static int exec_lower(int n, VU *v, Pipe *p, u32 w, u32 pc, u32 *target, int pr,
     case 104: VI_SET(v, it & 15, v->vi_top & 0x3FF); break;    /* XTOP */
     case 105: VI_SET(v, it & 15, v->vi_itop & (n ? 0x3FF : 0xFF)); break;   /* XITOP */
     case 108:                                           /* XGKICK */
-        if (n) VU_KICK(v->mem, (v->vi[is & 15] * 16) & v->mem_mask, v->mem_mask);
+        if (n) VU_KICK(v, v->mem, (v->vi[is & 15] * 16) & v->mem_mask, v->mem_mask);
         break;
     case 112: set_p(v, p, efu_sqsum(v, is), 11); break;                       /* ESADD */
     case 113: { float s = efu_sqsum(v, is); set_p(v, p, s != 0.0f ? 1.0f / s : 3.4028235e38f, 18); break; }
@@ -790,7 +796,7 @@ int do_lower(int n, VU *v, Pipe *p, FlagRegs *f, u8 *const mem, const u32 dmask,
     case L_MFIR: if (it) v_store(&v->vf[it], ldest, _mm_set1_epi32((s32)(s16)v->vi[is & 15])); return 0;
     case L_XTOP:  VI_SET(v, it & 15, v->vi_top & 0x3FF); return 0;
     case L_XITOP: VI_SET(v, it & 15, v->vi_itop & (n ? 0x3FF : 0xFF)); return 0;
-    case L_XGKICK: if (n) VU_KICK(mem, (v->vi[is & 15] * 16) & dmask, dmask); return 0;
+    case L_XGKICK: if (n) VU_KICK(v, mem, (v->vi[is & 15] * 16) & dmask, dmask); return 0;
     case L_SLOWF: status_sync(v, f);                 /* flag tests without a case above: they need MAC / status current */
         /* fall through */
     default:                                            /* everything else: the general decoder */
@@ -926,3 +932,91 @@ static void vu_exec1(int n, u32 addr) {
     v->pc = pc;
 }
 void vu0_callms(Ctx *c, u32 addr) { (void)c; vu_exec(0, addr); }
+
+/* ---- private VU1 instances (rt/vinterp.c: the frame's VU1 work again, on worker threads) --------
+ * Registers, pipeline state, data memory and predecoded records of their own; micro memory is the game's,
+ * read only (a pass is thrown away if vu1_micro_gen changed meanwhile). Interpreter only: the generated code
+ * is compiled for g_vu1's addresses. Nothing of the game thread's VU1 state is read or written. */
+struct VUW { VU vu; Pipe pipe; void *user; int fast; u8 mem[0x4000]; Rec recs[0x4000 / 8]; };
+static void vu_w_kick(VU *v, const u8 *mem, u32 addr, u32 mask) { if (vi_w_kick) vi_w_kick(((VUW *)v)->user, mem, addr, mask); }
+#if defined(VU_HAVE_FAST) && defined(VU_W_FAST)
+/* The generated code a second time, for these instances: the same file with the names of g_vu1's state replaced by
+ * the instance the caller passes (found from the pc pointer, the function's first argument). A program that does
+ * not end (possible with made-up inputs) leaves through the bail-out exit instead of stopping the game.
+ * Only with -DVU_W_FAST (EXTRA=-DVU_W_FAST for the build scripts): it doubles the time this file takes to compile
+ * (30 s -> 67 s), which every player-side build would pay, and the passes that use it are off by default
+ * (ROR_INTERP_KEYS). Without it a pass runs on the interpreter: 14 ms instead of 4.8 ms per pass on a Ryzen 9 7900X. */
+#define VU_W_HAVE_FAST 1
+typedef struct { u32 pc; VUW *w; } VUWCall;
+#define vu1_fast vu1_fast_w
+#define vu1_fast_image vu1_fast_image_w
+#define g_vu1 (((VUWCall *)(void *)ppc)->w->vu)
+#define vu_pipes (&((VUWCall *)(void *)ppc)->w->pipe - 1)
+#define vu1_mem (((VUW *)(void *)v)->mem)
+#define rt_fatal(...) goto bail
+#include "vu1_fast_gen.inc"
+#undef vu1_fast
+#undef vu1_fast_image
+#undef g_vu1
+#undef vu_pipes
+#undef vu1_mem
+#undef rt_fatal
+#endif
+VUW *vu_w_new(void *user) {
+    VUW *w = calloc(1, sizeof *w); w->user = user;
+    for (u32 i = 0; i < 0x4000 / 8; i++) predecode(&w->recs[i], 0, 0, i * 8);
+    return w;
+}
+VU *vu_w_vu(VUW *w) { return &w->vu; }
+size_t vu1_snap_size(void) { return sizeof(VU) + 0x4000; }
+void vu1_snap_save(void *dst) { memcpy(dst, &g_vu1, sizeof(VU)); memcpy((u8 *)dst + sizeof(VU), vu1_mem, 0x4000); }
+void vu_w_load(VUW *w, const void *snap) {
+    memcpy(&w->vu, snap, sizeof(VU)); memcpy(w->mem, (const u8 *)snap + sizeof(VU), 0x4000);
+    w->vu.mem = w->mem; w->vu.mem_mask = 0x3FFF; w->vu.micro = vu1_micro; w->vu.micro_mask = 0x3FFF;
+#ifdef VU_W_HAVE_FAST
+    w->fast = vu_use_fast && FLAG_LATENCY == 4 && !memcmp(vu1_micro, vu1_fast_image_w, sizeof vu1_micro);
+#endif
+}
+int vu1_program_known(void) {
+    static u64 gen = ~0ull; static int known;
+    if (gen != vu1_gen) {              /* the program this port knows the command interpreter of (the one tools/vubench.c has the entry table for) */
+        u64 h = 0x1234567;
+        for (u32 i = 0; i < 0x800; i++) { u64 w; memcpy(&w, vu1_micro + i * 8, 8); h = (h ^ w) * 0x9E3779B97F4A7C15ull; h ^= h >> 29; }
+        known = h == 0x208dc456c8f9e587ull; gen = vu1_gen;
+    }
+    return known;
+}
+void vu_w_exec(VUW *w, u32 addr) {
+    VU *v = &w->vu; Pipe *p = &w->pipe; Rec *recs = w->recs;
+    if (addr != 0xFFFFFFFFu) v->pc = addr;
+    u32 pc = v->pc & 0x3FFF & ~7u;
+    int ebit = 0, branch = 0; u32 branch_target = 0;
+    const int lat = (int)FLAG_LATENCY;
+    u8 *const mem = w->mem; const u32 dmask = 0x3FFF;
+    flags_clear(p); p->pend = 0; p->vi_wr_reg = 0;
+    u64 guard = VU_GUARD_MAX - 4000000;                    /* (a pass with made-up inputs must not be able to hang: it is cut short instead) */
+    for (; guard < VU_GUARD_MAX; guard++) {
+#ifdef VU_W_HAVE_FAST
+        if (w->fast && !branch && !ebit) {
+            VUWCall call = { pc, w };
+            int more = vu1_fast_w(&call.pc, &guard); pc = call.pc;
+            if (!more || guard >= VU_GUARD_MAX) break;
+        }
+#endif
+        Rec *r = &recs[pc >> 3];
+        u64 raw; memcpy(&raw, v->micro + pc, 8);
+        if (UNLIKELY(raw != r->raw)) predecode(r, (u32)raw, (u32)(raw >> 32), pc);
+        if (UNLIKELY(r->uk == U_BAD)) break;
+        int taken; u32 target = 0;
+        VU_STEP(1, v, p, &v->acc, &p->fr, POP_DYN, mem, dmask, lat, pc, r->raw, r->uk, r->usrc, r->ufs, r->uft, r->ubc, r->udst, r->udest, r->wr, r->mask16, r->scale,
+                r->lk, r->lit, r->lis, r->lid, r->ldest, r->fl, r->limm, r->ltarget, 1, taken, target);
+        u32 next = (pc + 8) & 0x3FFF;
+        if (branch) { next = branch_target & 0x3FFF & ~7u; branch = 0; }
+        if (taken) { branch = 1; branch_target = target; }
+        pc = next;
+        if (ebit) break;
+        if (r->fl & F_EBIT) ebit = 1;
+    }
+    flags_flush(v, p); q_land(v, p); p_land(v, p);
+    v->pc = pc;
+}

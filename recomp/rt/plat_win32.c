@@ -285,7 +285,7 @@ u64 plat_cpu_ns(void) {
  * ROR_NOPIN=1 leaves both to the system. */
 void plat_thread_role(int role) {
     if (getenv("ROR_NOPIN")) return;
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    if (role < 2) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
     SYSTEM_LOGICAL_PROCESSOR_INFORMATION info[256]; DWORD len = sizeof info; DWORD_PTR pm = 0, sm = 0;
     if (!GetLogicalProcessorInformation(info, &len) || !GetProcessAffinityMask(GetCurrentProcess(), &pm, &sm)) return;
     int first[64], n = 0;                         /* first usable logical processor of every core */
@@ -295,7 +295,7 @@ void plat_thread_role(int role) {
         for (int b = 0; b < 64; b++) if (m & ((DWORD_PTR)1 << b)) { first[n++] = b; break; }
     }
     if (n < 4) return;                            /* few cores: nothing to gain by choosing */
-    SetThreadIdealProcessor(GetCurrentThread(), (DWORD)first[role == 0 ? n / 2 : n / 2 + 1]);     /* away from the first cores, where the system's own work lands */
+    SetThreadIdealProcessor(GetCurrentThread(), (DWORD)first[(n / 2 + role) % n]);     /* away from the first cores, where the system's own work lands; helpers (2, 3, ...) on the cores after the two main threads */
 }
 void plat_sleep_until(u64 t_ns) {
     /* A high-resolution waitable timer where the system has one (Windows 10

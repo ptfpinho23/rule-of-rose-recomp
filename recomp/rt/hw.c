@@ -124,6 +124,7 @@ static u8 *vu_mem_ptr(u32 a) {
     if (o < 0x4000) return g_vu0.micro + (o & 0xFFF);
     if (o < 0x8000) return g_vu0.mem + (o & 0xFFF);
     if (o < 0xC000) { vu_micro_changed(1); return g_vu1.micro + (o & 0x3FFF); }   /* recheck the generated-code image */
+    { extern int g_vi_rec; void vi_note(int what) __attribute__((weak)); if (UNLIKELY(g_vi_rec)) vi_note(3); }   /* rt/vinterp.c: VU1 data touched outside VIF1 */
     return g_vu1.mem + (o & 0x3FFF);
 }
 

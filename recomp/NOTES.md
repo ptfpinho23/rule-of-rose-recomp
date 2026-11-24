@@ -31,7 +31,8 @@ game as MIPS32 and was not a valid translation).
 
 ## Verification
 
-- `ROR_TRACE=N build/recomp/ror` vs `... --interp`: both hash every call
+- `ROR_TRACE=N build/recomp/ror` vs `... --interp` (alone; `--interp auto|inputs|pairs` is the
+  frame interpolation method, see the last sections): both hash every call
   (target + all GPRs); identical hashes mean the generated control flow
   matches the interpreter. `ROR_TRACE_FROM/TO` print a window of calls.
 - Unhandled instructions fail the build (`UNHANDLED` in gen.py output).
@@ -360,7 +361,9 @@ In the game (video.c / main.c):
   `ROR_HW_STRIP=frame,count` + `ROR_HW_STRIP_DIR` (in-between pictures of two
   packages as PNGs), `ROR_HW_STATELOG=1`. `build/recomp/gscap/script_play.txt`
   is the standard script plus Cross every 400 frames and Up held from 21400
-  (player control from about 21300).
+  (player control from about 21300). (Since 2026-11-24 a scripted run ignores the
+  window's keyboard state: before, a window losing the focus released the
+  held buttons and changed the walk; see "Other things found on the way".)
 
 Measured in the game (private builds of 2026-11-22):
 - Software path: standard script to 16000, `--shots 1000`, `ROR_WAV`: 16 PNG +
@@ -1667,3 +1670,481 @@ interpreter; pad self-test all ok. Unthrottled, desktop: software 172-176 ->
 a window now follows the display (144) where it made 113-142. No
 ThreadSanitizer run: no script for it was delivered and the toolchain here
 has no sanitizer runtime.
+
+## Frame interpolation from the VU1 inputs (`--interp auto|inputs|pairs`) (2026-11-24)
+
+New module `rt/vinterp.c` (+ `vinterp.h`), hooks in `vif.c`, `vu.c`, `gs.c`,
+`hw.c`, `video.c`, `main.c`. It replaces the pairing of drawn primitives
+(section "Frame interpolation: validated pairs") as the first source of
+previous positions for `--fps` and for the motion vectors of `--filter fsr3`
+/ `dlss`; the pairing stays for what it does not cover. Based on a prototype
+(replay of a capture of everything the EE sends to VIF1 through the real
+vif.c / vu.c / gs.c); what is in the tree was written for the game and
+differs from it, see "How it differs from the prototype".
+
+### What the game sends (found by the prototype, used here)
+- VU1 runs one micro program (hash 208dc456c8f9e587, the one `vubench.c` has
+  the entry table for), a command interpreter: `MSCAL 0x08` executes the
+  command list at TOP, `MSCAL 0x40` one command. A command is a quadword
+  whose x is a handler address / 8: 0x190 (x, end, start) copies the rows
+  that follow to the globals start..end-1 (0x3d2..0x3ff), 0x11 (x, n) XGKICK
+  of the n quadwords that follow, 0x15 transform the position palette, 0x39 /
+  0xc8 lighting, 0x3dc / 0x3de indexed draw, 0x0a end. About 4,000 program
+  starts per game frame, all in the first of its two vblanks.
+- An object starts with the block (0x190, 0x3e1, 0x3d2) + 15 rows: model ->
+  world, its inverse, two 3x3 normal matrices, node pointers in w of rows 12
+  and 14. A camera is (0x190, 0x3ec, 0x3e2) + 10 rows: world -> screen, world
+  -> clip, scales, guard band; it is sent again about 130 times per frame; the
+  shadow camera is a second such block. Mesh streams (positions -> 0x1dc,
+  normals -> 0x22c, indices, colours, texture coordinates) are read by DMA in
+  place from model memory; parameter blocks and skinned vertices come from
+  two display-list buffers that alternate from frame to frame.
+
+### What the runtime does
+1. **Recording** (game thread; only with the GPU renderer and `--fps` or a
+   temporal upscaler, and not with `--interp pairs`). `vif.c command()` hands
+   every complete VIF1 command to `vi_rec` (code, destination, mask, cycle,
+   where its data was read from); every micro program start is a *run*
+   (`vi_run_begin` / `vi_run_end` around `start_micro`). `gs.c vertex_kick`
+   hands every vertex a run sends to the GS to `vi_vtx` (position with
+   XYOFFSET taken off, Z, fog, colour, S T Q, U V, primitive type and kick
+   flag) and keeps, beside the vertex queue, the index each queued vertex has
+   in that stream (`vq_vi`); a triangle recorded for the retained draw list
+   (`RPrim`) carries its run and its three stream indices. V4-32 commands
+   (parameter blocks) are copied; with key times on (below) every command's
+   data is copied, about 3 MB per frame.
+2. **Matching** at the frame boundary (`vi_boundary`, called from
+   `hwi_boundary`). A run's identity is a hash of its commands' structure
+   (code, destination relative to TOPS, mask, cycle, size) and of the source
+   address of every command whose address *both* frames read from (a bitmap
+   of source addresses per frame: model memory repeats, the alternating
+   display lists never do, so no address range has to be known). Objects
+   (object block to object block) are matched by node pointers + run
+   identities (nearest translation among equals), then by node pointers +
+   most runs shared, then objects made of the same runs in order of
+   occurrence (the third area has 715 objects of six runs each whose two
+   "pointer" words change every frame), then by most runs shared; the first
+   three look candidates up by hash, the last is given up beyond a work
+   limit. Runs of two matched objects pair by identity in order. A pair of runs is used when both sent the same
+   number of vertices with the same primitive types and PRIM writes (the kick
+   flag is left out: a triangle culled in one frame still has its vertices in
+   both); runs without any shared source address must also agree in every
+   vertex's texture coordinates.
+3. **Exact previous positions** (`hwi_boundary`). A triangle of a usable run
+   was made of the same three vertices of that run one frame earlier: its
+   previous positions, colours, fog and texture coordinates are read from
+   the previous frame's stream at the same offsets. Such primitives take no
+   part in the old pairing, nor do the previous frame's primitives of the
+   runs they came from. Refused, and left to the pairing: triangle fans (the
+   program's clipper sends the polygon left of a triangle cut by the view
+   volume as a fan whose corners are made per frame), triangles that turn
+   over or change their area more than four times, vertices in the picture in
+   both frames more than half a picture apart, and triangles the previous
+   frame did not draw unless they were in front of the camera and faced the
+   same way. The old pairing then runs on what is left (2D, fans, runs without
+   a partner or with another structure), and its shared-vertex step ("move
+   with the neighbours") starts from the exact positions, which outweigh any
+   number of pairs in the vote.
+4. **Cuts.** Real frames only when the main camera (the camera block sent
+   most often) turned more than 5 degrees or moved more than 100 units, when
+   fewer than 70 % of the runs found a partner, or when more than 30 % of the
+   placed vertices that are in the picture moved further than the pairing's
+   96 pixel limit (a cut the camera test cannot see).
+5. **Fallback, whole frame:** no previous frame, another micro program in VU1
+   memory (hash checked whenever micro memory may have changed), a micro
+   program upload or VIF1 reset inside the frame. Then everything is paired
+   the old way, as with `--interp pairs`. Per run and per primitive the
+   fallback is the old pairing as well; nothing is ever drawn from positions
+   the checks above did not accept.
+6. **Key times** (optional, `ROR_INTERP_KEYS=n`, default 0). Worker threads
+   run the frame's recorded commands again on a private VIF1 state
+   (`vif_w_command`) and a private VU1 instance (`vu_w_*` in vu.c: registers,
+   pipeline, data memory and predecoded records of its own, started from a
+   snapshot taken at the frame's first command; the generated fast path is
+   compiled a second time for these instances), with inputs interpolated to
+   t = k / (n + 1): camera blocks decomposed into rotation and eye (slerp +
+   lerp, both matrices recomposed), object blocks rotation slerp, scale and
+   translation lerp, inverse and normal matrices rebuilt, position palettes
+   and other 32-bit floats that differ linear, integers and GS packets from
+   the new frame. XGKICK of such an instance goes to a small packet reader
+   (`vi_w_kick`) that keeps the vertices; a run that kept its structure gives
+   every primitive of the package a third position, and the presenter moves
+   vertices along prev -> key -> new instead of prev -> new (`hwp_vtx`). The
+   package is published without waiting; keys arrive while it is shown
+   (`key_ok` per key, set after the last write) and a key is dropped for a
+   primitive when it is further than 1 pixel + half the way travelled from
+   the straight line. The passes of a frame are left out when the queue
+   holds more than 32 (workers behind), and a package slot is not reused
+   while its passes run.
+
+### Decisions and their measurements (RTX 3090, Ryzen 9 7900X, uphill walk 21300-25050)
+- **How many VU1 passes: none by default.** With one key at t = 0.5 the
+  exact position was compared with the middle of the straight line for every
+  placed vertex in the picture (`ROR_INTERP_DEV=1`, 5-7 million vertices per
+  250 frames): mean 0.032-0.034 PS2 pixels, 99 % below 0.13, 99.9 % below
+  0.13-0.31, single vertices up to 4 (0.001-0.002 % over one pixel; a key is
+  not used beyond 1 pixel + half the way anyway). The detector (below) gives
+  the same result with and without the key. A pass costs 4.8 ms on a worker
+  with the generated code (14 ms with the interpreter alone) plus the copy of
+  all VIF1 data on the game thread, and with it the presenter had about twice
+  as many intervals over 8.4 ms (119 against 51 of 14,000; p99 8.4 against
+  8.1 ms). So the two real frames are the only keys and positions move in a
+  straight line between them, as before; what changed is that the two ends
+  of the line are exact. `ROR_INTERP_KEYS=1..7` turns the passes on.
+- **Threads:** matching and placing run on the game thread at the boundary:
+  0.5-0.6 ms for matching, and the whole boundary work went from 2.8-3.0 to
+  1.2-1.4 ms per tick (`pair` in the perf log) because the old pairing only
+  sees the leftovers. Recording costs about 0.3 ms per tick (`ee`). Key
+  passes: one worker per key, ideal processors on the cores after the game
+  and presenter threads (`plat_thread_role(2 + k)`), normal priority.
+- **Hand-over without waiting:** the package carries prev and new positions
+  when it is published; keys are an addition the presenter picks up when
+  they are there.
+- **Memory:** four frame records (vertex stream 36 bytes per vertex, about
+  1.6 MB; parameter blocks; a 1 MB address bitmap), 36 more bytes per
+  package primitive; with keys 3 MB of VIF1 data per record and three
+  vertices per placed primitive and key.
+- **A frame that never ends** (no flip for a long time) stops being
+  recorded at 600,000 commands or 2 million vertices and is not used.
+- **Without a partner:** primitives of runs that are new appear at the start
+  of the interval unless the pairing's shared-vertex step can place them, as
+  before; a triangle the previous frame culled moves in from where its
+  vertices were (they are sent either way).
+
+### How it differs from the prototype and its integration design
+- The prototype re-ran VU1 for every in-between picture. Here the default
+  runs no pass at all: the insight that came out of building it is that a
+  matched run with unchanged structure already gives exact pairs (vertex i
+  of the run in both frames), so the "t = 0 pass" is the previous frame's
+  own vertex stream, and the measurements above showed the straight line
+  between two exact ends to be within a fraction of a PS2 pixel of a re-run.
+  The re-run machinery is complete and optional (key times).
+- No primitive assembler for worker output: a pass yields a vertex stream
+  with the same indices as the real frame's, and the real frame's retained
+  primitives say which three vertices make a triangle and with which state.
+  A run whose structure changed therefore contributes nothing from a pass
+  (the pairing handles it) instead of a differently shaped set of triangles.
+- Static and dynamic data are told apart by "both frames read this address",
+  not by address ranges; everything a pass needs is copied when recorded, so
+  model memory changing under a reference cannot happen.
+- Cameras and object blocks are found by reading the command list (0x11 n
+  skips, 0x190 end start names the globals), not by testing floats.
+- dmac.c is untouched (commands are taken in `vif.c command()`, which sees
+  them whole, with the address they were read from).
+- The second VU1 instance is a struct, not thread-local state; the game
+  thread's VU1 code is unchanged except that XGKICK tests which instance it
+  is (a constant in the generated code). The second copy of the generated
+  code is a build option (`EXTRA=-DVU_W_FAST`): it takes vu.c from 30 s to
+  67 s of compile time, which every player-side build would pay; without it
+  passes run on the interpreter (14 ms instead of 4.8 ms per pass).
+
+### Switches
+- `--interp auto|inputs|pairs` (default auto; `ROR_INTERP=` the same, the
+  command line wins). `pairs`: nothing of this section runs. `auto` and
+  `inputs` are the same today: inputs wherever the known program runs, pairs
+  for the rest. A bare `--interp` is still the reference CPU interpreter.
+- `ROR_INTERP_KEYS=0..7` key passes per game frame (default 0),
+  `ROR_INTERP_THREADS=n` workers for them (default one per key).
+- Test aids: `ROR_INTERP_DEBUG=1` one line per frame (runs, matched, usable,
+  camera turn and move, cut); `ROR_INTERP_SELFCHECK=1` every recorded
+  triangle is rebuilt from the vertex stream and compared with the retained
+  primitive (0 differences over 1,500 frames of the walk);
+  `ROR_INTERP_DEV=1` (with keys) distance of the exact key positions from
+  the straight line, every 250 frames; `ROR_INTERP_DETECT=first[,last[,save]]`
+  the artifact detector inside the presenter (below); `ROR_HW_STRIP=frame,
+  count[,packages]` now takes the number of packages and names the files by
+  vblank.
+- `ROR_PERFLOG`: a second line `[perf] <tick> inputs: frames F used U cut C
+  fallback B (prog P) | runs R ok x% nopartner a struct b uv c | prims T ok
+  y% jump j new n clip k | keys K ms runs ok z% dropped d | match m ms`
+  (explained above `perf_line` in video.c).
+
+### The detector, in the presenter (`ROR_INTERP_DETECT`)
+For every package the presenter takes, the picture at t = 0.5 is rendered
+once more off the clock, box-filtered to PS2 resolution and compared with
+the two real pictures; a pixel counts when a channel is more than 16 outside
+the range it has within 8 pixels in both (the measure of the earlier
+sections). In this mode the game thread waits for the presenter, so every
+package is measured (the game runs in slow motion). Measured at
+`--internal 4`: at 1x point-sampled minified textures sparkle between two
+frames and give isolated single-pixel hits with either method.
+
+### Results (RTX 3090, Windows; Ryzen 9 7900X)
+Detector, `--internal 4`, every package measured, pictures with at least
+3 / 10 / 40 pixels that are in neither game frame:
+
+| stretch (vblanks) | measured | pairs | inputs |
+|---|---|---|---|
+| uphill walk, `script-uphill.txt`, 21600-25040 | 1708 | 8 / 3 / 1 | 1 / 1 / 1 |
+| walk to the right, `script_play.txt`, 21600-25040 | 1719 | 1 / 0 / 0 | 1 / 0 / 0 |
+| uphill walk at `--wide 21:9`, 21600-23200 | 792 | 5 / 1 / 1 | 2 / 1 / 1 |
+| bus-stop cutscene with captions, 13700-15200 | 749 | 0 / 0 / 0 | 0 / 0 / 0 |
+| storybook with page turns, 9700-13500 | 1900 | 59 / 44 / 24 | 59 / 44 / 24 |
+| third area (gate of the orphanage), `script-far` below, 26900-27250 | 175 | 0 / 0 / 0 | 0 / 0 / 0 |
+
+- The one picture with 40 or more in the walks (vblank 22837, 48 and 77
+  pixels) is the "Strange Hill" loading screen, top screen row, with either
+  method; not interpolation.
+- Uphill, pairs: the other two over 10 are at 23601 (10) and 23921 (35).
+  Inputs: none.
+- Storybook: all hits are the edge of the page while it turns (a thin shape
+  moving more than the detector's 8 pixels per frame); both methods give the
+  same pictures there (the page's runs match, 99.99 % of the runs usable) and
+  the in-between looks right (page half-way).
+- The research measured the old method at 121 / 39 / 12 of 1,329. That was
+  the replay path at commit 84e7da0, which does not have the shared-vertex
+  step of the presenter; in the game the old method was already at the
+  numbers above after "validated pairs", so the gain measured here is small
+  in pictures: what the inputs change is that nearly all positions are exact
+  instead of inferred (95-99 % of the VU1 triangles, see below), the game
+  thread does half the boundary work, and motion vectors are exact.
+- Two defects found with the detector while building this, both from
+  previous positions that were not what they seemed, and what was done:
+  a polygon of the path stretched across the picture (vblank 23183) and a
+  dark triangle at the lower edge (24857): clipper fans, whose corner i is
+  not the same corner in the next frame. Fans are no longer placed by the
+  inputs.
+- Contact sheets looked at: camera turn (packages after vblank 22912) and
+  around 23600, five times per interval; the difference between successive
+  pictures is the same for every step (uniform motion), nothing out of
+  place.
+
+Fallback counters (`[perf] ... inputs:` totals):
+
+| scene | frames | used | cuts | whole-frame fallback | runs usable | no partner / other structure / texture coords | VU1 triangles placed | fans / refused |
+|---|---|---|---|---|---|---|---|---|
+| uphill walk | 1872 | 1862 | 9 | 1 (first frame) | 99.26 % | 22,828 / 33,560 / 0 of 7.58 M | 95.5 % | 659,705 / 29,681 of 23.2 M |
+| walk to the right | 1875 | 1873 | 1 | 1 | 99.87 % | 3,670 / 5,032 / 0 | 96.0 % | 763,043 / 5,967 |
+| uphill, 21:9 | 997 | 991 | 5 | 1 | 99.25 % | 12,678 / 19,815 / 0 | 94.1 % | 570,609 / 17,722 |
+| caption cutscene | 950 | 947 | 2 | 1 | 99.85 % | 4,945 / 175 / 0 | 96.8 % | 315,835 / 767 |
+| storybook | 2100 | 2099 | 0 | 1 | 99.99 % | 1 / 0 / 58 | 99.4 % | 10,528 / 1,067 |
+| uphill, on into the third area, 24900-32000 | 3541 | 3531 | 9 | 1 | 99.75 % | 35,190 / 36,598 / 0 of 28.2 M | 96.8 % | 960,519 / 140,032 of 46.4 M |
+
+"Other micro program" never occurred. Movies and menus (vblanks 0-7000 at
+`--fps 240`): about two program starts and a handful of triangles per frame
+are recorded; 1,934 frames interpolated, 2,943 shown as they come (uploads
+into the frame buffer), as before.
+
+Performance, `--internal 4 --filter fsr --sharpness 88 --aspect stretch
+--res 3840x2160` (the window came out between 2369x1333 and 3009x1693
+depending on the monitor it opened on; the rows of a pair are from windows
+of the same size, 2369x1333; an inputs run at 2844x1600 gave 236/s, p99 8.1,
+77 intervals over 8.4 ms), totals of 3,750 ticks:
+
+| run | method | presents/s | p50 / p95 / p99 ms | over 8.4 / 16.7 ms | ticks behind | pair ms/tick | sleep ms/tick |
+|---|---|---|---|---|---|---|---|
+| uphill, `--fps 240 --vsync 0` | pairs | 237 | 3.9 / 7.1 / 8.1 | 58 / 11 | 0 | 2.99 | 11.51 |
+| uphill, `--fps 240 --vsync 0` | inputs | 238 | 3.9 / 7.1 / 8.1 | 54 / 11 | 0 | 1.24 | 12.86 |
+| to the right, 240 | pairs | 239 | 3.9 / 6.9 / 8.1 | 46 / 3 | 0 | 1.32 | 13.93 |
+| to the right, 240 | inputs | 239 | 3.9 / 6.6 / 7.6 | 20 / 4 | 0 | 1.05 | 14.23 |
+| uphill, `--fps display` (144 Hz monitor, vsync on) | pairs | 143 | 6.9 / 9.6 / 10.9 | 1070 / 11 | 0 | 2.62 | 12.24 |
+| uphill, `--fps display` (144 Hz monitor, vsync on) | inputs | 143 | 6.9 / 9.6 / 10.9 | 1049 / 11 | 0 | 1.19 | 13.22 |
+
+(One earlier `--fps display` run landed on the 240 Hz monitor at 3009x1693:
+inputs 215/s, p99 8.9 ms; no pairs run at that size.) Video memory with
+everything on at 4x: 1081 MiB in the largest window (0.9 GB was measured
+before at a smaller one). `--filter fsr3 --internal 2` with `--fps 240`:
+193 presents a second, p99 7.9 ms, no tick behind.
+
+### Coverage beyond the walk
+`script-far` (not in the tree: `script-uphill.txt` plus
+`25100:bf6f,25110:ff6f,25600:bf6f,25610:ff6f,26200:ffef,26600:bfef,26610:ffef,
+27200:ffcf,27700:bfcf,27710:ffcf,28300:ffef,28800:ff6f,29300:bf6f,29310:ff6f,
+29800:ffef,30400:ffdf,31000:bfdf,31010:ffdf,31600:ffef`, run to 32000) walks
+on through a second area change at about vblank 26800 to the gate of the
+orphanage. That area has 12,000-13,000 program starts and 1,700 objects per
+frame, and showed what the first version of the matching could not do: 715
+objects there (six runs each, all at one place: an effect) carry values that
+change every frame where the others carry node pointers, so 35 % of the runs
+had no partner and every frame was taken for a cut (no in-betweens for 70
+seconds; nothing wrong was drawn). Objects made of the same runs are now
+paired in order (step 2); with that 3,531 of 3,541 frames of the run are
+used. The object matching was also made independent of the number of objects
+(it compared every object with every object).
+
+That area does not hold 50 Hz on the GPU renderer at all, with or without
+`--fps`, with either method (`--internal 2`, 640x480 window: 376 to 500 of
+700 ticks behind; game thread 19-20 ms per tick: ee 7.3, vu 2.4, gs 6.5,
+gpu 3.3). Not caused by this work and not looked into; the software renderer
+was not measured there.
+
+### Other things found on the way
+- **Scripted runs in a window were not reproducible.** `video_win32.c`
+  releases all buttons when the window loses the focus (`WM_KILLFOCUS`), and
+  the keyboard word was the same variable as the scripted pad word: a second
+  window opening, or someone using the machine, let go of the held direction
+  and the walk went elsewhere (seen as "the area change at 22840 is missing").
+  With `--script` the window's keyboard state is now ignored (`video.c`).
+- The software build of the replay tool (`recomp/tools/gsreplay.sh` without
+  `HW=1`) did not compile since the performance work (`plat_time_ns`
+  declared only under `GS_HW`); fixed.
+- Off-clock read-backs in the presenter (`ROR_HW_STRIP`, the detector) read
+  the display rectangle from the picture's target; when a frame's list paints
+  mostly a small target (loading screens) that was out of bounds and lost the
+  device (`sr failed (-4)`). The package now carries the target's size and
+  those packages are skipped.
+
+Pictures (not in the tree): `build/recomp/interp-check/inputs/`: contact
+sheets of the camera turn for both methods, the sheets around 23600, the two
+defects before the fan rule (`d0_023183_52px.png`, `d0_024857_61px.png`:
+previous, half-way, new, marked), the loading screen hit, the storybook page
+hit, the third area, and the upscaler crops at 21880.
+
+### Regression
+Software renderer, standard script to 16000, 16 PNG + WAV: identical to the
+reference (frame_016000 ed535164..., audio.wav 670b42cf...) on Linux with 1,
+2, 4 and default workers and on Windows with default and 2. GPU without
+`--fps`: 46 shots over 23,000 frames at 4x on the RTX 3090 identical to the
+build before; lavapipe 1x 16 shots identical. `vubench starts` on the 3,723
+program starts of frame 21790: same hashes as the sources before, generated
+code == interpreter. Pad self-test all ok on both.
+
+### Not done / not known
+- Scenes the scripts do not reach (indoors, combat, other effects). The
+  method is built to fall back there, and the counters in the perf log say
+  how much it does, but nothing beyond the three areas, the storybook and
+  the cutscenes was looked at.
+- Key passes (`ROR_INTERP_KEYS`) were run over the uphill walk and the
+  storybook only, never with `--wide`, never together with `fsr3` / `dlss`,
+  and the fast-path build option `VU_W_FAST` only in the first half of the
+  work (the binaries built last use the interpreter for passes).
+- A triangle that is new and shares no vertex with anything still appears at
+  the start of the interval; triangles that disappear do so at the start.
+- A mesh that jumps (same identity, other place) is only caught per vertex
+  (half a picture) or by the 30 % rule; no such case was seen.
+- The 2D layer (captions, fades by the blend constant) is paired the old
+  way, unchanged.
+
+## DLSS and frame generation (`--filter dlss`, `--framegen`) (2026-11-24)
+
+Developed as a patch against 84e7da0 in a private copy and merged after the
+section above (three-way merge; conflicts only where both sides had added
+lines). Design comments are at "DLSS Super Resolution" and "frame
+generation" in `rt/hw/gs_hw.c`. `--framegen` is an experimental switch: it
+is accepted on the command line but not listed in the usage text or in
+docs/OPTIONS.md. Nothing from NVIDIA is in the tree or in the packages; the
+player supplies the four DLLs (docs/OPTIONS.md, "DLSS").
+
+### DLSS Super Resolution
+- A second backend of the temporal path of `--filter fsr3` (same jittered
+  scene, motion vectors, depth, 2D layer afterwards; gs.c does not know which
+  runs). Reached through NVIDIA Streamline 2.14.16: `sl.interposer.dll`
+  exports C-linkage functions, `rt/hw/sl_min.h` is a C transcription of the
+  few declarations used (MIT, NVIDIA's notice kept). No MSVC, no C++, no
+  import library. Structure layouts were checked against the SDK headers
+  with static assertions (not part of the build).
+- Streamline must be initialised before the first Vulkan call and hands out
+  Vulkan itself: with `--filter dlss` (or `--framegen dlss`) `hw_start` takes
+  `vkGetInstanceProcAddr` / `vkGetDeviceProcAddr` from the interposer instead
+  of vulkan-1.dll. Without those switches nothing changes.
+- Before the DLL is loaded: Authenticode signature valid and signer contains
+  "NVIDIA"; file version 2.14 or newer.
+- Conventions (checked on the 3090): jitter offset = the same value FSR gets
+  (the other three sign combinations are visibly blurred); motion vectors
+  current -> previous in render pixels (`mvecScale` = 1 / render size); depth
+  inverted; LDR colour (`colorBuffersHDR` off), auto exposure; reset on cuts.
+  Presets are NVIDIA's defaults (`ROR_DLSS_PRESET=J..M`, `ROR_DLSS_MODE=1..6`
+  for experiments).
+- DLSS accepts a render size between 50% and 100% of its output per axis
+  (quality / balanced / performance by ratio, DLAA at 100%), or exactly a
+  third (ultra performance). Anything else fails inside NGX (0xbad00005,
+  reported only through the message callback, which is therefore watched).
+  So the DLSS output is the window rectangle where that fits, else 2x or 3x
+  the render size (or the render size itself when it is larger than the
+  window), and the presentation pass does the rest (EASU up, area filter
+  down). Log line: `temporal upscaler: DLSS 310.9.16 (performance), 1024x896
+  -> 2048x1792 (DLSS scales by 1 to 2, or by 3; FSR 1.0 does the rest to
+  2880x2160)`.
+- No sharpening in DLSS: `--sharpness` is the RCAS pass afterwards, one stop
+  weaker than for FSR 1.0 (`ROR_DLSS_RCAS=k` scales the constant; full
+  strength when EASU follows DLSS).
+- Fallbacks (one line each): DLLs missing / unsigned / too old / Streamline
+  or DLSS not supported / a failure while running -> FSR 3.1 if AMD's DLLs
+  are there, else FSR 1.0.
+- Streamline prints two or three lines of its own to the console ("File ...
+  is signed by NVIDIA", and "NvLowLatencyVk.dll is NOT correctly signed" when
+  that optional file is absent); harmless, not suppressible.
+- `ROR_DLSS_LOG=1|2` Streamline's messages; `ROR_TU_TIMING=1` GPU time of the
+  upscaler / frame generation alone; `ROR_HW_VRAMLOG=1` video memory.
+
+### Frame generation
+- `--framegen fsr`: AMD FSR 3.1.6 frame interpolation
+  (`amd_fidelityfx_framegeneration_vk.dll`) WITHOUT AMD's swapchain wrapper:
+  context configured with `FFX_FRAMEGENERATION_FLAG_NO_SWAPCHAIN_CONTEXT_NOTIFY`,
+  `PrepareV2` (motion, depth) and `FRAMEGENERATION` dispatched by hand into an
+  image of ours; our presenter shows the generated picture, then the real
+  one. Input is the upscaled picture before the 2D layer; the layer is put
+  over both. Needs a temporal upscaler (fsr3 or dlss) for motion and depth.
+  One generated picture per real one (the midpoint).
+- Without `--fps`: the first vblank that shows a new picture shows the
+  generated one (50 different pictures a second, real picture 20 ms later).
+  With `--fps N`: the presenter renders N/2 pictures and presents each
+  generated one half a step before its real one.
+- `--framegen dlss`: Streamline is asked whether the card supports DLSS Frame
+  Generation and one line is logged; it is never turned on. It only works by
+  taking over the swapchain inside Streamline and needs Reflex markers in
+  the frame loop; neither exists here and no RTX 40 card was available.
+
+### Measured (RTX 3090, replays of captures made with `ROR_GSCAP`; the game itself was only run for boot-time smoke tests, see "Not tested")
+Standing still, vblanks 21392-21398, mean luma change between game frames
+(middle of the picture) / neighbour contrast, 2880x2160:
+fsr 4x 2.07 / 2.15; fsr 2x 2.04 / 1.21; fsr3 2x 0.14 / 0.94; fsr3 1x 0.11 /
+0.62; dlss 4x 0.52 / 1.43; dlss 2x 0.44 / 1.19; dlss 1x 2.53 / 0.81. (The
+2.0 of the FSR 1.0 rows is the film grain, which the temporal upscalers
+average away in this scene because it is drawn before the last 3D primitive;
+dlss 1x flickers by itself.)
+GPU time per picture (other work was running on the card): DLSS 2.2 ms
+(1024x896 -> 1920x1440), 4.0 ms (-> 2048x1792), 3.4 ms (2048x1792 ->
+2880x2160); FSR 3.1 1.0-2.3 ms; FSR frame generation 1.6 ms at 1920x1440,
+3.3-5.7 ms at 2880x2160. Video memory of the process at 2880x2160: fsr 4x
+226 MiB, fsr3 2x 626, dlss 2x 815, dlss 4x 1370, dlss 4x + framegen 1739.
+
+
+### In the running game (RTX 3090, after the merge; `--fps 240 --vsync 0` unless said)
+The patch had only run on capture replays. With the four NVIDIA files and
+AMD's DLLs copied into the test folder (they are not in the tree); the
+window asked for was 2880x2160 and came out 1777x1333 on the monitor it
+opened on, so the windowed runs upscale less than a 4K screen would:
+
+| run (uphill script) | upscaler line | presents/s | p99 ms | ticks behind | video memory |
+|---|---|---|---|---|---|
+| `--filter fsr3 --internal 2`, 21300-23300 | 3.1.6, 1024x896 -> 1777x1333 | 193 | 7.9 | 0 | 721-729 MiB |
+| `--filter dlss --internal 2`, 21300-23300 | DLSS 310.9.16 (quality), 1024x896 -> 1777x1333 | 184 | 8.1 | 0 | 827-881 MiB |
+| `--filter dlss --internal 4`, 21300-23300 | DLSS 310.9.16 (DLAA), 2048x1792 -> 2048x1792, area filter to 1777x1333 | 127 | 12.1 | 0 | 1751-1760 MiB |
+| `--filter dlss --internal 2`, no `--fps` | as above | - | - | 5 of 2000 | 881-890 MiB |
+| `--filter dlss --internal 2 --wide 21:9 --res 2520x1080` | 1024x896 -> 2048x1080, FSR 1.0 to 2520x1080 (and -> 1440x1080 for 4:3 screens) | 179 | 8.4 | 0 | |
+| `--filter dlss --internal 2`, 13700-25050 (captions, cuts, area change, 3.8 minutes) | | 179 | 8.6 | 0 | 890-895 MiB throughout |
+
+All exit 0. At `--internal 4` the upscaler itself limits the rate (about
+4 ms per picture at 2048x1792), so 240 pictures a second are not reached
+with DLSS at 4x; at 2x about 180. (At 2880x2160, headless, the lines are
+`DLSS 310.9.16 (performance), 1024x896 -> 2048x1792 ... FSR 1.0 does the
+rest to 2880x2160` and `(quality), 2048x1792 -> 2880x2160`; the rate at
+that size was not measured in a window.) The upscaler context is made again at
+every change of picture shape under `--wide` (three times each in that
+run), without a visible stall in the perf log. No growth of video memory
+over the long run. Captions and the 2D layer stay sharp (they are drawn
+after the upscale, as with FSR 3.1).
+
+Fallbacks checked in the game: without NVIDIA's files `DLSS: sl.interposer.dll
+(NVIDIA Streamline) is not in the program's folder or %ROR_APP_DIR%: trying
+FSR 3.1`, then `temporal upscaler: 3.1.6 ...`; without AMD's either, `FSR
+3.1: amd_fidelityfx_loader_vk.dll could not be loaded ... using FSR 1.0`.
+With `--filter fsr` nothing of this is touched: the 46 shots of the GPU
+regression and the software md5s are identical to the build before.
+
+Motion vectors now come from the VU1 inputs (section above) for 95-99 % of
+the 3D triangles; geometry without a previous position gets zero vectors and
+is marked reactive. Pictures at vblank 21880 (walk, 2880x2160, headless
+`--post-shots`), compared by eye with the patch author's crops of the same
+scene made from paired vertices: DLSS at 2x and 4x look as they did (clean
+edges, no trails; they were already good); FSR 3.1 at 2x has a firmer
+outline of the moving character, with visible stair-steps along it where
+the earlier crop had a soft fringe. The frames are not the same game frame
+and no measurement was made of it, so this is an impression, not a result.
+
+### Not tested
+DLSS Frame Generation in any form; `--framegen fsr` in the running game
+(replays only); a card without DLSS support but with the DLLs present; a
+session of hours; DLSS past the three areas the scripts reach. Streamline is
+not shut down at exit, like the rest of Vulkan here.

@@ -15,6 +15,19 @@ uphill from it.
 - The GPU renderer, frame interpolation (`--fps display`), widescreen at 16:9
   and 21:9 and FSR 3.1 have been run over the same stretch on one GPU, an RTX
   3090.
+- Frame interpolation from the game's geometry inputs (`--interp auto`, the
+  default with `--fps`) has been measured on that card over scripted walks
+  through the first three outdoor areas, the storybook and the first
+  cutscene: a detector that looks for pixels belonging to neither of two game
+  frames finds none in the in-between pictures of the walks outside a loading
+  screen, and in the first two areas the game holds full speed at 240
+  pictures per second. Scenes the scripted runs do not reach have not been
+  looked at; for
+  anything the method does not recognise it falls back to the older pairing
+  of drawn primitives.
+- DLSS (`--filter dlss`, with NVIDIA's files supplied by the player) has been
+  run in the first two areas and the first cutscene on the RTX 3090 only
+  (about 180 pictures per second with `--fps 240` at `--internal 2`).
 
 ## Not tested yet
 
@@ -38,6 +51,9 @@ uphill from it.
 - With the GPU renderer and `--wide`, the start of the walk in the first scene
   drops below full speed for about a second (many textures change at once).
   The software renderer is not affected.
+- With the GPU renderer the third outdoor area (the gate of the orphanage)
+  runs below full speed on the development machine, with or without `--fps`.
+  Not investigated yet.
 - With `--wide` the picture changes shape between 3D scenes (wide) and movies
   or menus (4:3). In the tested stretch this happens while the screen is
   black. Later areas may show objects popping in at the sides or 2D elements

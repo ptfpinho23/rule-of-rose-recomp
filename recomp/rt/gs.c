@@ -40,6 +40,7 @@ u64 g_gs_tex_rebuilt;           /* texels decoded into the texture cache */
  * [8] too few primitives paired (a cut), [9] no start-of-frame copy, [10] no package (presenter behind),
  * [11] ns of [3] spent waiting for the GPU */
 u64 g_perf_tx[8];               /* ROR_PERFLOG=2: decodes by cause: [0] nothing cached for this texture, [1] other palette, [2] other content, [3] written by a queued draw, [5] texels; [4] lookups answered by moving an entry to a new address */
+u64 plat_time_ns(void);         /* plat.h (the replay tool supplies its own) */
 int g_perf_on; u64 g_perf[12]; u32 g_perf_hist[258]; u64 g_perf_pres_max;    /* hist: presenter intervals in 0.25 ms steps, last = 64 ms and more */
 u64 g_gs_stat[6];              /* bounding-box pixels and primitive counts: small / medium / large */
 
@@ -317,10 +318,16 @@ static ClutJob *q_clut(const ClutDesc *d, u32 seq);
 /* Hardware renderer glue (see "hardware renderer" near the end of the file). */
 static int hw_on, hw_scale, hw_shblend;
 static int hw_interp_n, hw_fps_on, hwi_uploads, hwi_texgone; static float hwi_snap_px;
-static int hw_fsr3;                       /* --filter fsr3 and the FidelityFX upscaler is usable (see "FSR 3.1") */
+static int hw_fsr3;                       /* --filter fsr3 / dlss and a temporal upscaler is usable (see "FSR 3.1") */
+static int hw_fg;                         /* --framegen fsr and it is usable: every upscaled picture also gives the picture half-way from the previous one */
 struct HwState_; struct HwVertex_;
 static void hwi_record(const struct HwState_ *h, const struct HwVertex_ *v, int n);
 static u64 hw_state_gen, hwi_state_key;   /* draw states built so far; identity of the current one for frame matching */
+#include "vinterp.h"
+extern int g_gif_path;
+int g_vi_run = -1;                        /* rt/vinterp.c: number of the VU1 program run whose vertices are arriving, or -1 */
+static int vq_vi[3];                      /* per vertex of vq: its index in the frame's recorded vertex stream (valid while g_vi_run >= 0) */
+#define VQI(stmt) do { if (UNLIKELY(g_vi_run >= 0)) { stmt; } } while (0)
 static void hwg_tex(DState *s);
 static void hwg_prim(const DState *st, const Prim *p);
 static void hwg_sync(void);
@@ -338,6 +345,8 @@ u64  plat_time_ns(void);                 /* plat.h (the replay tool supplies its
 void plat_sleep_until(u64 t_ns);
 void plat_thread_role(int role);
 #include "hw/gs_hw.h"
+#else
+#define VQI(stmt) do { } while (0)
 #endif
 
 /* ---- CLUT ------------------------------------------------------------------
@@ -2035,15 +2044,22 @@ static void vertex_kick(u32 x, u32 y, u32 z, u32 fog, int draw) {
     v.q = r_q; v.s = r_s; v.t = r_t; v.u = r_u; v.v = r_v; v.f = (u8)fog;
     int type = r_prim & 7;
     static const u8 need[8] = { 1, 2, 2, 3, 3, 3, 2, 255 };
-    if (vcount < 3) vq[vcount++] = v;
-    else { if (type == 5) { vq[1] = vq[2]; vq[2] = v; } else { vq[0] = vq[1]; vq[1] = vq[2]; vq[2] = v; } }
+#ifdef GS_HW
+    int vidx = -1;             /* rt/vinterp.c keeps every vertex a recorded VU1 run sends; vq_vi follows vq */
+    if (UNLIKELY(g_vi_run >= 0) && g_gif_path == GIF_PATH1) vidx = vi_vtx(v.x, v.y, z, fog, r_rgbaq, r_q, r_s, r_t, r_u, r_v, type | (draw << 3));
+#endif
+    if (vcount < 3) { VQI(vq_vi[vcount] = vidx); vq[vcount++] = v; }
+    else {
+        if (type == 5) { vq[1] = vq[2]; vq[2] = v; VQI(vq_vi[1] = vq_vi[2]; vq_vi[2] = vidx); }
+        else { vq[0] = vq[1]; vq[1] = vq[2]; vq[2] = v; VQI(vq_vi[0] = vq_vi[1]; vq_vi[1] = vq_vi[2]; vq_vi[2] = vidx); }
+    }
     if (vcount < need[type]) return;
     if (draw) { g_gs_prims++; submit(type); }
     switch (type) {            /* what stays in the queue for the next primitive */
     case 0: case 1: case 3: case 6: vcount = 0; break;
-    case 2: vq[0] = vq[1]; vcount = 1; break;
-    case 4: vq[0] = vq[1]; vq[1] = vq[2]; vcount = 2; break;
-    case 5: vq[1] = vq[2]; vcount = 2; break;
+    case 2: vq[0] = vq[1]; VQI(vq_vi[0] = vq_vi[1]); vcount = 1; break;
+    case 4: vq[0] = vq[1]; vq[1] = vq[2]; VQI(vq_vi[0] = vq_vi[1]; vq_vi[1] = vq_vi[2]); vcount = 2; break;
+    case 5: vq[1] = vq[2]; VQI(vq_vi[1] = vq_vi[2]); vcount = 2; break;
     }
 }
 
@@ -2103,7 +2119,8 @@ static void tex_hw_forget(TexEnt *e) { if (e->hw_valid) { hw_tex_destroy(e->hwte
  * when less than 70% of the vertices have a partner (cut) or when the frame
  * uploaded pixels into a target or dropped a texture (movies; not replayable
  * from the draw list alone). */
-typedef struct { u64 key; int n; HwState h; HwVertex v[6]; u8 path; } RPrim;      /* path: GIF path the primitive came by (PATH1 = VU1 = 3D) */
+typedef struct { u64 key; int n; HwState h; HwVertex v[6]; u8 path;      /* path: GIF path the primitive came by (PATH1 = VU1 = 3D) */
+                 u8 conv; int run, vi[3]; s32 ofx, ofy; } RPrim;        /* run >= 0: a triangle of that recorded VU1 run (rt/vinterp.c), made of the vertices vi[] of the frame's stream; conv: 1 texel coordinates, 2 own colours; XYOFFSET */
 static RPrim *hwi_cur, *hwi_prev; static int hwi_ncur, hwi_nprev, hwi_ccur, hwi_cprev;
 static int hw_interp_first, hw_interp_count = 1 << 30, hwi_frame, hwi_have_start; static u32 hwi_last_fbp = ~0u;
 void save_png(const char *path, const u32 *px, int w, int h);
@@ -2116,7 +2133,7 @@ static void hwi_record(const struct HwState_ *h, const struct HwVertex_ *v, int 
      * TEX0 address and format rather than the GPU texture (a palette
      * animation makes a new one every frame) */
     p->key = hwi_state_key ^ (u64)n; p->n = n; p->h = *h; memcpy(p->v, v, sizeof(HwVertex) * (size_t)n);
-    { extern int g_gif_path; p->path = (u8)g_gif_path; }
+    p->path = (u8)g_gif_path; p->run = -1;
 }
 /* Identity of a primitive inside its mesh: its texture coordinates (they stay
  * with the triangle whatever order the game draws the mesh in). */
@@ -2238,9 +2255,15 @@ static long hwi_rematch(int i, int e, int *partner) {
  * buffers and the game thread waits (hwp_using) until the presenter has left
  * the one it is about to reuse; the game thread submits its copies (hw_flush)
  * before a package becomes visible; the presenter only reads shared images. */
-typedef struct { HwState h; int n; u8 paired; HwVertex cur[6], prev[6]; u8 fix_prev; } PPrim;
+typedef struct { HwState h; int n; u8 paired; HwVertex cur[6], prev[6]; u8 fix_prev;
+                 u8 conv; int run, vi[3], mid; s32 ofx, ofy; } PPrim;           /* mid >= 0: its row in the package's key-time vertices (run, vi, conv, ofx, ofy as in RPrim) */
+#define HWP_MAXKEYS 7
 typedef struct Pkg_ { u64 gpu_seq; PPrim *p; int n, cap, ok, nrt, src[HW_MAXRT], dst[HW_MAXRT], slot, fslot, pic_w, pic_game, sx, sy, sw, sh, pdx, pdy, pdw, pdh, pww, pwh; u64 t_ns, dur_ns, seq;
-                 u8 *cls; int cls_cap, f_ok, f_cut, f_ovl, f_mv, f_mvds, f_ob, f_ow, f_ods; float cam[5]; } Pkg;      /* FSR 3.1: see hwf_classify */
+                 u8 *cls; int cls_cap, f_ok, f_cut, f_ovl, f_mv, f_mvds, f_ob, f_ow, f_ods; float cam[5];             /* FSR 3.1: see hwf_classify */
+                 /* key times (rt/vinterp.c): nkeys vertex sets between the previous and the new positions, at t = (k + 1) / (nkeys + 1), for
+                  * nmid primitives; row r of key k is midv[(k * nmid + r) * 3 ..], usable when key_ok[k] is set and midok[k * nmid + r] */
+                 HwVertex *midv; u8 *midok; int nmid, nkeys, mid_cap; atomic_int key_ok[HWP_MAXKEYS], busy; u64 vserial;
+                 int pic_tw, pic_th; } Pkg;                                      /* size of the picture's target, native pixels */
 static Pkg hwp_pkg[4]; static u64 hwp_seq, hwp_ideal_ns, hwp_last_ideal; static Pkg *hwp_newest;
 static pthread_mutex_t hwp_mx = PTHREAD_MUTEX_INITIALIZER;
 static atomic_ullong hwp_using = 1ull << 62;           /* lowest package number the presenter may still touch */
@@ -2257,6 +2280,98 @@ static int hwp_w_ds(int hw) {
 }
 static void hwf_classify(Pkg *P);
 static int hwf_replay, hwf_cut;
+static int hwd_from = -2, hwd_to = 1 << 30, hwd_save = 40;      /* ROR_INTERP_DETECT, see hwd_package */
+/* Previous positions that come from the VU1 inputs (rt/vinterp.c) instead of a partner in the previous draw list:
+ * partner[i] = HWI_FIX - k names row k of hwi_fixv. */
+#define HWI_FIX (-0x20000000)
+static HwVertex (*hwi_fixv)[3]; static int hwi_nfix, hwi_cfix;
+static const VResult *hwi_vr;                      /* what vi_boundary said about the frame being published */
+static inline const HwVertex *hwi_pv(int partner) {
+    return partner >= 0 ? hwi_prev[partner].v : partner <= HWI_FIX ? hwi_fixv[HWI_FIX - partner] : partner <= -2 ? hwi_syn[-2 - partner].v : 0;
+}
+/* A vertex of a recorded stream as hwg_prim makes it from the GS vertex (col: the vertex the colour comes from). */
+static inline void hwi_vv(HwVertex *o, const VVtx *v, const VVtx *col, int conv, s32 ofx, s32 ofy) {
+    o->x = (float)((s32)v->x - ofx) / 16.0f; o->y = (float)((s32)v->y - ofy) / 16.0f; o->z = (float)v->z; o->fog = (float)v->f;
+    if (conv & 1) { o->s = (float)v->u / 16.0f; o->t = (float)v->v / 16.0f; o->q = 1.0f; } else { o->s = v->s; o->t = v->t; o->q = v->q; }
+    o->r = (float)(col->rgba & 255); o->g = (float)((col->rgba >> 8) & 255); o->b = (float)((col->rgba >> 16) & 255); o->a = (float)(col->rgba >> 24);
+    o->sx0 = o->sy0 = o->dudx = o->dvdy = 0;
+}
+/* Worker thread (rt/vinterp.c): the vertices of one key time are there. */
+static int hwi_dev_log = -1; static atomic_ullong hwi_dev_hist[3][66], hwi_dev_n;       /* ROR_INTERP_DEV=1: see hwp_key_done */
+static void hwp_key_done(void *user, u64 serial, int k, float t, const VVtx *stream, const u8 *valid) {
+    Pkg *P = user;
+    if (!stream) {
+        /* ROR_INTERP_DEV=1: how far the exact positions at the key times are from straight lines. Per vertex on screen, in native
+         * pixels: [0] every key against the line previous -> new; with three keys, [1] the outer keys against the lines through
+         * the middle key, [2] the middle key against the line through the outer ones. */
+        if (hwi_dev_log > 0 && P->vserial == serial) {
+            int K = P->nkeys, nm = P->nmid;
+            for (int i = 0; i < P->n; i++) {
+                const PPrim *q = &P->p[i]; if (q->mid < 0) continue;
+                for (int kk = 0; kk < K; kk++) {
+                    if (!atomic_load(&P->key_ok[kk]) || !P->midok[kk * nm + q->mid]) continue;
+                    const HwVertex *m = &P->midv[(size_t)(kk * nm + q->mid) * 3]; float tk = (float)(kk + 1) / (float)(K + 1);
+                    for (int j = 0; j < 3; j++) {
+                        if (q->cur[j].x < 0 || q->cur[j].x > 512 || q->cur[j].y < 0 || q->cur[j].y > 448) continue;
+                        float lx = q->prev[j].x + (q->cur[j].x - q->prev[j].x) * tk, ly = q->prev[j].y + (q->cur[j].y - q->prev[j].y) * tk, d = sqrtf((m[j].x - lx) * (m[j].x - lx) + (m[j].y - ly) * (m[j].y - ly));
+                        int b = (int)(d * 16.0f); atomic_fetch_add(&hwi_dev_hist[0][b > 65 ? 65 : b], 1);
+                        if (K == 3 && kk != 1 && atomic_load(&P->key_ok[1]) && P->midok[nm + q->mid]) {
+                            const HwVertex *c = &P->midv[(size_t)(nm + q->mid) * 3 + j], *e = kk ? &q->cur[j] : &q->prev[j];
+                            d = sqrtf((m[j].x - (c->x + e->x) * 0.5f) * (m[j].x - (c->x + e->x) * 0.5f) + (m[j].y - (c->y + e->y) * 0.5f) * (m[j].y - (c->y + e->y) * 0.5f));
+                            b = (int)(d * 16.0f); atomic_fetch_add(&hwi_dev_hist[1][b > 65 ? 65 : b], 1);
+                        }
+                        if (K == 3 && kk == 1 && atomic_load(&P->key_ok[0]) && atomic_load(&P->key_ok[2]) && P->midok[q->mid] && P->midok[2 * nm + q->mid]) {
+                            const HwVertex *a = &P->midv[(size_t)q->mid * 3 + j], *c = &P->midv[(size_t)(2 * nm + q->mid) * 3 + j];
+                            d = sqrtf((m[j].x - (a->x + c->x) * 0.5f) * (m[j].x - (a->x + c->x) * 0.5f) + (m[j].y - (a->y + c->y) * 0.5f) * (m[j].y - (a->y + c->y) * 0.5f));
+                            b = (int)(d * 16.0f); atomic_fetch_add(&hwi_dev_hist[2][b > 65 ? 65 : b], 1);
+                        }
+                    }
+                }
+            }
+            if (atomic_fetch_add(&hwi_dev_n, 1) % 250 == 249) for (int w = 0; w < 3; w++) {
+                u64 n = 0, c = 0, h[66]; double mean = 0; float p50 = 0, p99 = 0, p999 = 0, mx = 0;
+                for (int b = 0; b < 66; b++) { h[b] = atomic_exchange(&hwi_dev_hist[w][b], 0); n += h[b]; mean += (double)h[b] * (b + 0.5) / 16.0; if (h[b]) mx = (float)(b + 1) / 16.0f; }
+                if (!n) continue;
+                for (int b = 0; b < 66; b++) { c += h[b]; if (!p50 && c * 2 >= n) p50 = (float)(b + 1) / 16.0f; if (!p99 && c * 100 >= n * 99) p99 = (float)(b + 1) / 16.0f; if (!p999 && c * 1000 >= n * 999) p999 = (float)(b + 1) / 16.0f; }
+                rt_log("[interp] vblank %llu: %s, native pixels over %llu vertices: mean %.3f, median below %.2f, 99%% below %.2f, 99.9%% below %.2f, largest below %.2f%s; over one pixel: %.3f%%\n", (unsigned long long)g_gs_frames,
+                       w == 0 ? "exact positions against the straight line between the two frames" : w == 1 ? "exact positions at 1/4 and 3/4 against lines through the exact middle" : "exact middle against the line between exact 1/4 and 3/4",
+                       (unsigned long long)n, mean / (double)n, p50, p99, p999, mx, mx > 4.0f ? " (4 = that or more)" : "", 100.0 * (double)({ u64 o = 0; for (int b = 16; b < 66; b++) o += h[b]; o; }) / (double)n);
+            }
+        }
+        atomic_store(&P->busy, 0); return;
+    }
+    if (P->vserial != serial || k >= P->nkeys) return;
+    int nm = P->nmid; HwVertex *mv = P->midv + (size_t)k * nm * 3; u8 *okv = P->midok + (size_t)k * nm; u64 nok = 0;
+    for (int i = 0; i < P->n; i++) {
+        const PPrim *q = &P->p[i]; if (q->mid < 0) continue;
+        HwVertex *m = mv + (size_t)q->mid * 3; int ok = valid[q->run];
+        for (int j = 0; j < 3 && ok; j++) {
+            hwi_vv(&m[j], &stream[q->vi[j]], (q->conv & 2) ? &stream[q->vi[j]] : &stream[q->vi[2]], q->conv, q->ofx, q->ofy);
+            /* a key position is a correction of the straight path, never something else: further from it than a pixel
+             * and half the way travelled, the pass disagrees with the two real frames and is not used for this primitive */
+            float lx = q->prev[j].x + (q->cur[j].x - q->prev[j].x) * t, ly = q->prev[j].y + (q->cur[j].y - q->prev[j].y) * t;
+            float way = fabsf(q->cur[j].x - q->prev[j].x) + fabsf(q->cur[j].y - q->prev[j].y), lim = 1.0f + 0.5f * way;
+            if (!(fabsf(m[j].x - lx) <= lim && fabsf(m[j].y - ly) <= lim)) ok = 0;
+        }
+        okv[q->mid] = (u8)ok; nok += (u64)ok;
+    }
+    atomic_store(&P->key_ok[k], 1);
+}
+/* Vertices of a package's primitive at time t (0 = previous frame, 1 = new frame): straight between the two, or through
+ * the key positions that have arrived. */
+static inline void hwp_vtx(const Pkg *P, const PPrim *q, float t, HwVertex *v) {
+    const HwVertex *lo = q->prev, *hi = q->cur; float t0 = 0.0f, t1 = 1.0f;
+    if (q->mid >= 0) for (int k = 0; k < P->nkeys; k++) {
+        if (!atomic_load_explicit(&P->key_ok[k], memory_order_acquire) || !P->midok[k * P->nmid + q->mid]) continue;
+        const HwVertex *m = &P->midv[(size_t)(k * P->nmid + q->mid) * 3]; float tk = (float)(k + 1) / (float)(P->nkeys + 1);
+        if (tk <= t) { lo = m; t0 = tk; } else { hi = m; t1 = tk; break; }
+    }
+    float u = (t - t0) / (t1 - t0);
+    for (int k = 0; k < q->n; k++) {
+        const float *a = (const float *)&hi[k], *b = (const float *)&lo[k]; float *o = (float *)&v[k];
+        for (size_t f = 0; f < sizeof(HwVertex) / sizeof(float); f++) o[f] = b[f] + (a[f] - b[f]) * u;
+    }
+}
 static Pkg *hwp_publish(const int *partner, int ok, int pic, int sx, int sy, int sw, int sh) {
     if (!hwp_maps_ready) { for (int i = 0; i < 64; i++) hwp_wmap[i] = hwp_wds[i] = -1; hwp_maps_ready = 1; }
     u64 k = hwp_seq + 1; Pkg *P = &hwp_pkg[k & 3];
@@ -2265,19 +2380,26 @@ static Pkg *hwp_publish(const int *partner, int ok, int pic, int sx, int sy, int
      * that far behind, this frame gets no package (the game thread never
      * waits); the next one then cannot be interpolated either, having no
      * start-of-frame copy. */
-    if (atomic_load(&hwp_using) + 3 <= k) { hwi_have_start = -1; hwp_stat_dropped++; g_perf[10]++; return 0; }
+    /* (ROR_INTERP_DETECT, testing: the presenter measures every package and is slow; the game waits for it instead) */
+    if (hwd_from >= 0) for (int w8 = 0; w8 < 2000 && (atomic_load(&hwp_using) + 1 < k || atomic_load(&P->busy)); w8++) plat_sleep_until(plat_time_ns() + 1000000);
+    if (atomic_load(&hwp_using) + 3 <= k || atomic_load(&P->busy)) { hwi_have_start = -1; hwp_stat_dropped++; g_perf[10]++; return 0; }      /* (busy: key-time passes of package k-4 still running) */
     hwp_seq = k;
     if (P->cap < hwi_ncur) { P->cap = hwi_ncur + 1024; P->p = realloc(P->p, sizeof(PPrim) * (size_t)P->cap); }
-    P->n = hwi_ncur;
+    P->n = hwi_ncur; int nmid = 0;
     for (int i = 0; i < hwi_ncur; i++) {
         PPrim *q = &P->p[i]; const RPrim *c = &hwi_cur[i];
-        q->h = c->h; q->n = c->n; q->paired = 0; q->fix_prev = c->h.fix;
+        q->h = c->h; q->n = c->n; q->paired = 0; q->fix_prev = c->h.fix; q->mid = -1; q->run = c->run;
         q->h.rt = hwp_w_rt(c->h.rt); q->h.ds = hwp_w_ds(c->h.ds);
         if (q->h.tex_kind == 2) q->h.tex = hwp_w_rt(c->h.tex);
         memcpy(q->cur, c->v, sizeof(HwVertex) * (size_t)c->n);
         if ((ok || (hw_fsr3 && !hwf_cut)) && partner[i] != -1) {     /* (not ok: the pairs are only used for FSR 3.1 motion vectors) */
-            const RPrim *pv = partner[i] >= 0 ? &hwi_prev[partner[i]] : &hwi_syn[-2 - partner[i]];
+            const RPrim *pv = partner[i] >= 0 ? &hwi_prev[partner[i]] : partner[i] <= HWI_FIX ? c : &hwi_syn[-2 - partner[i]];
             q->paired = 1;
+            if (partner[i] <= HWI_FIX) {           /* previous positions from the VU1 inputs */
+                memcpy(q->prev, hwi_fixv[HWI_FIX - partner[i]], sizeof(HwVertex) * 3);
+                q->vi[0] = c->vi[0]; q->vi[1] = c->vi[1]; q->vi[2] = c->vi[2]; q->ofx = c->ofx; q->ofy = c->ofy; q->conv = c->conv; q->mid = nmid++;
+                continue;
+            }
             if (c->h.flags & HWF_SPRITE) {         /* a sprite that changed size is another thing: let it jump, do not morph */
                 float w0 = c->v[5].x - c->v[0].x, h0 = c->v[5].y - c->v[0].y, w1 = pv->v[5].x - pv->v[0].x, h1 = pv->v[5].y - pv->v[0].y;
                 if (fabsf(w0 - w1) > 0.5f || fabsf(h0 - h1) > 0.5f) q->paired = 0;
@@ -2293,11 +2415,23 @@ static Pkg *hwp_publish(const int *partner, int ok, int pic, int sx, int sy, int
     for (int i = 0; i < HW_MAXRT; i++) if (hrt[i].used) { P->src[P->nrt] = hrt[i].hw; P->dst[P->nrt++] = hwp_w_rt(hrt[i].hw); }
     P->slot = (int)((k - 1) & 3); P->fslot = (int)(k & 3);
     P->pic_game = pic; P->pic_w = hwp_w_rt(pic); P->sx = sx; P->sy = sy; P->sw = sw; P->sh = sh; P->ok = ok;
+    P->pic_tw = P->pic_th = 0;
+    for (int i = 0; i < HW_MAXRT; i++) if (hrt[i].used && hrt[i].hw == pic) { P->pic_tw = (int)hrt[i].fbw * 64; P->pic_th = hrt[i].hrows; }
     /* where this picture belongs in the window: with --wide the rectangle is
      * the wide one for 3D frames and 4:3 for the rest, and the package is
      * shown some vblanks after it was made */
     P->pdx = hwp_par.dx; P->pdy = hwp_par.dy; P->pdw = hwp_par.dw; P->pdh = hwp_par.dh; P->pww = hwp_par.ww; P->pwh = hwp_par.wh;
     P->f_ok = 0;
+    /* key times: the passes run on worker threads and fill the package in while it is being shown */
+    P->nkeys = 0; P->nmid = nmid;
+    for (int kk = 0; kk < HWP_MAXKEYS; kk++) atomic_store(&P->key_ok[kk], 0);
+    if (ok && nmid && hwi_vr && hwi_vr->usable && vi_keys_wanted && vi_keys_wanted() > 0) {
+        int K = vi_keys_wanted(); if (K > HWP_MAXKEYS) K = HWP_MAXKEYS;
+        if (hwi_dev_log < 0) hwi_dev_log = getenv("ROR_INTERP_DEV") ? atoi(getenv("ROR_INTERP_DEV")) : 0;
+        if (P->mid_cap < nmid * K) { P->mid_cap = nmid * K + 4096; P->midv = realloc(P->midv, sizeof(HwVertex) * 3 * (size_t)P->mid_cap); P->midok = realloc(P->midok, (size_t)P->mid_cap); }
+        P->nkeys = K; P->vserial = hwi_vr->serial; atomic_store(&P->busy, 1);
+        if (!vi_keys_submit(hwp_key_done, P)) { P->nkeys = 0; atomic_store(&P->busy, 0); }
+    }
     if (hw_fsr3) hwf_classify(P);
     hw_rt_save(pic, P->fslot, 1);
     hw_keep_generation();
@@ -2350,7 +2484,7 @@ void wide_frustum(float *cam);                     /* rt/wide.c: near, far, vert
 static int hwf_ovl_scale;
 static struct { int w, h, n, rt, ds; } hwf_tg[12]; static int hwf_ntg;      /* targets by size: n = 0 motion vectors, else the 2D layer at scale n (two targets) */
 static struct { int dx, dy, dw, dh, ww, wh; } hwf_rect;                    /* where the picture goes in the output (game thread, no presenter) */
-static struct { int pic, w, h, valid; } hwf_out[2];                        /* upscaled pictures kept for the game's two display buffers */
+static struct { int pic, w, h, valid, gen; } hwf_out[2];                   /* upscaled pictures kept for the game's two display buffers; gen: the generated picture leading up to it has not been shown yet */
 static double hwf_last_tau; static int hwf_reset = 1; static u64 hwf_last_ns;
 static int hwf_target(int w, int h, int n, int second) {
     for (int i = 0; i < hwf_ntg; i++) if (hwf_tg[i].w == w && hwf_tg[i].h == h && hwf_tg[i].n == n) return second == 2 ? hwf_tg[i].ds : hwf_tg[i].rt + (second == 1);
@@ -2379,6 +2513,10 @@ static void hwf_classify(Pkg *P) {
         if (p1 && in_pic && P->p[i].n == 3 && !(h->flags & HWF_SPRITE)) {
             if (h->zwrite) c |= 4 | ((h->flags & HWF_ATE) && h->afail == 1 && (h->cmask & 7) ? 16 : 0);
             else if ((h->cmask & 7) || h->need_dst) c |= 8;
+            /* geometry without a previous position (new in this frame, or a run the inputs could not vouch for and the
+             * pairing found nothing for) has no motion to give: zero vectors, and marked reactive so that the upscaler
+             * does not blend it with what was there before */
+            if (!P->p[i].paired && !hwf_cut && (h->cmask & 7)) c |= 8;
         }
         P->cls[i] = c;
     }
@@ -2393,13 +2531,11 @@ static void hwf_classify(Pkg *P) {
     P->f_ok = 1;
 }
 /* A primitive of a package at time t: vertices blended towards the previous frame's, as the presenter does. */
+static const Pkg *hwf_pkg;                          /* the package hwf_render is drawing */
 static void hwf_vtx(const PPrim *q, float t, HwState *h, HwVertex *v) {
     *h = q->h;
     if (!q->paired || t >= 1.0f) { memcpy(v, q->cur, sizeof(HwVertex) * (size_t)q->n); return; }
-    for (int k = 0; k < q->n; k++) {
-        const float *a = (const float *)&q->cur[k], *b = (const float *)&q->prev[k]; float *o = (float *)&v[k];
-        for (size_t f = 0; f < sizeof(HwVertex) / sizeof(float); f++) o[f] = b[f] + (a[f] - b[f]) * t;
-    }
+    hwp_vtx(hwf_pkg, q, t, v);
     if (q->fix_prev != q->h.fix) {
         int fx = (int)lrintf((float)q->fix_prev + ((float)q->h.fix - (float)q->fix_prev) * t);
         h->fix = (u8)fx; if (h->blend >> 8) h->blend = (h->blend & 0xFF) | ((u32)fx << 8);
@@ -2416,7 +2552,7 @@ static int hwf_render(Pkg *P, float t, int slot, int dw, int dh) {
     if (mk < 0.0f) mk = 0.0f; if (mk > 1.5f) mk = 1.5f;
     static int noreact = -1, nomv; if (noreact < 0) { noreact = getenv("ROR_FSR3_NOREACTIVE") != 0; nomv = getenv("ROR_FSR3_NOMV") != 0; }
     if (nomv) mk = 0.0f;
-    HwState h; HwVertex v[6];
+    HwState h; HwVertex v[6]; hwf_pkg = P;
     for (int i = 0; i < P->nrt; i++) hw_rt_load(P->dst[i], P->src[i], P->slot, 0);
     /* the scene, jittered */
     for (int i = 0; i < P->n; i++) {
@@ -2477,32 +2613,37 @@ static int hwf_render(Pkg *P, float t, int slot, int dw, int dh) {
     f.color = P->pic_w; f.sx = P->sx; f.sy = P->sy; f.sw = P->sw; f.sh = P->sh; f.mv = P->f_mv;
     f.ovl_b = P->f_ovl ? P->f_ob : -1; f.ovl_w = P->f_ovl ? P->f_ow : -1; f.slot = slot; f.reset = reset; f.no_reactive = noreact;
     f.dt_ms = hw_fps_on && hwf_last_ns ? (float)(now - hwf_last_ns) / 1e6f : 40.0f; if (f.dt_ms > 100.0f) f.dt_ms = 100.0f;
+    f.fg = hw_fg;
     f.cam_near = P->cam[0]; f.cam_far = P->cam[1]; f.cam_fovy = P->cam[2];
     f.unit_m = 0.025f;               /* estimate: one game unit is about 2.5 cm (near plane 5, far 2000..5000) */
     hwf_last_ns = now;
-    if (!hw_fsr3_upscale(&f)) { hw_fsr3 = 0; return 0; }
+    int done = hw_fsr3_upscale(&f);
+    if (!done) { hw_fsr3 = hw_tu_alive(); return 0; }              /* (DLSS giving up leaves FSR 3.1, if its DLLs are there) */
     {   static int log = -1; static u64 n, nreset; if (log < 0) log = getenv("ROR_FSR3_LOG") ? atoi(getenv("ROR_FSR3_LOG")) : 0;
         n++; nreset += (u64)reset;
-        if (log && (n % (u64)log == 0 || reset)) rt_log("[fsr3] vblank %llu: picture %llu (package %llu, t %.2f) into slot %d: motion scale %.2f, jitter %.3f %.3f px, %s2D layer%s; %llu resets so far\n", (unsigned long long)g_gs_frames, (unsigned long long)n,
-                    (unsigned long long)P->seq, t, slot, mk, jx * N, jy * N, P->f_ovl ? "" : "no ", reset ? ", history reset" : "", (unsigned long long)nreset); }
+        if (log && (n % (u64)log == 0 || reset)) rt_log("[fsr3] vblank %llu: picture %llu (package %llu, t %.2f) into slot %d: motion scale %.2f, jitter %.3f %.3f px, %s2D layer%s%s; %llu resets so far\n", (unsigned long long)g_gs_frames, (unsigned long long)n,
+                    (unsigned long long)P->seq, t, slot, mk, jx * N, jy * N, P->f_ovl ? "" : "no ", reset ? ", history reset" : "", done == 2 ? ", with a generated picture" : "", (unsigned long long)nreset); }
     hwf_reset = 0; hwf_last_tau = tau;
-    return 1;
+    return done;                                 /* 2: the generated picture (frame generation) is ready as well */
 }
 /* Game thread without a presenter: upscale the frame that was just completed.
  * It is shown from the moment the game displays the buffer it was drawn into. */
 static void hwf_boundary(Pkg *P) {
     int pic = P->pic_game, slot = -1;
-    for (int s = 0; s < 2; s++) if (hwf_out[s].pic == pic) { hwf_out[s].valid = 0; slot = s; }
+    for (int s = 0; s < 2; s++) if (hwf_out[s].pic == pic) { hwf_out[s].valid = hwf_out[s].gen = 0; slot = s; }
     if (slot < 0) slot = !hwf_out[0].valid ? 0 : !hwf_out[1].valid ? 1 : 0;
-    if (!P->f_ok || hwf_rect.dw <= 0 || !hwf_render(P, 1.0f, slot, hwf_rect.dw, hwf_rect.dh)) { hwf_reset = 1; return; }
-    hwf_out[slot].pic = pic; hwf_out[slot].w = hwf_rect.dw; hwf_out[slot].h = hwf_rect.dh; hwf_out[slot].valid = 1;
+    int done = !P->f_ok || hwf_rect.dw <= 0 ? 0 : hwf_render(P, 1.0f, slot, hwf_rect.dw, hwf_rect.dh);
+    if (!done) { hwf_reset = 1; return; }
+    hwf_out[slot].pic = pic; hwf_out[slot].w = hwf_rect.dw; hwf_out[slot].h = hwf_rect.dh; hwf_out[slot].valid = 1; hwf_out[slot].gen = done == 2;
 }
 /* Before a present of game target `hw` by the game thread: use its upscaled picture if there is one. */
 static void hwf_show(int hw, int linear, int dw, int dh) {
     if (!hw_fsr3 || linear != 3 || hw_fps_on) return;
     { static int log = -1; if (log < 0) log = getenv("ROR_FSR3_LOG") != 0;
       if (log && (g_gs_frames % 200 == 0)) rt_log("[fsr3] vblank %llu: present of target %d at %dx%d; slots: %d %dx%d valid %d, %d %dx%d valid %d\n", (unsigned long long)g_gs_frames, hw, dw, dh, hwf_out[0].pic, hwf_out[0].w, hwf_out[0].h, hwf_out[0].valid, hwf_out[1].pic, hwf_out[1].w, hwf_out[1].h, hwf_out[1].valid); }
-    for (int s = 0; s < 2; s++) if (hwf_out[s].valid && hwf_out[s].pic == hw && hwf_out[s].w == dw && hwf_out[s].h == dh) hw_fsr3_show(s);
+    /* Frame generation: the first vblank that displays a new picture shows the generated one leading up to it, the
+     * following vblanks the picture itself (the game draws 25 pictures for 50 vblanks, so that is 50 different ones). */
+    for (int s = 0; s < 2; s++) if (hwf_out[s].valid && hwf_out[s].pic == hw && hwf_out[s].w == dw && hwf_out[s].h == dh) { hw_fsr3_show(hwf_out[s].gen ? 2 + s : s); hwf_out[s].gen = 0; }
 }
 static int cmp_u64(const void *a, const void *b) { u64 x = *(const u64 *)a, y = *(const u64 *)b; return x < y ? -1 : x > y; }
 /* ROR_HW_GRAB=frame,count[,stride] (+ ROR_HW_GRAB_DIR): PNGs of `count`
@@ -2521,6 +2662,86 @@ static void hwg_grab_after(int tag) {
     snprintf(path, sizeof path, "%s/grab_%03d_v%06llu_t%03d.png", dir ? dir : ".", hwg_grab_i++, (unsigned long long)g_gs_frames, tag);
     save_png(path, img, w, h); free(img);
 }
+/* The picture of package P at time t (0 = the previous frame's positions, 1 = the new frame's) into the presenter's targets. */
+static void hwp_draw_at(Pkg *P, float t, int skip_new) {
+    for (int i = 0; i < P->nrt; i++) hw_rt_load(P->dst[i], P->src[i], P->slot, 0);
+    for (int i = 0; i < P->n; i++) {
+        PPrim *q = &P->p[i];
+        if (!q->paired) { if (!skip_new) hw_draw(&q->h, q->cur, q->n); continue; }
+        HwVertex v[6]; HwState h = q->h;
+        hwp_vtx(P, q, t, v);
+        if (q->fix_prev != q->h.fix) {     /* a fade by the blend constant */
+            int fx = (int)lrintf((float)q->fix_prev + ((float)q->h.fix - (float)q->fix_prev) * t);
+            h.fix = (u8)fx; if (h.blend >> 8) h.blend = (h.blend & 0xFF) | ((u32)fx << 8);
+        }
+        hw_draw(&h, v, q->n);
+    }
+}
+/* ROR_INTERP_DETECT=first[,last[,save]] (testing): for every package the presenter takes between those vblanks, the
+ * picture half-way between the two game frames is rendered once more off the clock, reduced to PS2 resolution and
+ * compared with the two real pictures: a pixel counts when one of its channels is more than 16 outside the range
+ * that channel has within 8 pixels in both real pictures (something that is in neither frame). One log line per
+ * package, totals every 250; pictures with `save` or more such pixels (default 40) are written to ROR_HW_STRIP_DIR
+ * (previous, half-way, new, and the half-way picture with the counted pixels in magenta). */
+static void hwd_minmax(const u8 *src, u8 *mn, u8 *mx, int w, int h, int rad, u8 *t0, u8 *t1) {
+    for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) {
+        int a = 255, b = 0; for (int k = x - rad < 0 ? 0 : x - rad; k <= x + rad && k < w; k++) { int v = src[y * w + k]; if (v < a) a = v; if (v > b) b = v; }
+        t0[y * w + x] = (u8)a; t1[y * w + x] = (u8)b;
+    }
+    for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) {
+        int a = 255, b = 0; for (int k = y - rad < 0 ? 0 : y - rad; k <= y + rad && k < h; k++) { if (t0[k * w + x] < a) a = t0[k * w + x]; if (t1[k * w + x] > b) b = t1[k * w + x]; }
+        mn[y * w + x] = (u8)a; mx[y * w + x] = (u8)b;
+    }
+}
+static void hwd_grab(Pkg *P, u32 *out) {            /* the picture in the presenter's target, at PS2 resolution, 0x00RRGGBB */
+    int N = hw_scale, w = P->sw, h = P->sh; const u32 *src = hw_rt_read_scaled(P->pic_w, P->sx, P->sy, w, h);
+    for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) {
+        u32 r = 0, g = 0, b = 0;
+        for (int j = 0; j < N; j++) for (int i = 0; i < N; i++) { u32 c = src[(size_t)(y * N + j) * (size_t)(w * N) + (size_t)(x * N + i)]; r += c & 255; g += (c >> 8) & 255; b += (c >> 16) & 255; }
+        u32 nn = (u32)(N * N); out[y * w + x] = ((r / nn) << 16) | ((g / nn) << 8) | (b / nn);
+    }
+}
+static void hwd_package(Pkg *P) {
+    static u32 *pa, *pm, *pb, *mark; static u8 *work; static int cw, ch; static u64 a_seq; static u64 n_pk, n_meas, n3, n10, n40, n_not, n_gap, saved;
+    int w = P->sw, h = P->sh; size_t n = (size_t)w * (size_t)h;
+    if (w <= 0 || h <= 0 || P->sx + w > P->pic_tw || P->sy + h > P->pic_th) { a_seq = 0; rt_log("[detect] vblank %llu package %llu: -2\n", (unsigned long long)g_gs_frames, (unsigned long long)P->seq); return; }     /* the list painted something else than a display buffer */
+    if (w != cw || h != ch) { free(pa); free(pm); free(pb); free(mark); free(work); pa = malloc(n * 4); pm = malloc(n * 4); pb = malloc(n * 4); mark = malloc(n * 4); work = malloc(n * 8); cw = w; ch = h; a_seq = 0; }
+    for (int k = 0; k < 300 && atomic_load(&P->busy); k++) plat_sleep_until(plat_time_ns() + 1000000);      /* (key-time passes still running) */
+    long cnt = -1;
+    if (P->ok && a_seq + 1 == P->seq) { hwp_draw_at(P, 0.5f, 0); hwd_grab(P, pm); }
+    hw_rt_load(P->pic_w, P->pic_game, P->fslot, 1); hwd_grab(P, pb);
+    n_pk++;
+    if (!P->ok) n_not++;
+    else if (a_seq + 1 != P->seq) n_gap++;
+    else {
+        u8 *chv = work, *mn0 = work + n, *mx0 = work + 2 * n, *mn1 = work + 3 * n, *mx1 = work + 4 * n, *bad = work + 5 * n, *t0 = work + 6 * n, *t1 = work + 7 * n;
+        memset(bad, 0, n); cnt = 0;
+        for (int c = 0; c < 3; c++) {
+            for (size_t i = 0; i < n; i++) chv[i] = (u8)(pa[i] >> (8 * c));
+            hwd_minmax(chv, mn0, mx0, w, h, 8, t0, t1);
+            for (size_t i = 0; i < n; i++) chv[i] = (u8)(pb[i] >> (8 * c));
+            hwd_minmax(chv, mn1, mx1, w, h, 8, t0, t1);
+            for (size_t i = 0; i < n; i++) {
+                int v = (pm[i] >> (8 * c)) & 255, lo = mn0[i] < mn1[i] ? mn0[i] : mn1[i], hi = mx0[i] > mx1[i] ? mx0[i] : mx1[i];
+                if (v > hi + 16 || v < lo - 16) bad[i] = 1;
+            }
+        }
+        for (size_t i = 0; i < n; i++) cnt += bad[i];
+        n_meas++; n3 += cnt >= 3; n10 += cnt >= 10; n40 += cnt >= 40;
+        if (cnt >= hwd_save && saved < 60) {
+            char path[300]; const char *dir = getenv("ROR_HW_STRIP_DIR"); saved++;
+            for (size_t i = 0; i < n; i++) mark[i] = bad[i] ? 0xFF00FF : ((pm[i] >> 2) & 0x3F3F3F);
+            snprintf(path, sizeof path, "%s/det_v%06llu_%ldpx_0prev.png", dir ? dir : ".", (unsigned long long)g_gs_frames, cnt); save_png(path, pa, w, h);
+            snprintf(path, sizeof path, "%s/det_v%06llu_%ldpx_1half.png", dir ? dir : ".", (unsigned long long)g_gs_frames, cnt); save_png(path, pm, w, h);
+            snprintf(path, sizeof path, "%s/det_v%06llu_%ldpx_2new.png", dir ? dir : ".", (unsigned long long)g_gs_frames, cnt); save_png(path, pb, w, h);
+            snprintf(path, sizeof path, "%s/det_v%06llu_%ldpx_3mark.png", dir ? dir : ".", (unsigned long long)g_gs_frames, cnt); save_png(path, mark, w, h);
+        }
+    }
+    rt_log("[detect] vblank %llu package %llu: %ld\n", (unsigned long long)g_gs_frames, (unsigned long long)P->seq, cnt);
+    if (n_pk % 250 == 0) rt_log("[detect] total at vblank %llu: %llu packages, %llu measured, with at least 3 / 10 / 40 pixels in neither frame: %llu / %llu / %llu; %llu not interpolated, %llu without the frame before\n", (unsigned long long)g_gs_frames,
+                                (unsigned long long)n_pk, (unsigned long long)n_meas, (unsigned long long)n3, (unsigned long long)n10, (unsigned long long)n40, (unsigned long long)n_not, (unsigned long long)n_gap);
+    { u32 *t = pa; pa = pb; pb = t; } a_seq = P->seq;
+}
 static void *hwp_thread(void *arg) {
     (void)arg;
     _mm_setcsr(worker_csr);
@@ -2528,8 +2749,9 @@ static void *hwp_thread(void *arg) {
     hw_thread_init();
     Pkg *cur = 0, *next = 0; u64 taken = 0, last_present = 0, due = 0; int shown_final = 0, lw = 0, lh = 0;
     static u64 iv[1024]; int niv = 0; u64 render_ns = 0, presents = 0, t_log = 0;
-    int strip_from = -1, strip_n = 0, strip_i = 0; u64 strip_seq = 0; const char *strip_dir = getenv("ROR_HW_STRIP_DIR");
-    if (getenv("ROR_HW_STRIP")) sscanf(getenv("ROR_HW_STRIP"), "%d,%d", &strip_from, &strip_n);
+    int strip_from = -1, strip_n = 0, strip_i = 0, strip_pk = 2; u64 strip_seq = 0, det_seq = 0; const char *strip_dir = getenv("ROR_HW_STRIP_DIR");
+    if (getenv("ROR_HW_STRIP")) sscanf(getenv("ROR_HW_STRIP"), "%d,%d,%d", &strip_from, &strip_n, &strip_pk);
+    if (hwd_from == -2) { hwd_from = -1; if (getenv("ROR_INTERP_DETECT")) sscanf(getenv("ROR_INTERP_DETECT"), "%d,%d,%d", &hwd_from, &hwd_to, &hwd_save); }
     for (;;) {
         int dx, dy, dw, dh, ww, wh, linear, sat64;
         pthread_mutex_lock(&hwp_mx);
@@ -2542,69 +2764,54 @@ static void *hwp_thread(void *arg) {
         atomic_store(&hwp_using, cur ? cur->seq : 1ull << 62);
         if (!cur || ww <= 0 || wh <= 0) { plat_sleep_until(now + 2000000); continue; }
         if (cur->pww == ww && cur->pwh == wh) { dx = cur->pdx; dy = cur->pdy; dw = cur->pdw; dh = cur->pdh; }   /* the package's own rectangle unless the window changed size since */
+        if (hwd_from >= 0 && cur->seq != det_seq && (int)g_gs_frames >= hwd_from && (int)g_gs_frames <= hwd_to && !(hw_fsr3 && linear == 3)) { det_seq = cur->seq; hwd_package(cur); now = plat_time_ns(); }
         float t = 1.0f;
         if (cur->ok) { t = now <= cur->t_ns ? 0.0f : (float)((double)(now - cur->t_ns) / (double)cur->dur_ns); if (t > 1.0f) t = 1.0f; }
         if (t >= 1.0f && shown_final && ww == lw && wh == lh) { plat_sleep_until(now + 500000); continue; }
         /* Rate limit: --fps N; for the display rate only if presenting does not
          * wait for the display by itself (decided from the first intervals). */
-        static int limit = -1; static u64 probe_sum; static int probe_n;
+        static int limit = -1, fg_prev; static u64 probe_sum; static int probe_n;
         if (limit < 0) limit = hw_fps_target;
         if (limit > 0) {
             if (due > now) { plat_sleep_until(due); now = plat_time_ns(); }
-            due = (due && due + 100000000ull > now ? due : now) + 1000000000ull / (u64)limit;
+            due = (due && due + 100000000ull > now ? due : now) + (fg_prev ? 2000000000ull : 1000000000ull) / (u64)limit;    /* frame generation: every second presented picture is rendered */
         }
         int fs = 0;                       /* FSR 3.1: this picture comes from the temporal upscaler */
         if (hw_fsr3 && linear == 3) {
             if (cur->f_ok && dw > 0 && dh > 0) fs = hwf_render(cur, t, 0, dw, dh);
             if (!fs) hwf_reset = 1;
         }
+        fg_prev = fs == 2;
         if (fs) { if (t >= 1.0f) shown_final = 1; }
         else if (t >= 1.0f) { hw_rt_load(cur->pic_w, cur->pic_game, cur->fslot, 1); shown_final = 1; }
-        else {
-            for (int i = 0; i < cur->nrt; i++) hw_rt_load(cur->dst[i], cur->src[i], cur->slot, 0);
-            for (int i = 0; i < cur->n; i++) {
-                PPrim *q = &cur->p[i];
-                if (!q->paired) { hw_draw(&q->h, q->cur, q->n); continue; }
-                HwVertex v[6]; HwState h = q->h;
-                for (int k = 0; k < q->n; k++) {
-                    const float *a = (const float *)&q->cur[k], *b = (const float *)&q->prev[k]; float *o = (float *)&v[k];
-                    for (size_t f = 0; f < sizeof(HwVertex) / sizeof(float); f++) o[f] = b[f] + (a[f] - b[f]) * t;
-                }
-                if (q->fix_prev != q->h.fix) {     /* a fade by the blend constant */
-                    int fx = (int)lrintf((float)q->fix_prev + ((float)q->h.fix - (float)q->fix_prev) * t);
-                    h.fix = (u8)fx; if (h.blend >> 8) h.blend = (h.blend & 0xFF) | ((u32)fx << 8);
-                }
-                hw_draw(&h, v, q->n);
-            }
-        }
+        else hwp_draw_at(cur, t, 0);
         lw = ww; lh = wh;
         /* ROR_HW_STRIP=frame,count: for the two packages current after that
          * vblank, `count` pictures at evenly spaced t from 0 to 1, rendered
          * off the clock and saved as PNGs (to look at the in-betweens). */
-        if (strip_n > 1 && (int)g_gs_frames >= strip_from && strip_i < 2 && cur->ok && cur->seq != strip_seq) {
+        if (strip_n > 1 && (int)g_gs_frames >= strip_from && strip_i < strip_pk && cur->ok && cur->seq != strip_seq && cur->sx + cur->sw <= cur->pic_tw && cur->sy + cur->sh <= cur->pic_th) {
             strip_seq = cur->seq;
+            for (int w8 = 0; w8 < 300 && atomic_load(&cur->busy); w8++) plat_sleep_until(plat_time_ns() + 1000000);      /* (key-time passes still running) */
             size_t npx = (size_t)cur->sw * hw_scale * (size_t)cur->sh * hw_scale; u32 *img = malloc(npx * 4); char path[300];
             for (int m = 0; m < strip_n; m++) {
                 float ts = (float)m / (float)(strip_n - 1);
-                for (int i = 0; i < cur->nrt; i++) hw_rt_load(cur->dst[i], cur->src[i], cur->slot, 0);
-                for (int i = 0; i < cur->n; i++) {
-                    PPrim *q = &cur->p[i]; HwVertex v[6];
-                    if (!q->paired) { if (m) hw_draw(&q->h, q->cur, q->n); continue; }
-                    for (int k = 0; k < q->n; k++) {
-                        const float *a = (const float *)&q->cur[k], *b = (const float *)&q->prev[k]; float *o = (float *)&v[k];
-                        for (size_t f = 0; f < sizeof(HwVertex) / sizeof(float); f++) o[f] = b[f] + (a[f] - b[f]) * ts;
-                    }
-                    hw_draw(&q->h, v, q->n);
-                }
+                hwp_draw_at(cur, ts, m == 0);
                 const u32 *src = hw_rt_read_scaled(cur->pic_w, cur->sx, cur->sy, cur->sw, cur->sh);
                 for (size_t i = 0; i < npx; i++) { u32 cc = src[i]; img[i] = ((cc & 0xFF) << 16) | (cc & 0xFF00) | ((cc >> 16) & 0xFF); }
-                snprintf(path, sizeof path, "%s/strip_pkg%llu_%02d_t%03d.png", strip_dir ? strip_dir : ".", (unsigned long long)cur->seq, m, (int)(ts * 100.0f));
+                snprintf(path, sizeof path, "%s/strip_v%06llu_pkg%llu_%02d_t%03d.png", strip_dir ? strip_dir : ".", (unsigned long long)g_gs_frames, (unsigned long long)cur->seq, m, (int)(ts * 100.0f));
                 save_png(path, img, cur->sw * hw_scale, cur->sh * hw_scale);
             }
             free(img); strip_i++;
             continue;
         }
         u64 t1 = plat_time_ns();
+        if (fs == 2) {                    /* frame generation: first the picture half-way from the previous one, half a step later this one */
+            hwg_grab_before();
+            hw_fsr3_show(2);
+            hw_present(cur->pic_w, cur->sx, cur->sy, cur->sw, cur->sh, dx, dy, dw, dh, ww, wh, linear, sat64);
+            hwg_grab_after(900 + (int)(t * 99.0f));
+            if (limit > 0) plat_sleep_until(now + 1000000000ull / (u64)limit);
+        }
         hwg_grab_before();
         if (fs) hw_fsr3_show(0);
         hw_present(cur->pic_w, cur->sx, cur->sy, cur->sw, cur->sh, dx, dy, dw, dh, ww, wh, linear, sat64);
@@ -2679,6 +2886,81 @@ static void hwi_boundary(HRt *disp, u32 dbx, u32 dby, u32 ww, u32 hh) {
     int *partner = malloc(sizeof(int) * (size_t)(hwi_ncur + 1)); u64 tm0 = plat_time_ns(), tm1 = 0, tm2 = 0, perf_w0 = hw_stat_wait_ns;
     if (hwi_strict < 0) { hwi_strict = !(getenv("ROR_HW_INTERP_CHECK") && atoi(getenv("ROR_HW_INTERP_CHECK")) == 0); hwi_stats = getenv("ROR_HW_INTERP_STATS") != 0; }
     long tot = 0, matched = 0, snapped = 0, n_cross = 0; int j = 0, batches = 0, mb = 0, sb = 0, rb = 0;
+    /* The VU1 inputs first (rt/vinterp.c): a triangle of a run that is the same run as in the previous frame, sending
+     * the same vertices in the same order, was made of the same vertices of that run then. Those primitives get their
+     * previous positions here and take no part in the pairing below; neither do the previous frame's primitives of
+     * the runs they came from. Everything else (2D, runs without a partner or with another structure, frames the
+     * recording does not cover) is paired by position in the draw list as before. */
+    const VResult *VR = vi_boundary ? vi_boundary() : 0;
+    int *fixp = 0, *cmap = 0, *pmap = 0, *partner_full = partner, full_ncur = hwi_ncur, full_nprev = hwi_nprev; RPrim *full_cur = hwi_cur, *full_prev = hwi_prev;
+    hwi_vr = VR; hwi_nfix = 0; int vfar = 0;
+    if (VR && VR->nrun) for (int i = 0; i < hwi_ncur; i++) g_vi_stat[VIS_PRIMS] += hwi_cur[i].run >= 0;
+    if (VR && VR->usable && !VR->cut) {
+        static int selfcheck = -1; long sc_bad = 0, n_jump = 0, n_new = 0, n_seen = 0, n_far = 0, n_clip = 0; static long dbg[3];
+        if (selfcheck < 0) selfcheck = getenv("ROR_INTERP_SELFCHECK") != 0;
+        fixp = malloc(sizeof(int) * (size_t)(hwi_ncur + 1));
+        if (hwi_cfix < hwi_ncur) { hwi_cfix = hwi_ncur + 4096; hwi_fixv = realloc(hwi_fixv, sizeof(HwVertex) * 3 * (size_t)hwi_cfix); }
+        u8 *claimed = calloc((size_t)VR->pnrun + 1, 1);
+        for (int i = 0; i < hwi_ncur; i++) {
+            const RPrim *c = &hwi_cur[i]; fixp[i] = -1;
+            if (c->run < 0 || c->run >= VR->nrun) continue;
+            int d = VR->delta[c->run], v0 = VR->v0[c->run];
+            if (selfcheck && c->vi[0] >= 0 && c->vi[1] >= 0 && c->vi[2] >= 0 && c->vi[2] < VR->nvtx) {      /* the recorded stream must give the primitive back */
+                HwVertex t3[3];
+                for (int q = 0; q < 3; q++) hwi_vv(&t3[q], &VR->cur[c->vi[q]], (c->conv & 2) ? &VR->cur[c->vi[q]] : &VR->cur[c->vi[2]], c->conv, 0, 0);
+                sc_bad += memcmp(t3, c->v, sizeof t3) != 0;
+            }
+            if (d == VI_NONE || c->vi[0] < v0 || c->vi[1] < v0 || c->vi[2] < v0 || c->vi[2] + d >= VR->pnvtx) continue;
+            /* Triangle fans are what the program's clipper sends: the polygon left of a triangle cut by the view volume.
+             * Its corners are made per frame; corner i of one frame is not corner i of the next. Left to the pairing. */
+            if ((VR->cur[c->vi[2]].kind & 7) == 5) { n_clip++; continue; }
+            HwVertex *pv = hwi_fixv[hwi_nfix]; const VVtx *S = VR->prev + d; int jump = 0;
+            for (int q = 0; q < 3; q++) {
+                hwi_vv(&pv[q], &S[c->vi[q]], (c->conv & 2) ? &S[c->vi[q]] : &S[c->vi[2]], c->conv, 0, 0);
+                /* a vertex that is in the picture in both frames and half a picture apart did not travel there */
+                const HwVertex *a = &pv[q], *b = &c->v[q];
+                if (a->x >= 0 && a->x <= 640 && a->y >= 0 && a->y <= 512 && b->x >= 0 && b->x <= 640 && b->y >= 0 && b->y <= 512) {
+                    float dx = a->x - b->x, dy = a->y - b->y;
+                    if (fabsf(dx) > 256.0f || fabsf(dy) > 224.0f) jump = 1;
+                    n_seen++; n_far += dx * dx + dy * dy > hwi_snap_px * hwi_snap_px;
+                }
+            }
+            if (jump) { n_jump++; continue; }
+            {   /* a triangle that turns over or changes its size several times within one frame is not followed (the same
+                 * tests as for a pair, hwi_check) */
+                float ac = (c->v[1].x - c->v[0].x) * (c->v[2].y - c->v[0].y) - (c->v[2].x - c->v[0].x) * (c->v[1].y - c->v[0].y);
+                float ap = (pv[1].x - pv[0].x) * (pv[2].y - pv[0].y) - (pv[2].x - pv[0].x) * (pv[1].y - pv[0].y), mc = fabsf(ac), mp = fabsf(ap);
+                if (((mc > 128.0f || mp > 128.0f) && (mc > 4.0f * mp || mp > 4.0f * mc)) || (mc > 32.0f && mp > 32.0f && (ac > 0) != (ap > 0))) { n_new++; dbg[(mc > 32.0f && mp > 32.0f && (ac > 0) != (ap > 0)) ? 2 : 1]++; continue; }
+            }
+            if (!(S[c->vi[2]].kind & 8)) {
+                /* The run sent these vertices in the previous frame too but did not draw this triangle there (culled). Their
+                 * positions are only good as a starting place if they were in front of the camera and the triangle faced the
+                 * same way; otherwise it is left to the pairing below, which moves it with its neighbours or lets it appear. */
+                float ac = (c->v[1].x - c->v[0].x) * (c->v[2].y - c->v[0].y) - (c->v[2].x - c->v[0].x) * (c->v[1].y - c->v[0].y);
+                float ap = (pv[1].x - pv[0].x) * (pv[2].y - pv[0].y) - (pv[2].x - pv[0].x) * (pv[1].y - pv[0].y);
+                if (!(S[c->vi[0]].q > 0.0f && S[c->vi[1]].q > 0.0f && S[c->vi[2]].q > 0.0f) || (ac > 0) != (ap > 0)) { n_new++; continue; }
+            }
+            fixp[i] = hwi_nfix++; claimed[VR->prun[c->run]] = 1;
+        }
+        /* A cut the camera test did not see (it knows one kind of camera block): when a third of the vertices in the
+         * picture are further from their previous place than the pairing would ever accept, the picture did not move,
+         * it changed. Real frames only then. */
+        if (n_far * 10 > n_seen * 3 && n_seen > 300) { vfar = 1; hwi_nfix = 0; for (int i = 0; i < hwi_ncur; i++) fixp[i] = -1; g_vi_stat[VIS_CUT]++; g_vi_stat[VIS_USED]--; }
+        g_vi_stat[VIS_PRIMS_OK] += (u64)hwi_nfix; g_vi_stat[VIS_RUNS_JUMP] += (u64)n_jump; g_vi_stat[VIS_PRIMS_NEW] += (u64)n_new; g_vi_stat[VIS_PRIMS_CLIP] += (u64)n_clip;
+        { static u64 fr; if (getenv("ROR_INTERP_DEBUG") && ++fr % 250 == 0) rt_log("[interp] refused so far: behind camera %ld, area %ld, facing %ld\n", dbg[0], dbg[1], dbg[2]); }
+        if (selfcheck) { static u64 n, bad; n++; bad += (u64)sc_bad; if (sc_bad || n % 500 == 0) rt_log("[interp] self-check at vblank %llu: %ld primitives of this frame differ from their recorded vertices (%llu in %llu frames so far)\n", (unsigned long long)g_gs_frames, sc_bad, (unsigned long long)bad, (unsigned long long)n); }
+        if (hwi_nfix) {
+            static RPrim *tc, *tp; static int tcc, tpc; int nc = 0, np = 0;
+            if (tcc < hwi_ncur + 1) { tcc = hwi_ncur + 4096; tc = realloc(tc, sizeof(RPrim) * (size_t)tcc); }
+            if (tpc < hwi_nprev + 1) { tpc = hwi_nprev + 4096; tp = realloc(tp, sizeof(RPrim) * (size_t)tpc); }
+            cmap = malloc(sizeof(int) * (size_t)(hwi_ncur + 1)); pmap = malloc(sizeof(int) * (size_t)(hwi_nprev + 1));
+            for (int i = 0; i < hwi_ncur; i++) if (fixp[i] < 0) { cmap[nc] = i; tc[nc++] = hwi_cur[i]; }
+            for (int q = 0; q < hwi_nprev; q++) if (!(hwi_prev[q].run >= 0 && hwi_prev[q].run < VR->pnrun && claimed[hwi_prev[q].run])) { pmap[np] = q; tp[np++] = hwi_prev[q]; }
+            hwi_cur = tc; hwi_ncur = nc; hwi_prev = tp; hwi_nprev = np;
+            partner = malloc(sizeof(int) * (size_t)(nc + 1));
+        }
+        free(claimed);
+    }
     hwi_kbuild();
     /* Primitive by primitive, in order. When the states differ, the previous
      * list is searched forward for the start of a batch with this state (a
@@ -2771,6 +3053,15 @@ static void hwi_boundary(HRt *disp, u32 dbx, u32 dby, u32 ww, u32 hh) {
             free(used); free(tab); free(next); free(hv);
         }
     }
+    if (cmap) {                  /* back to the whole lists */
+        int *tpart = partner, nc = hwi_ncur; partner = partner_full;
+        hwi_cur = full_cur; hwi_ncur = full_ncur; hwi_prev = full_prev; hwi_nprev = full_nprev;
+        for (int i = 0; i < hwi_ncur; i++) partner[i] = fixp[i] >= 0 ? HWI_FIX - fixp[i] : -1;
+        for (int k = 0; k < nc; k++) if (tpart[k] >= 0) partner[cmap[k]] = pmap[tpart[k]];
+        free(tpart); free(cmap); free(pmap);
+        tot += 3L * hwi_nfix; matched += 3L * hwi_nfix;
+    }
+    free(fixp);
     if (want && getenv("ROR_HW_INTERP_DEBUG")) {
         int cnt[32] = { 0 }, first[32], last[32];
         for (int i = 0; i < hwi_ncur; i++) { int r = hwi_cur[i].h.rt & 31; if (!cnt[r]++) first[r] = i; last[r] = i; }
@@ -2849,18 +3140,19 @@ static void hwi_boundary(HRt *disp, u32 dbx, u32 dby, u32 ww, u32 hh) {
              * different depths in between and show through each other in a dot
              * pattern. The place most pairs name wins, the smaller move on a tie;
              * pairs that name another place are dissolved and placed below. */
+            for (int pass = 0; pass < 2; pass++)       /* (places known from the VU1 inputs first: they are exact, and outweigh any number of pairs) */
             for (int i = 0; i < hwi_ncur; i++) {
-                if (partner[i] < 0 || (hwi_cur[i].h.flags & HWF_SPRITE)) continue;
-                const RPrim *c = &hwi_cur[i], *pv = &hwi_prev[partner[i]];
+                if ((pass == 0) != (partner[i] <= HWI_FIX) || partner[i] == -1 || (hwi_cur[i].h.flags & HWF_SPRITE)) continue;
+                const RPrim *c = &hwi_cur[i]; const HwVertex *pv = hwi_pv(partner[i]);
                 for (int q = 0; q < c->n; q++) {
                     int en, sl; WFIND(en, sl, c, q);
                     if (en < 0) { WADD(en, sl, c, q); tab[en].cn[0] = tab[en].cn[1] = tab[en].cn[2] = 0; }
                     WV *w = &tab[en];
                     int k = 0;
-                    for (; k < 3 && w->cn[k]; k++) if (fabsf(w->cx[k] - pv->v[q].x) <= 0.25f && fabsf(w->cy[k] - pv->v[q].y) <= 0.25f) break;
+                    for (; k < 3 && w->cn[k]; k++) if (fabsf(w->cx[k] - pv[q].x) <= 0.25f && fabsf(w->cy[k] - pv[q].y) <= 0.25f) break;
                     if (k == 3) continue;
-                    if (!w->cn[k]) { w->cx[k] = pv->v[q].x; w->cy[k] = pv->v[q].y; w->cz[k] = pv->v[q].z; }
-                    if (w->cn[k] < 65535) w->cn[k]++;
+                    if (!w->cn[k]) { w->cx[k] = pv[q].x; w->cy[k] = pv[q].y; w->cz[k] = pv[q].z; }
+                    if (pass == 0) w->cn[k] = 65535; else if (w->cn[k] < 65535) w->cn[k]++;
                 }
             }
             for (int k = 0; k < nent; k++) {
@@ -2934,13 +3226,14 @@ static void hwi_boundary(HRt *disp, u32 dbx, u32 dby, u32 ww, u32 hh) {
     }
     /* (A texture replaced during the frame does not stand in the way: GPU textures are never rewritten, and
      * one that is given up stays alive for the packages that can still draw with it, hw_keep_generation.) */
-    int ok = hwi_nprev > 0 && tot > 0 && matched * 10 >= tot * 7 && !hwi_uploads && hwi_have_start;
+    int vcut = (VR && VR->usable && VR->cut) || vfar;  /* the camera jumped (rt/vinterp.c): real frames only, whatever the lists look like */
+    int ok = hwi_nprev > 0 && tot > 0 && matched * 10 >= tot * 7 && !hwi_uploads && hwi_have_start && !vcut;
     if (g_perf_on && hw_fps_on) {
         g_perf[4]++;
         if (ok) g_perf[5]++; else if (hwi_uploads) g_perf[6]++; else if (hwi_have_start <= 0) g_perf[9]++; else g_perf[8]++;
         if (hwi_texgone) g_perf[7]++;          /* (counted, no longer a reason) */
     }
-    hwf_replay = !hwi_uploads && hwi_have_start > 0; hwf_cut = !(hwi_nprev > 0 && tot > 0 && matched * 10 >= tot * 7);
+    hwf_replay = !hwi_uploads && hwi_have_start > 0; hwf_cut = !(hwi_nprev > 0 && tot > 0 && matched * 10 >= tot * 7) || vcut;
     if (hw_fps_on || hw_fsr3) {
         { static int trace = -1, ntr; if (trace < 0) trace = getenv("ROR_HW_PRESENT_TRACE") ? atoi(getenv("ROR_HW_PRESENT_TRACE")) : 0;
           if (trace && (int)g_gs_frames >= trace && ntr < 60) { ntr++; rt_log("[btrace] at %.2f ms: vblank %llu boundary, displayed fbp %x, list %d prims, picture target %d, ok %d, ideal %.2f\n", plat_time_ns() / 1e6, (unsigned long long)g_gs_frames, disp->fbp, hwi_ncur, pic, ok, hwp_ideal_ns / 1e6); } }
@@ -2969,10 +3262,10 @@ static void hwi_boundary(HRt *disp, u32 dbx, u32 dby, u32 ww, u32 hh) {
                 for (int i = 0; i < hwi_ncur; i++) {
                     RPrim *c = &hwi_cur[i]; HwVertex v[6];
                     memcpy(v, c->v, sizeof(HwVertex) * (size_t)c->n);
-                    if (partner[i] >= 0) {
-                        const RPrim *p = &hwi_prev[partner[i]];
+                    if (hwi_pv(partner[i])) {
+                        const HwVertex *pvv = hwi_pv(partner[i]);
                         for (int q = 0; q < c->n; q++) {
-                            float *a = (float *)&v[q]; const float *b = (const float *)&p->v[q];
+                            float *a = (float *)&v[q]; const float *b = (const float *)&pvv[q];
                             for (size_t f = 0; f < sizeof(HwVertex) / sizeof(float); f++) a[f] = b[f] + (a[f] - b[f]) * t;
                         }
                     } else if (m == 0) continue;         /* t = 0 is the previous picture: nothing new in it yet */
@@ -3347,7 +3640,13 @@ static void hwg_prim(const DState *st, const Prim *p) {
     }
     hw_draw(&h, v, n);
     r->gpu_dirty = 1;
-    if (hw_interp_n || hw_fps_on || hw_fsr3) hwi_record(&h, v, n);
+    if (hw_interp_n || hw_fps_on || hw_fsr3) {
+        hwi_record(&h, v, n);
+        if (g_vi_run >= 0 && p->type == PT_TRI && g_gif_path == GIF_PATH1) {
+            RPrim *rp = &hwi_cur[hwi_ncur - 1];
+            rp->run = g_vi_run; rp->vi[0] = vq_vi[0]; rp->vi[1] = vq_vi[1]; rp->vi[2] = vq_vi[2]; rp->ofx = c->ofx; rp->ofy = c->ofy; rp->conv = (u8)((st->fst ? 1 : 0) | (st->iip ? 2 : 0));
+        }
+    }
 }
 
 /* CLUT load whose source may be on the GPU. Returns 1 if the load was deferred. */
@@ -3781,7 +4080,11 @@ void gs_write_reg(u32 reg, u64 d) {
     if (gs_dump_frame && g_gs_frames == gs_dump_frame && (reg == 0x47 || reg == 0x48 || reg == 0x4e || reg == 0x4f || reg == 0x1a || reg == 0x1b))
         rt_log("[gsdump] reg %02x <- %016llx\n", reg, (unsigned long long)d);
     switch (reg) {
-    case 0x00: r_prim = d & 0x7FF; vcount = 0; break;
+    case 0x00: r_prim = d & 0x7FF; vcount = 0;
+#ifdef GS_HW
+        if (UNLIKELY(g_vi_run >= 0) && g_gif_path == GIF_PATH1) vi_prim_mark();
+#endif
+        break;
     case 0x01: r_rgbaq = (u32)d; { u32 q = (u32)(d >> 32); memcpy(&r_q, &q, 4); } break;
     case 0x02: { u32 s = (u32)d, t = (u32)(d >> 32); memcpy(&r_s, &s, 4); memcpy(&r_t, &t, 4); break; }
     case 0x03: r_u = d & 0x3FFF; r_v = (d >> 16) & 0x3FFF; break;
@@ -3966,8 +4269,9 @@ static int disp_rect(u64 *pfb, u64 *pdp, u32 *pfbp, u32 *pfbw, u32 *ppsm, u32 *p
     *pfb = fb; *pdp = dp; *pfbp = fbp; *pfbw = fbw; *ppsm = psm; *pdbx = dbx; *pdby = dby; *pww = ww; *phh = hh;
     return 1;
 }
-static int want_gpu, want_internal = 4, want_fsr3;
+static int want_gpu, want_internal = 4, want_fsr3, want_fg;
 void gs_fsr3(int want) { want_fsr3 = want; }
+void gs_framegen(int kind) { want_fg = kind; }
 void gs_renderer(int gpu, int internal) { want_gpu = gpu; want_internal = internal < 1 ? 1 : internal > 8 ? 8 : internal; }
 #ifdef GS_HW
 int gs_hw_active(void) { return hw_on; }
@@ -4013,6 +4317,8 @@ void gs_hw_fsr3_rect(int dx, int dy, int dw, int dh, int ww_, int wh_) {
 void gs_hw_interp(int fps, int display_hz) {
     if (!hw_on || hw_fps_on) return;
     hw_fps_target = fps; hw_fps_hz = display_hz; hw_fps_on = 1; hwi_snap_px = hwi_snap_px > 0 ? hwi_snap_px : 96.0f;
+    if (vi_start) vi_start();
+    if (hwd_from == -2) { hwd_from = -1; if (getenv("ROR_INTERP_DETECT")) sscanf(getenv("ROR_INTERP_DETECT"), "%d,%d,%d", &hwd_from, &hwd_to, &hwd_save); }
     pthread_t t;
     if (pthread_create(&t, 0, hwp_thread, 0) != 0) { hw_fps_on = 0; rt_log("[gs] cannot start the presentation thread: frame interpolation off\n"); }
 }
@@ -4132,6 +4438,8 @@ void gs_init(void) {
             if (getenv("ROR_HW_INTERP_SNAP")) hwi_snap_px = (float)atof(getenv("ROR_HW_INTERP_SNAP"));
             if (getenv("ROR_HW_INTERP")) sscanf(getenv("ROR_HW_INTERP"), "%d,%d,%d", &hw_interp_n, &hw_interp_first, &hw_interp_count);
             if (want_fsr3) hw_fsr3_want();
+            if (want_fsr3 == 2) hw_dlss_want();
+            if (want_fg) hw_fg_want(want_fg);
             if (getenv("ROR_FSR3_OVL")) hwf_ovl_scale = atoi(getenv("ROR_FSR3_OVL"));
             if (hw_start(hw_scale)) {
                 /* auto: where the picture gains (from 2x) and the extra texture reads cost nothing measurable (a discrete card;
@@ -4140,6 +4448,11 @@ void gs_init(void) {
                 hw_on = 1; hw_tex_filter(smooth);
                 rt_log("[gs] hardware renderer on %s, %dx, texture filter %s\n", hw_device_name(), hw_scale, smooth ? "smooth" : "original");
                 if (want_fsr3) hw_fsr3 = hw_fsr3_init();
+                if ((hw_fsr3 || hw_interp_n) && vi_start) vi_start();
+                if (want_fg == 1) {
+                    if (!hw_fsr3) rt_log("[gs] frame generation works on the pictures of a temporal upscaler (--filter fsr3 or dlss), which is not in use: frame generation off\n");
+                    else hw_fg = hw_fg_init();
+                }
             }
             else rt_log("[gs] GPU renderer not available (no Vulkan 1.3 device with the needed features): using the software renderer\n");
         }

@@ -117,4 +117,48 @@ struct ffxQueryDescUpscaleGetJitterPhaseCount { ffxApiHeader header; uint32_t re
 struct ffxQueryDescUpscaleGetJitterOffset { ffxApiHeader header; int32_t index, phaseCount; float *pOutX, *pOutY; };
 #define FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE_VERSION (FFX_API_EFFECT_ID_UPSCALE | 0x0bu)
 struct ffxCreateContextDescUpscaleVersion { ffxApiHeader header; uint32_t version; };
+
+/* ---- frame generation (amd_fidelityfx_framegeneration_vk.dll; FSR 3.1.6 frame interpolation) ----
+ * framegeneration/include/ffx_framegeneration.h, api/include/ffx_api_types.h. Used without AMD's
+ * swapchain wrapper: the context is configured with NO_SWAPCHAIN_CONTEXT_NOTIFY and dispatched by
+ * hand, which writes the in-between picture into an image of the caller. */
+#define FFX_API_EFFECT_ID_FRAMEGENERATION 0x00020000u
+#define FFX_FRAMEGENERATION_VERSION ((4u << 22) | (0u << 12) | 2u)
+enum { FFX_API_RESOURCE_STATE_UNORDERED_ACCESS = 1 << 1 };
+enum { FFX_API_BACKBUFFER_TRANSFER_FUNCTION_SRGB = 0 };
+struct FfxApiRect2D { int32_t left, top, width, height; };
+struct FfxApiEffectMemoryUsage { uint64_t totalUsageInBytes, aliasableUsageInBytes; };
+enum { FFX_FRAMEGENERATION_ENABLE_DEPTH_INVERTED = 1 << 3, FFX_FRAMEGENERATION_ENABLE_DEBUG_CHECKING = 1 << 6 };
+enum { FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_TEAR_LINES = 1 << 0, FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_VIEW = 1 << 2, FFX_FRAMEGENERATION_FLAG_NO_SWAPCHAIN_CONTEXT_NOTIFY = 1 << 3 };
+#define FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION (FFX_API_EFFECT_ID_FRAMEGENERATION | 0x01u)
+struct ffxCreateContextDescFrameGeneration { ffxApiHeader header; uint32_t flags; struct FfxApiDimensions2D displaySize, maxRenderSize; uint32_t backBufferFormat; };
+#define FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION (FFX_API_EFFECT_ID_FRAMEGENERATION | 0x02u)
+struct ffxConfigureDescFrameGeneration {
+    ffxApiHeader header; void *swapChain;
+    void *presentCallback, *presentCallbackUserContext, *frameGenerationCallback, *frameGenerationCallbackUserContext;
+    bool frameGenerationEnabled, allowAsyncWorkloads;
+    struct FfxApiResource HUDLessColor; uint32_t flags; bool onlyPresentGenerated; struct FfxApiRect2D generationRect; uint64_t frameID;
+};
+#define FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION (FFX_API_EFFECT_ID_FRAMEGENERATION | 0x03u)
+struct ffxDispatchDescFrameGeneration {
+    ffxApiHeader header; void *commandList;
+    struct FfxApiResource presentColor, outputs[4];
+    uint32_t numGeneratedFrames; bool reset; uint32_t backbufferTransferFunction; float minMaxLuminance[2];
+    struct FfxApiRect2D generationRect; uint64_t frameID;
+};
+#define FFX_API_QUERY_DESC_TYPE_FRAMEGENERATION_GPU_MEMORY_USAGE (FFX_API_EFFECT_ID_FRAMEGENERATION | 0x07u)
+struct ffxQueryDescFrameGenerationGetGPUMemoryUsage { ffxApiHeader header; struct FfxApiEffectMemoryUsage *gpuMemoryUsageFrameGeneration; };
+#define FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_V2 (FFX_API_EFFECT_ID_FRAMEGENERATION | 0x0cu)
+struct ffxDispatchDescFrameGenerationPrepareV2 {
+    ffxApiHeader header; uint64_t frameID; uint32_t flags; void *commandList;
+    struct FfxApiDimensions2D renderSize; struct FfxApiFloatCoords2D jitterOffset, motionVectorScale;
+    float frameTimeDelta; bool reset; float cameraNear, cameraFar, cameraFovAngleVertical, viewSpaceToMetersFactor;
+    struct FfxApiResource depth, motionVectors;
+    float cameraPosition[3], cameraUp[3], cameraRight[3], cameraForward[3];
+};
+#define FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION_VERSION (FFX_API_EFFECT_ID_FRAMEGENERATION | 0x0eu)
+struct ffxCreateContextDescFrameGenerationVersion { ffxApiHeader header; uint32_t version; };
+/* ffx_upscale.h: memory used by an upscaler context */
+#define FFX_API_QUERY_DESC_TYPE_UPSCALE_GPU_MEMORY_USAGE (FFX_API_EFFECT_ID_UPSCALE | 0x08u)
+struct ffxQueryDescUpscaleGetGPUMemoryUsage { ffxApiHeader header; struct FfxApiEffectMemoryUsage *gpuMemoryUsageUpscaler; };
 #endif

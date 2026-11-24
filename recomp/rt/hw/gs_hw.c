@@ -125,6 +125,8 @@ static VkSampler sampler; static VkDescriptorSetLayout dsl; static VkDescriptorP
 static VkShaderModule sm_vert, sm_frag, sm_frag_ez, sm_bvert, sm_bfrag, sm_pfrag, sm_mvvert, sm_mvfrag, sm_ffrag; static VkPipeline blit_pipe;
 static int have_depth_clamp, early_z;          /* early depth test (see draw_range): the device can clamp depth; not switched off by ROR_HW_NO_EARLYZ=1 */
 static int fsr_want; static float mv_zfar, mv_zinv;      /* FSR 3.1 asked for (hw_fsr3_want); depth mapping of the motion-vector pass */
+static int sl_want, sl_on, vram_want;                    /* Streamline asked for (hw_dlss_want / hw_fg_want(2)) and initialised (see "DLSS"); ROR_HW_VRAMLOG */
+static void *sl_open(void); static void sl_after_device(void *lib);
 static int N = 1;
 static float uv_shift_k(void) { static float k = -1.0f; if (k < 0.0f) k = getenv("ROR_HW_UVSHIFT") ? (float)atof(getenv("ROR_HW_UVSHIFT")) : 0.0f; return k; }
 /* Texture coordinates of triangles are taken at the fragment itself (native position g / N), where the
@@ -336,7 +338,10 @@ void hw_thread_init(void) {
     qi = (!is_game && nqueues > 1) ? 1 : 0;
 }
 int hw_start(int scale) {
-    void *l = lib_open();
+    /* DLSS: Vulkan is reached through NVIDIA's sl.interposer.dll, initialised before any Vulkan call. It hands out
+     * the functions of vulkan-1.dll except the few it intercepts (instance, device and swapchain creation, present). */
+    void *l = sl_want ? sl_open() : 0;
+    if (!l) l = lib_open();
     if (!l) return 0;
     gipa = (PFN_vkGetInstanceProcAddr)lib_sym(l, "vkGetInstanceProcAddr");
     if (!gipa) return 0;
@@ -383,7 +388,7 @@ int hw_start(int scale) {
     early_z = have_depth_clamp && !getenv("ROR_HW_NO_EARLYZ");
     VkDeviceCreateInfo di = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &ef };
     di.queueCreateInfoCount = 1; di.pQueueCreateInfos = &qi;
-    static const char *dev_ext[4] = { "VK_KHR_swapchain" };
+    static const char *dev_ext[5] = { "VK_KHR_swapchain" };
     /* FSR 3.1 (only when asked for; the device is created exactly as before otherwise): the
      * FidelityFX Vulkan backend picks its shader variants from what the physical device
      * supports (half floats, 16-bit integers, wave size control), so what is supported of
@@ -400,8 +405,10 @@ int hw_start(int scale) {
                 if (have_surface_ext && !strcmp(ep[i].extensionName, dev_ext[0])) have_swapchain_ext = 1;
                 if (!strcmp(ep[i].extensionName, "VK_KHR_cooperative_matrix")) have_cm = 1;
                 if (!strcmp(ep[i].extensionName, "VK_EXT_shader_float8")) have_f8 = 1;
+                if (!strcmp(ep[i].extensionName, "VK_EXT_memory_budget") && getenv("ROR_HW_VRAMLOG")) vram_want = 1;
             }
         if (have_swapchain_ext) nx = 1;
+        if (vram_want) dev_ext[nx++] = "VK_EXT_memory_budget";
         if (fsr_want) {
             VkPhysicalDeviceVulkan13Features s13 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES };
             VkPhysicalDeviceVulkan12Features s12 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &s13 };
@@ -425,6 +432,7 @@ int hw_start(int scale) {
         if (nx) { di.enabledExtensionCount = (uint32_t)nx; di.ppEnabledExtensionNames = dev_ext; }
     }
     if (vkCreateDevice(phys, &di, 0, &dev) != VK_SUCCESS) return 0;
+    if (sl_on) { PFN_vkGetDeviceProcAddr g = (PFN_vkGetDeviceProcAddr)lib_sym(l, "vkGetDeviceProcAddr"); if (g) vkGetDeviceProcAddr = g; }
 #define X(n) vk##n = (PFN_vk##n)vkGetDeviceProcAddr(dev, "vk" #n);
     VKDFN(X)
 #undef X
@@ -458,6 +466,7 @@ int hw_start(int scale) {
     blit_pipe = pipeline((15u << 3) | (1u << 10));
     img_create(&dummy, 1, 1, 0, 1);
     to_layout(&dummy, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    if (sl_on) sl_after_device(l);
     return 1;
 }
 
@@ -746,8 +755,352 @@ static void fsr_message(uint32_t type, const wchar_t *msg) {
     fprintf(stderr, "[gs_hw] FidelityFX %s: %s\n", type == 0 ? "error" : "warning", b);
 }
 #endif
-int hw_fsr3_init(void) {
-    if (!fsr_want || !dev) return 0;
+/* ---- DLSS Super Resolution (--filter dlss) -------------------------------------
+ * NVIDIA's DLSS through the Streamline SDK's DLLs, loaded at run time from the
+ * program's folder or %ROR_APP_DIR%: sl.interposer.dll (the API: C-linkage
+ * functions, declared in sl_min.h), sl.common.dll and sl.dlss.dll (plugins) and
+ * nvngx_dlss.dll (the network, run by the NVIDIA driver). Windows and NVIDIA
+ * RTX cards only. It is a second backend of the temporal upscaling below: the
+ * same jittered picture, motion vectors and depth go in, the same kept
+ * pictures come out, and gs.c does not know which of the two runs.
+ *  - Streamline wants to be initialised before the first Vulkan call and to
+ *    hand out the Vulkan functions itself, so hw_start loads the interposer in
+ *    place of vulkan-1.dll (sl_open) when DLSS was asked for. The interposer
+ *    passes everything through except instance, device and swapchain creation
+ *    and present, where it adds what its plugins need.
+ *  - Before anything of the DLL runs: its Authenticode signature must verify
+ *    and name NVIDIA, and its file version must be 2.14 or newer.
+ *  - No application ID: Streamline is given a project ID (a GUID of this
+ *    project) with the "custom engine" type, the way NVIDIA's guide describes
+ *    for engines without one. Over-the-air updates of the DLLs are not enabled.
+ *  - Any failure: one log line, then FSR 3.1 if AMD's DLLs are there, else FSR 1.0.
+ * DLSS Frame Generation (--framegen dlss) is only asked about: Streamline
+ * reports whether the card supports it, and it is then left off, because it
+ * works by taking over the swapchain and needs NVIDIA Reflex in the frame loop,
+ * neither of which this renderer does (and no RTX 40 card was there to test). */
+#include "sl_min.h"
+static int dlss_asked, dlss_ok, tu_dlss;          /* --filter dlss; DLSS usable; the temporal upscaler in use is DLSS */
+static int fg_kind, fg_ok;                        /* --framegen: 1 FSR, 2 DLSS (asked); FSR frame generation usable */
+static int dlss_live, dlss_mode; static uint32_t dlss_frame; static char dlss_name[64];
+static SlViewport dlss_vp = { SL_HEAD(SL_GUID_VIEWPORT, 1), 0 };
+static PfnSlIsFeatureSupported sl_supported; static PfnSlSetFeatureLoaded sl_set_loaded; static PfnSlGetFeatureVersion sl_feature_version;
+static PfnSlGetFeatureFunction sl_feature_function; static PfnSlGetNewFrameToken sl_new_token; static PfnSlSetConstants sl_set_constants;
+static PfnSlEvaluateFeature sl_evaluate; static PfnSlFreeResources sl_free;
+static PfnSlDLSSGetOptimalSettings sl_dlss_optimal; static PfnSlDLSSGetState sl_dlss_state; static PfnSlDLSSSetOptions sl_dlss_options;
+static char sl_last_error[200], sl_about[200]; static int sl_errors;
+static int tu_qw, tu_qh;                         /* the output size the kept pictures were asked for (they are smaller or larger than it when DLSS covers only part of the scale) */
+void hw_dlss_want(void) { sl_want = 1; dlss_asked = 1; fsr_want = 1; }       /* (fsr_want: the motion-vector shaders and device features of the temporal path) */
+void hw_fg_want(int kind) { fg_kind = kind; if (kind == 2) sl_want = 1; }
+static const char *sl_result_text(SlResult r) {
+    switch (r) {
+    case SL_ERR_DRIVER_OUT_OF_DATE: return "the graphics driver is too old";
+    case SL_ERR_OS_OUT_OF_DATE: return "this Windows version is too old";
+    case SL_ERR_OS_DISABLED_HWS: return "hardware-accelerated GPU scheduling is turned off in Windows";
+    case SL_ERR_NO_SUPPORTED_ADAPTER: case SL_ERR_ADAPTER_NOT_SUPPORTED: return "not supported on this graphics card";
+    case SL_ERR_NO_PLUGINS: case SL_ERR_FEATURE_MISSING: return "its Streamline plugin DLL or NVIDIA feature DLL is missing";
+    case SL_ERR_FEATURE_NOT_SUPPORTED: return "not supported on this system";
+    default: return "Streamline reported an error";
+    }
+}
+/* What happens to the two requests when Streamline cannot be used at all. */
+static void sl_unavailable(const char *why) {
+    if (dlss_asked) fprintf(stderr, "[gs_hw] DLSS: %s: trying FSR 3.1\n", why);
+    if (fg_kind == 2) { fprintf(stderr, "[gs_hw] DLSS Frame Generation: %s: frame generation off\n", why); fg_kind = 0; }
+}
+#ifdef _WIN32
+#include <wintrust.h>
+#include <softpub.h>
+#include <wincrypt.h>
+/* Folder of a file that is beside the program or in %ROR_APP_DIR% (with the trailing separator); 0 if it is in neither. */
+static int dll_folder(const wchar_t *name, wchar_t *dir, size_t cap) {
+    size_t nl = wcslen(name);
+    for (int k = 0; k < 2; k++) {
+        size_t n = 0;
+        if (k == 0) { n = GetModuleFileNameW(0, dir, (DWORD)(cap - nl - 2)); while (n > 0 && dir[n - 1] != L'\\' && dir[n - 1] != L'/') n--; }
+        else {
+            const wchar_t *app = _wgetenv(L"ROR_APP_DIR"); n = app ? wcslen(app) : 0;
+            if (n == 0 || n + nl + 2 >= cap) continue;
+            memcpy(dir, app, n * sizeof(wchar_t));
+            if (dir[n - 1] != L'\\' && dir[n - 1] != L'/') dir[n++] = L'\\';
+        }
+        if (n == 0) continue;
+        memcpy(dir + n, name, (nl + 1) * sizeof(wchar_t));
+        DWORD at = GetFileAttributesW(dir);
+        dir[n] = 0;
+        if (at != INVALID_FILE_ATTRIBUTES && !(at & FILE_ATTRIBUTE_DIRECTORY)) return 1;
+    }
+    return 0;
+}
+/* Authenticode: the file's signature verifies against the machine's trusted roots (no network), and the signer's name is returned. */
+static int dll_signed(const wchar_t *path, char *signer, size_t cap) {
+    HMODULE wt = LoadLibraryW(L"wintrust.dll"), cr = LoadLibraryW(L"crypt32.dll");
+    signer[0] = 0;
+    if (!wt || !cr) return 0;
+    typedef LONG (WINAPI *PVerify)(HWND, GUID *, LPVOID);
+    typedef CRYPT_PROVIDER_DATA *(WINAPI *PProvData)(HANDLE);
+    typedef CRYPT_PROVIDER_SGNR *(WINAPI *PSigner)(CRYPT_PROVIDER_DATA *, DWORD, BOOL, DWORD);
+    typedef CRYPT_PROVIDER_CERT *(WINAPI *PCert)(CRYPT_PROVIDER_SGNR *, DWORD);
+    typedef DWORD (WINAPI *PName)(PCCERT_CONTEXT, DWORD, DWORD, void *, LPSTR, DWORD);
+    PVerify verify = (PVerify)(void *)GetProcAddress(wt, "WinVerifyTrust");
+    PProvData prov = (PProvData)(void *)GetProcAddress(wt, "WTHelperProvDataFromStateData");
+    PSigner sgnr = (PSigner)(void *)GetProcAddress(wt, "WTHelperGetProvSignerFromChain");
+    PCert cert = (PCert)(void *)GetProcAddress(wt, "WTHelperGetProvCertFromChain");
+    PName name = (PName)(void *)GetProcAddress(cr, "CertGetNameStringA");
+    if (!verify || !prov || !sgnr || !cert || !name) return 0;
+    WINTRUST_FILE_INFO fi; memset(&fi, 0, sizeof fi); fi.cbStruct = sizeof fi; fi.pcwszFilePath = path;
+    WINTRUST_DATA d; memset(&d, 0, sizeof d);
+    d.cbStruct = sizeof d; d.dwUIChoice = WTD_UI_NONE; d.fdwRevocationChecks = WTD_REVOKE_NONE; d.dwUnionChoice = WTD_CHOICE_FILE; d.pFile = &fi;
+    d.dwStateAction = WTD_STATEACTION_VERIFY; d.dwProvFlags = WTD_CACHE_ONLY_URL_RETRIEVAL;
+    GUID action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    LONG r = verify((HWND)INVALID_HANDLE_VALUE, &action, &d);
+    if (r == 0) {
+        CRYPT_PROVIDER_DATA *pd = prov(d.hWVTStateData);
+        CRYPT_PROVIDER_SGNR *sg = pd ? sgnr(pd, 0, FALSE, 0) : 0;
+        CRYPT_PROVIDER_CERT *ce = sg ? cert(sg, 0) : 0;
+        if (ce && ce->pCert) name(ce->pCert, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, 0, signer, (DWORD)cap);
+    }
+    d.dwStateAction = WTD_STATEACTION_CLOSE;
+    verify((HWND)INVALID_HANDLE_VALUE, &action, &d);
+    return r == 0;
+}
+static int dll_version(const wchar_t *path, unsigned v[4]) {
+    HMODULE vl = LoadLibraryW(L"version.dll");
+    v[0] = v[1] = v[2] = v[3] = 0;
+    if (!vl) return 0;
+    typedef DWORD (WINAPI *PSize)(LPCWSTR, LPDWORD);
+    typedef BOOL (WINAPI *PInfo)(LPCWSTR, DWORD, DWORD, LPVOID);
+    typedef BOOL (WINAPI *PQuery)(LPCVOID, LPCWSTR, LPVOID *, PUINT);
+    PSize size = (PSize)(void *)GetProcAddress(vl, "GetFileVersionInfoSizeW");
+    PInfo info = (PInfo)(void *)GetProcAddress(vl, "GetFileVersionInfoW");
+    PQuery query = (PQuery)(void *)GetProcAddress(vl, "VerQueryValueW");
+    DWORD h = 0, n = size && info && query ? size(path, &h) : 0;
+    if (!n) return 0;
+    void *buf = malloc(n); VS_FIXEDFILEINFO *ff = 0; UINT fl = 0; int ok = 0;
+    if (info(path, 0, n, buf) && query(buf, L"\\", (LPVOID *)&ff, &fl) && ff && fl >= sizeof *ff) {
+        v[0] = HIWORD(ff->dwFileVersionMS); v[1] = LOWORD(ff->dwFileVersionMS); v[2] = HIWORD(ff->dwFileVersionLS); v[3] = LOWORD(ff->dwFileVersionLS); ok = 1;
+    }
+    free(buf);
+    return ok;
+}
+static void sl_message(uint32_t type, const char *msg) {
+    static int verbose = -1; if (verbose < 0) verbose = getenv("ROR_DLSS_LOG") ? atoi(getenv("ROR_DLSS_LOG")) : 0;     /* 1: Streamline's warnings and errors, 2: everything */
+    if (!msg) return;
+    if (type == SL_LOGTYPE_ERROR) { sl_errors++; size_t n = strlen(msg); while (n > 0 && (msg[n - 1] == '\n' || msg[n - 1] == '\r')) n--; if (n > sizeof sl_last_error - 1) n = sizeof sl_last_error - 1; memcpy(sl_last_error, msg, n); sl_last_error[n] = 0; }
+    if (verbose > 1 || (verbose == 1 && type != SL_LOGTYPE_INFO)) fprintf(stderr, "[streamline] %s%s", msg, msg[0] && msg[strlen(msg) - 1] == '\n' ? "" : "\n");
+}
+#endif
+/* hw_start, before the first Vulkan call: load and initialise Streamline. Returns the library to take Vulkan from, or 0. */
+static void *sl_open(void) {
+#ifdef _WIN32
+    static wchar_t dir[1024], path[1100]; static const wchar_t *dirs[1]; char signer[128], why[400]; unsigned v[4];
+    if (!dll_folder(L"sl.interposer.dll", dir, 1024)) { sl_unavailable("sl.interposer.dll (NVIDIA Streamline) is not in the program's folder or %ROR_APP_DIR%"); return 0; }
+    _snwprintf(path, 1100, L"%lssl.interposer.dll", dir);
+    if (!dll_signed(path, signer, sizeof signer) || !strstr(signer, "NVIDIA")) {
+        snprintf(why, sizeof why, "sl.interposer.dll does not carry a valid NVIDIA signature (signer: %s); it is not loaded", signer[0] ? signer : "none");
+        sl_unavailable(why); return 0;
+    }
+    if (!dll_version(path, v) || v[0] != 2 || v[1] < 14) {
+        snprintf(why, sizeof why, "sl.interposer.dll is version %u.%u.%u, this build needs Streamline 2.14 or newer", v[0], v[1], v[2]);
+        sl_unavailable(why); return 0;
+    }
+    HMODULE m = LoadLibraryExW(path, 0, LOAD_WITH_ALTERED_SEARCH_PATH);
+    if (!m) { snprintf(why, sizeof why, "sl.interposer.dll could not be loaded (error %lu; it needs the Microsoft Visual C++ runtime)", (unsigned long)GetLastError()); sl_unavailable(why); return 0; }
+    PfnSlInit init = (PfnSlInit)(void *)GetProcAddress(m, "slInit");
+    sl_supported = (PfnSlIsFeatureSupported)(void *)GetProcAddress(m, "slIsFeatureSupported"); sl_set_loaded = (PfnSlSetFeatureLoaded)(void *)GetProcAddress(m, "slSetFeatureLoaded");
+    sl_feature_version = (PfnSlGetFeatureVersion)(void *)GetProcAddress(m, "slGetFeatureVersion"); sl_feature_function = (PfnSlGetFeatureFunction)(void *)GetProcAddress(m, "slGetFeatureFunction");
+    sl_new_token = (PfnSlGetNewFrameToken)(void *)GetProcAddress(m, "slGetNewFrameToken"); sl_set_constants = (PfnSlSetConstants)(void *)GetProcAddress(m, "slSetConstants");
+    sl_evaluate = (PfnSlEvaluateFeature)(void *)GetProcAddress(m, "slEvaluateFeature"); sl_free = (PfnSlFreeResources)(void *)GetProcAddress(m, "slFreeResources");
+    if (!init || !sl_supported || !sl_set_loaded || !sl_feature_version || !sl_feature_function || !sl_new_token || !sl_set_constants || !sl_evaluate || !sl_free ||
+        !GetProcAddress(m, "vkGetInstanceProcAddr") || !GetProcAddress(m, "vkGetDeviceProcAddr")) { sl_unavailable("sl.interposer.dll does not export the Streamline API"); return 0; }
+    static const uint32_t feats[4] = { SL_FEATURE_DLSS, SL_FEATURE_DLSS_G, SL_FEATURE_REFLEX, SL_FEATURE_PCL };     /* (the last three only to ask about DLSS Frame Generation) */
+    SlPreferences pref; memset(&pref, 0, sizeof pref);
+    pref.h = (SlBase)SL_HEAD(SL_GUID_PREFERENCES, 1);
+    pref.logLevel = getenv("ROR_DLSS_LOG") && atoi(getenv("ROR_DLSS_LOG")) > 1 ? SL_LOG_VERBOSE : SL_LOG_DEFAULT;
+    dirs[0] = dir; pref.pathsToPlugins = dirs; pref.numPathsToPlugins = 1;
+    pref.logMessageCallback = sl_message;
+    pref.flags = SL_PREF_DISABLE_CL_STATE_TRACKING | SL_PREF_FRAME_BASED_TAGGING;       /* no SL_PREF_ALLOW_OTA: nothing is downloaded */
+    if (dlss_asked) { pref.featuresToLoad = feats; pref.numFeaturesToLoad = fg_kind == 2 ? 4 : 1; }
+    else { pref.featuresToLoad = feats + 1; pref.numFeaturesToLoad = 3; }
+    pref.engine = SL_ENGINE_CUSTOM; pref.engineVersion = "1.0";
+    pref.projectId = "5a6f7d0e-3c1b-4f52-9c8e-2b7d51a0e4c3";                             /* this project's own ID (there is no NVIDIA application ID) */
+    pref.renderAPI = SL_RENDER_API_VULKAN;
+    SlResult r = init(&pref, SL_SDK_VERSION);
+    if (r != SL_OK) { snprintf(why, sizeof why, "Streamline %u.%u.%u could not be initialised (result %d%s%s)", v[0], v[1], v[2], (int)r, sl_last_error[0] ? ": " : "", sl_last_error); sl_unavailable(why); return 0; }
+    sl_on = 1; sl_last_error[0] = 0;
+    snprintf(sl_about, sizeof sl_about, "Streamline %u.%u.%u, signed by %s", v[0], v[1], v[2], signer);
+    return m;
+#else
+    sl_unavailable("NVIDIA's Streamline DLLs exist for Windows only");
+    return 0;
+#endif
+}
+/* hw_start, once the device exists: what the card supports. */
+static void sl_after_device(void *lib) {
+    (void)lib;
+    SlAdapterInfo ad; memset(&ad, 0, sizeof ad); ad.h = (SlBase)SL_HEAD(SL_GUID_ADAPTER_INFO, 1); ad.vkPhysicalDevice = (void *)phys;
+    if (dlss_asked) {
+        SlResult r = sl_supported(SL_FEATURE_DLSS, &ad);
+        void *f0 = 0, *f1 = 0, *f2 = 0;
+        if (r == SL_OK && (sl_feature_function(SL_FEATURE_DLSS, "slDLSSGetOptimalSettings", &f0) != SL_OK || sl_feature_function(SL_FEATURE_DLSS, "slDLSSGetState", &f1) != SL_OK ||
+                           sl_feature_function(SL_FEATURE_DLSS, "slDLSSSetOptions", &f2) != SL_OK || !f0 || !f1 || !f2)) r = SL_ERR_FEATURE_MISSING;
+        if (r != SL_OK) fprintf(stderr, "[gs_hw] DLSS: %s (Streamline result %d; needs a GeForce RTX card, sl.common.dll, sl.dlss.dll and nvngx_dlss.dll): trying FSR 3.1\n", sl_result_text(r), (int)r);
+        else {
+            sl_dlss_optimal = (PfnSlDLSSGetOptimalSettings)f0; sl_dlss_state = (PfnSlDLSSGetState)f1; sl_dlss_options = (PfnSlDLSSSetOptions)f2;
+            SlFeatureVersion fv; memset(&fv, 0, sizeof fv); fv.h = (SlBase)SL_HEAD(SL_GUID_FEATURE_VERSION, 1);
+            sl_feature_version(SL_FEATURE_DLSS, &fv);
+            snprintf(dlss_name, sizeof dlss_name, "DLSS %u.%u.%u", fv.versionNGX.major, fv.versionNGX.minor, fv.versionNGX.build);
+            fprintf(stderr, "[gs_hw] %s is available (%s)\n", dlss_name, sl_about);
+            dlss_ok = 1; sl_last_error[0] = 0;
+        }
+    }
+    if (fg_kind == 2) {
+        SlResult r = sl_supported(SL_FEATURE_DLSS_G, &ad);
+        if (r == SL_OK) {
+            fprintf(stderr, "[gs_hw] DLSS Frame Generation: this graphics card supports it, but this renderer cannot drive it (it takes over the swapchain and needs NVIDIA Reflex; never tested): frame generation off\n");
+            sl_set_loaded(SL_FEATURE_DLSS_G, 0); sl_set_loaded(SL_FEATURE_REFLEX, 0); sl_set_loaded(SL_FEATURE_PCL, 0);
+        } else fprintf(stderr, "[gs_hw] DLSS Frame Generation: %s (Streamline result %d; it needs a GeForce RTX 40 series card or newer and sl.dlss_g.dll, nvngx_dlssg.dll): frame generation off\n", sl_result_text(r), (int)r);
+        fg_kind = 0;
+    }
+}
+static void tu_images(int rw, int rh, int dw, int dh);
+static void fsr_free_images(void);
+static void dlss_drop(const char *why, SlResult r) {
+    fprintf(stderr, "[gs_hw] DLSS: %s (Streamline result %d%s%s): trying FSR 3.1\n", why, (int)r, sl_last_error[0] ? ": " : "", sl_last_error);
+    if (dlss_live) { sl_free(SL_FEATURE_DLSS, &dlss_vp); dlss_live = 0; }
+    dlss_ok = 0; tu_dlss = 0;
+}
+/* The DLSS instance for render -> output size. 0: DLSS is given up (logged). */
+static int dlss_begin(int rw, int rh, int dw, int dh) {
+    if (!dlss_ok) return 0;
+    if (dlss_live && rw == fsr_rw && rh == fsr_rh && dw == fsr_dw && dh == fsr_dh) return 1;
+    hw_flush();
+    if (dlss_live) { sl_free(SL_FEATURE_DLSS, &dlss_vp); dlss_live = 0; }
+    /* quality mode from the scale: DLAA at 1, ultra performance at exactly 3, else the mode whose nominal ratio (1.5, 1.72, 2) is nearest above;
+     * if that mode does not take this render size, the next ones are tried */
+    float s = sqrtf((float)dw * (float)dh / ((float)rw * (float)rh));
+    int mode = rw == dw && rh == dh ? SL_DLSS_DLAA : dw == 3 * rw && dh == 3 * rh ? SL_DLSS_ULTRA_PERFORMANCE : s >= 1.86f ? SL_DLSS_MAX_PERFORMANCE : s >= 1.61f ? SL_DLSS_BALANCED : SL_DLSS_MAX_QUALITY;
+    static const char *const mode_name[7] = { "off", "performance", "balanced", "quality", "ultra performance", "ultra quality", "DLAA" };
+    static const int next_mode[7] = { 0, SL_DLSS_BALANCED, SL_DLSS_MAX_QUALITY, 0, SL_DLSS_MAX_PERFORMANCE, 0, SL_DLSS_MAX_QUALITY };
+    if (getenv("ROR_DLSS_MODE") && atoi(getenv("ROR_DLSS_MODE")) >= 1 && atoi(getenv("ROR_DLSS_MODE")) <= 6) mode = atoi(getenv("ROR_DLSS_MODE"));
+    uint32_t preset = SL_DLSS_PRESET_DEFAULT;
+    { const char *e = getenv("ROR_DLSS_PRESET"); if (e && e[0] >= 'J' && e[0] <= 'M' && !e[1]) preset = (uint32_t)(SL_DLSS_PRESET_J + (e[0] - 'J')); }
+    SlDLSSOptions o; memset(&o, 0, sizeof o); o.h = (SlBase)SL_HEAD(SL_GUID_DLSS_OPTIONS, 3);
+    o.mode = (uint32_t)mode; o.outputWidth = (uint32_t)dw; o.outputHeight = (uint32_t)dh; o.sharpness = 0.0f; o.preExposure = 1.0f; o.exposureScale = 1.0f;
+    o.colorBuffersHDR = SL_FALSE;                  /* the GS's 8-bit gamma-encoded picture */
+    o.indicatorInvertAxisX = o.indicatorInvertAxisY = SL_FALSE;
+    o.dlaaPreset = o.qualityPreset = o.balancedPreset = o.performancePreset = o.ultraPerformancePreset = o.ultraQualityPreset = preset;
+    o.useAutoExposure = SL_TRUE; o.alphaUpscalingEnabled = SL_FALSE;
+    SlDLSSOptimalSettings os; SlResult r;
+    for (;;) {
+        memset(&os, 0, sizeof os); os.h = (SlBase)SL_HEAD(SL_GUID_DLSS_SETTINGS, 1);
+        r = sl_dlss_optimal(&o, &os);
+        if (r == SL_OK && os.optimalRenderWidth && (uint32_t)rw >= os.renderWidthMin && (uint32_t)rw <= os.renderWidthMax && (uint32_t)rh >= os.renderHeightMin && (uint32_t)rh <= os.renderHeightMax) break;
+        mode = next_mode[mode]; o.mode = (uint32_t)mode;
+        if (!mode) { char why[160]; snprintf(why, sizeof why, "no quality mode takes %dx%d -> %dx%d", rw, rh, dw, dh); dlss_drop(why, r); return 0; }
+    }
+    r = sl_dlss_options(&dlss_vp, &o);
+    if (r != SL_OK) { dlss_drop("the options were refused", r); return 0; }
+    dlss_live = 1; dlss_mode = mode;
+    fsr_free_images(); tu_images(rw, rh, dw, dh);
+    int phase = (int)ceilf(8.0f * (float)dw * (float)dh / ((float)rw * (float)rh));       /* NVIDIA's guide: 8 x the area ratio */
+    fsr_phase = phase < 8 ? 8 : phase > 256 ? 256 : phase; fsr_index = 0; fsr_fresh = 1;
+    fsr_rw = rw; fsr_rh = rh; fsr_dw = dw; fsr_dh = dh;
+    char rest[96]; rest[0] = 0;
+    if (dw != tu_qw || dh != tu_qh) snprintf(rest, sizeof rest, " (DLSS scales by 1 to 2, or by 3; %s does the rest to %dx%d)", dw < tu_qw ? "FSR 1.0" : "the area filter", tu_qw, tu_qh);
+    fprintf(stderr, "[gs_hw] temporal upscaler: %s (%s), %dx%d -> %dx%d%s, %d jitter phases\n", dlss_name, mode_name[mode], rw, rh, dw, dh, rest, fsr_phase);
+    return 1;
+}
+static float halton(int i, int b) { float f = 1.0f, r = 0.0f; while (i > 0) { f /= (float)b; r += f * (float)(i % b); i /= b; } return r; }
+static SlResource sl_res(Img *im, VkFormat fmt, VkImageUsageFlags usage) {
+    SlResource r; memset(&r, 0, sizeof r); r.h = (SlBase)SL_HEAD(SL_GUID_RESOURCE, 1);
+    r.type = 0; r.native = (void *)im->img; r.memory = (void *)im->mem; r.view = (void *)im->view; r.state = (uint32_t)im->layout;
+    r.width = (uint32_t)im->w; r.height = (uint32_t)im->h; r.nativeFormat = (uint32_t)fmt; r.mipLevels = 1; r.arrayLayers = 1; r.usage = (uint32_t)usage;
+    return r;
+}
+/* The DLSS pass: f_col, f_mv, f_depth -> f_out, recorded into this thread's command buffer. */
+static int dlss_eval(const HwFsr3 *p, int rw, int rh) {
+    const VkImageUsageFlags base = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    SlFrameToken *tok = 0; uint32_t fi = dlss_frame++;
+    SlResult r = sl_new_token(&tok, &fi);
+    if (r != SL_OK || !tok) { dlss_drop("no frame token", r); return 0; }
+    SlConstants c; memset(&c, 0, sizeof c); c.h = (SlBase)SL_HEAD(SL_GUID_CONSTANTS, 2);
+    float *mats[5] = { c.cameraViewToClip, c.clipToCameraView, c.clipToLensClip, c.clipToPrevClip, c.prevClipToClip };
+    for (int i = 0; i < 5; i++) mats[i][0] = mats[i][5] = mats[i][10] = mats[i][15] = 1.0f;      /* not used by DLSS Super Resolution: the motion image holds all motion */
+    c.jitterOffset[0] = fsr_jx; c.jitterOffset[1] = fsr_jy;
+    c.mvecScale[0] = 1.0f / (float)rw; c.mvecScale[1] = 1.0f / (float)rh;                        /* the motion image is in render pixels; Streamline wants it scaled to the picture = 1 */
+    c.cameraUp[1] = 1.0f; c.cameraRight[0] = 1.0f; c.cameraFwd[2] = 1.0f;
+    c.cameraNear = p->cam_near; c.cameraFar = p->cam_far; c.cameraFOV = p->cam_fovy; c.cameraAspectRatio = (float)fsr_dw / (float)fsr_dh;
+    c.motionVectorsInvalidValue = SL_INVALID_FLOAT;
+    c.depthInverted = SL_TRUE;                      /* 1 at the near plane, 0 at the far plane (see the motion-vector pass) */
+    c.cameraMotionIncluded = SL_TRUE; c.motionVectors3D = SL_FALSE; c.reset = p->reset || fsr_fresh ? SL_TRUE : SL_FALSE;
+    c.orthographicProjection = SL_FALSE; c.motionVectorsDilated = SL_FALSE; c.motionVectorsJittered = SL_FALSE;
+    c.minRelativeLinearDepthObjectSeparation = 40.0f;
+    r = sl_set_constants(&c, tok, &dlss_vp);
+    if (r != SL_OK) { dlss_drop("the frame constants were refused", r); return 0; }
+    SlResource res[4] = { sl_res(&f_col, VK_FORMAT_R8G8B8A8_UNORM, base), sl_res(&f_out, VK_FORMAT_R16G16B16A16_SFLOAT, base | VK_IMAGE_USAGE_STORAGE_BIT),
+                          sl_res(&f_depth, VK_FORMAT_R32_SFLOAT, base), sl_res(&f_mv, VK_FORMAT_R16G16_SFLOAT, base) };
+    static const uint32_t kind[4] = { SL_BUFFER_SCALING_INPUT, SL_BUFFER_SCALING_OUTPUT, SL_BUFFER_DEPTH, SL_BUFFER_MVEC };
+    SlResourceTag tag[4]; const SlBase *in[5] = { &dlss_vp.h };
+    for (int i = 0; i < 4; i++) {
+        memset(&tag[i], 0, sizeof tag[i]); tag[i].h = (SlBase)SL_HEAD(SL_GUID_RESOURCE_TAG, 1);
+        tag[i].resource = &res[i]; tag[i].type = kind[i]; tag[i].lifecycle = SL_LIFECYCLE_VALID_UNTIL_EVALUATE;
+        tag[i].extent = (SlExtent){ 0, 0, res[i].width, res[i].height };
+        in[i + 1] = &tag[i].h;
+    }
+    int errors = sl_errors;
+    r = sl_evaluate(SL_FEATURE_DLSS, tok, in, 5, (void *)cb);
+    rendering = 0; cur_rt = cur_ds = -1;            /* Streamline bound its own pipelines; it leaves the images in the layouts they came in */
+    if (r != SL_OK || sl_errors != errors) { dlss_drop("upscaling failed", r); return 0; }       /* (a failure inside the NVIDIA library is only reported through the message callback) */
+    return 1;
+}
+
+/* ---- frame generation (--framegen fsr) -------------------------------------------
+ * AMD FSR 3 frame interpolation from amd_fidelityfx_framegeneration_vk.dll
+ * (same loader DLL and API as the upscaler). AMD's usual set-up replaces the
+ * application's swapchain by a wrapper that presents the generated pictures
+ * itself; this renderer keeps its own swapchain and presenter and uses the
+ * other documented way: the context is configured with
+ * NO_SWAPCHAIN_CONTEXT_NOTIFY and dispatched by hand, which writes ONE picture
+ * for the instant half-way between the previous upscaled picture and this one
+ * into an image given to it. Inputs: the upscaled picture before the 2D layer
+ * (so captions and film grain are not interpolated), and the motion vectors
+ * and depth the upscaler got. The 2D layer of the newer picture is put over
+ * the generated one as over the real one. The caller presents the generated
+ * picture first, then the real one. */
+static ffxContext fg_ctx; static PfnFfxConfigure ffx_configure; static int fg_rw, fg_rh, fg_dw, fg_dh, fg_have, fg_debug; static uint64_t fg_frame;
+static Img f_gen, f_compg[2];                     /* the generated picture; with the 2D layer, one for each kept picture */
+static void fg_drop(const char *why, ffxReturnCode_t rc) {
+    fprintf(stderr, "[gs_hw] frame generation: %s (FidelityFX error %u): frame generation off\n", why, (unsigned)rc);
+    fg_ok = 0; fg_have = 0;
+}
+/* Context and images for these sizes; nothing of this thread's may be pending. */
+static void fg_begin(int rw, int rh, int dw, int dh) {
+    if (!fg_ok || (fg_ctx && rw == fg_rw && rh == fg_rh && dw == fg_dw && dh == fg_dh)) return;
+    hw_flush();
+    if (fg_ctx) { ffx_destroy(&fg_ctx, 0); fg_ctx = 0; }
+    if (f_gen.img) img_destroy(&f_gen);
+    for (int i = 0; i < 2; i++) if (f_compg[i].img) img_destroy(&f_compg[i]);
+    fg_have = 0; fg_frame = 0;
+    struct ffxCreateBackendVKDesc be = { { FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK, 0 }, { dev, phys, vkGetDeviceProcAddr } };
+    struct ffxCreateContextDescFrameGenerationVersion ver = { { FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION_VERSION, &be.header }, FFX_FRAMEGENERATION_VERSION };
+    struct ffxCreateContextDescFrameGeneration cg; memset(&cg, 0, sizeof cg);
+    cg.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION; cg.header.pNext = &ver.header;
+    cg.flags = FFX_FRAMEGENERATION_ENABLE_DEPTH_INVERTED | (fg_debug ? FFX_FRAMEGENERATION_ENABLE_DEBUG_CHECKING : 0);
+    cg.displaySize.width = (uint32_t)dw; cg.displaySize.height = (uint32_t)dh; cg.maxRenderSize.width = (uint32_t)rw; cg.maxRenderSize.height = (uint32_t)rh;
+    cg.backBufferFormat = FFX_API_SURFACE_FORMAT_R16G16B16A16_FLOAT;
+    ffxReturnCode_t rc = ffx_create(&fg_ctx, &cg.header, 0);
+    if (rc != FFX_API_RETURN_OK || !fg_ctx) { fg_ctx = 0; fg_drop("the context could not be created", rc); return; }
+    struct ffxQueryGetProviderVersion pv = { { FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION, 0 }, 0, 0 };
+    ffx_query(&fg_ctx, &pv.header);
+    fprintf(stderr, "[gs_hw] frame generation: %s, %dx%d (motion and depth at %dx%d)\n", pv.versionName ? pv.versionName : "FidelityFX (version unknown)", dw, dh, rw, rh);
+    img_new(&f_gen, dw, dh, VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT, 0);
+    img_new(&f_compg[0], dw, dh, VK_FORMAT_R16G16B16A16_SFLOAT, 0, 1); img_new(&f_compg[1], dw, dh, VK_FORMAT_R16G16B16A16_SFLOAT, 0, 1);
+    to_layout(&f_gen, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    fg_rw = rw; fg_rh = rh; fg_dw = dw; fg_dh = dh;
+}
+/* AMD's loader DLL and its API; for the upscaler (FSR 3.1) and for frame generation. what / then: the two ends of the log line if it fails. */
+static int fsr3_load(const char *what, const char *then) {
+    static int tried; if (tried) return fsr_ok; tried = 1;
 #ifdef _WIN32
     wchar_t path[1024]; DWORD n = GetModuleFileNameW(0, path, 900);
     while (n > 0 && path[n - 1] != L'\\' && path[n - 1] != L'/') n--;
@@ -763,10 +1116,11 @@ int hw_fsr3_init(void) {
             m = LoadLibraryExW(path, 0, LOAD_WITH_ALTERED_SEARCH_PATH);
         }
     }
-    if (!m) { fprintf(stderr, "[gs_hw] FSR 3.1: amd_fidelityfx_loader_vk.dll could not be loaded from the program's folder or %%ROR_APP_DIR%% (error %lu): using FSR 1.0\n", (unsigned long)GetLastError()); return 0; }
+    if (!m) { fprintf(stderr, "[gs_hw] %s: amd_fidelityfx_loader_vk.dll could not be loaded from the program's folder or %%ROR_APP_DIR%% (error %lu): %s\n", what, (unsigned long)GetLastError(), then); return 0; }
     ffx_create = (PfnFfxCreateContext)(void *)GetProcAddress(m, "ffxCreateContext"); ffx_destroy = (PfnFfxDestroyContext)(void *)GetProcAddress(m, "ffxDestroyContext");
     ffx_query = (PfnFfxQuery)(void *)GetProcAddress(m, "ffxQuery"); ffx_dispatch = (PfnFfxDispatch)(void *)GetProcAddress(m, "ffxDispatch");
-    if (!ffx_create || !ffx_destroy || !ffx_query || !ffx_dispatch) { fprintf(stderr, "[gs_hw] FSR 3.1: amd_fidelityfx_loader_vk.dll does not export the FidelityFX API: using FSR 1.0\n"); return 0; }
+    ffx_configure = (PfnFfxConfigure)(void *)GetProcAddress(m, "ffxConfigure");
+    if (!ffx_create || !ffx_destroy || !ffx_query || !ffx_dispatch || !ffx_configure) { fprintf(stderr, "[gs_hw] %s: amd_fidelityfx_loader_vk.dll does not export the FidelityFX API: %s\n", what, then); return 0; }
     fsr_debug = getenv("ROR_FSR3_DEBUG") ? atoi(getenv("ROR_FSR3_DEBUG")) : 0;        /* 1: the upscaler checks its inputs and reports; 2: plus its debug view */
     fsr_view = getenv("ROR_FSR3_VIEW") ? atoi(getenv("ROR_FSR3_VIEW")) : 0;           /* show an input instead of the result: 1 colour, 2 motion, 3 depth, 4 reactive */
     {   /* the upscaler versions the DLL (and, on Radeon, the driver) offers; ROR_FSR_VERSION=text pins the first whose name contains it */
@@ -790,17 +1144,56 @@ int hw_fsr3_init(void) {
     fsr_ok = 1;
     return 1;
 #else
-    fprintf(stderr, "[gs_hw] FSR 3.1 needs AMD's FidelityFX DLL, which exists for Windows only: using FSR 1.0\n");
+    fprintf(stderr, "[gs_hw] %s needs AMD's FidelityFX DLL, which exists for Windows only: %s\n", what, then);
     return 0;
 #endif
+}
+int hw_fsr3_init(void) {
+    if (!fsr_want || !dev) return 0;
+    if (dlss_ok) { tu_dlss = 1; return 1; }          /* (AMD's DLL is loaded only if DLSS gives up later) */
+    return fsr3_load("FSR 3.1", "using FSR 1.0");
+}
+int hw_tu_alive(void) { return tu_dlss || fsr_ok; }
+/* --framegen fsr, after hw_fsr3_init. 0 (one log line): frame generation cannot run. */
+int hw_fg_init(void) {
+    if (fg_kind != 1 || !dev) return 0;
+    if (!fsr3_load("frame generation", "frame generation off")) { if (!tu_dlss) fprintf(stderr, "[gs_hw] frame generation: AMD's FidelityFX DLLs are not available: frame generation off\n"); return 0; }
+    VkDeviceContext dc = { dev, phys, vkGetDeviceProcAddr }; uint64_t count = 0;
+    struct ffxQueryDescGetVersions q = { { FFX_API_QUERY_DESC_TYPE_GET_VERSIONS, 0 }, FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION, &dc, &count, 0, 0 };
+    if (ffx_query(0, &q.header) != FFX_API_RETURN_OK || count == 0) { fprintf(stderr, "[gs_hw] frame generation: amd_fidelityfx_framegeneration_vk.dll is not beside amd_fidelityfx_loader_vk.dll or offers no frame generation: frame generation off\n"); return 0; }
+    fg_debug = getenv("ROR_FG_DEBUG") ? atoi(getenv("ROR_FG_DEBUG")) : 0;               /* 1: FidelityFX checks its inputs and reports; 2: plus tear lines; 3: its debug view */
+    fg_ok = 1;
+    return 1;
 }
 static void fsr_free_images(void) {
     Img *all[7] = { &f_col, &f_mv, &f_depth, &f_react, &f_out, &f_comp[0], &f_comp[1] };
     for (int i = 0; i < 7; i++) if (all[i]->img) img_destroy(all[i]);
 }
+/* The upscaler's inputs, each exactly render size, its output and the two kept pictures. */
+static void tu_images(int rw, int rh, int dw, int dh) {
+    img_new(&f_col, rw, rh, VK_FORMAT_R8G8B8A8_UNORM, 0, 1);
+    img_new(&f_mv, rw, rh, VK_FORMAT_R16G16_SFLOAT, 0, 0);
+    img_new(&f_depth, rw, rh, VK_FORMAT_R32_SFLOAT, 0, 0);
+    img_new(&f_react, rw, rh, VK_FORMAT_R8_UNORM, 0, 0);
+    img_new(&f_out, dw, dh, VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT, 0);
+    img_new(&f_comp[0], dw, dh, VK_FORMAT_R16G16B16A16_SFLOAT, 0, 1); img_new(&f_comp[1], dw, dh, VK_FORMAT_R16G16B16A16_SFLOAT, 0, 1);
+}
 int hw_fsr3_begin(int rw, int rh, int dw, int dh, float *jx, float *jy) {
-    if (!fsr_ok || rw <= 0 || rh <= 0 || dw <= 0 || dh <= 0) return 0;
-    if (!fsr_ctx || rw != fsr_rw || rh != fsr_rh || dw != fsr_dw || dh != fsr_dh) {
+    if (rw <= 0 || rh <= 0 || dw <= 0 || dh <= 0) return 0;
+    if (tu_dlss) {
+        /* DLSS takes a render size between half its output size and all of it, or exactly a third. Its output here is the
+         * window rectangle where that fits, else the nearest size it can do; the presentation pass (FSR 1.0 EASU, or the
+         * area filter downwards) covers the remainder. */
+        static int no3 = -1; if (no3 < 0) no3 = getenv("ROR_DLSS_NO3X") != 0;
+        int tw = dw < rw ? rw : dw > 2 * rw ? 2 * rw : dw, th = dh < rh ? rh : dh > 2 * rh ? 2 * rh : dh;
+        if (dw >= 3 * rw && dh >= 3 * rh && !no3) { tw = 3 * rw; th = 3 * rh; }
+        tu_qw = dw; tu_qh = dh;
+        if (dlss_begin(rw, rh, tw, th)) { dw = tw; dh = th; }
+        else if (!fsr3_load("FSR 3.1", "using FSR 1.0")) return 0;      /* DLSS gave up: FSR 3.1 from here on, if it is there */
+    }
+    if (!tu_dlss) { tu_qw = dw; tu_qh = dh; }
+    if (!tu_dlss && !fsr_ok) return 0;
+    if (!tu_dlss && (!fsr_ctx || rw != fsr_rw || rh != fsr_rh || dw != fsr_dw || dh != fsr_dh)) {
         hw_flush();                                    /* nothing of this thread's is pending; no other thread uses these objects */
         if (fsr_ctx) { ffx_destroy(&fsr_ctx, 0); fsr_ctx = 0; }
         fsr_free_images();
@@ -829,16 +1222,15 @@ int hw_fsr3_begin(int rw, int rh, int dw, int dh, float *jx, float *jy) {
         fsr_phase = phase; fsr_index = 0; fsr_fresh = 1;
         fsr_rw = rw; fsr_rh = rh; fsr_dw = dw; fsr_dh = dh;
         fprintf(stderr, "[gs_hw] temporal upscaler: %s, %dx%d -> %dx%d, %d jitter phases\n", pv.versionName ? pv.versionName : "FidelityFX (version unknown)", rw, rh, dw, dh, phase);
-        img_new(&f_col, rw, rh, VK_FORMAT_R8G8B8A8_UNORM, 0, 1);
-        img_new(&f_mv, rw, rh, VK_FORMAT_R16G16_SFLOAT, 0, 0);
-        img_new(&f_depth, rw, rh, VK_FORMAT_R32_SFLOAT, 0, 0);
-        img_new(&f_react, rw, rh, VK_FORMAT_R8_UNORM, 0, 0);
-        img_new(&f_out, dw, dh, VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT, 0);
-        img_new(&f_comp[0], dw, dh, VK_FORMAT_R16G16B16A16_SFLOAT, 0, 0); img_new(&f_comp[1], dw, dh, VK_FORMAT_R16G16B16A16_SFLOAT, 0, 0);
+        tu_images(rw, rh, dw, dh);
     }
+    fg_begin(rw, rh, fsr_dw, fsr_dh);
     float qx = 0, qy = 0;
+    if (tu_dlss) { int i = fsr_index++ % fsr_phase + 1; qx = halton(i, 2) - 0.5f; qy = halton(i, 3) - 0.5f; }       /* the Halton (2, 3) sequence NVIDIA trains with */
+    else {
     struct ffxQueryDescUpscaleGetJitterOffset jq = { { FFX_API_QUERY_DESC_TYPE_UPSCALE_GETJITTEROFFSET, 0 }, fsr_index++, fsr_phase, &qx, &qy };
     ffx_query(&fsr_ctx, &jq.header);
+    }
     /* The offset handed to the upscaler is minus the sequence value, and the picture is drawn moved by that offset
      * (what AMD's sample does through its projection matrix: clip-space shift (-2x/w, +2y/h), y up). */
     fsr_jx = -qx; fsr_jy = -qy;
@@ -880,8 +1272,75 @@ static struct FfxApiResource fsr_res(Img *im, uint32_t fmt, uint32_t usage) {
     r.description.depth = 1; r.description.mipCount = 1; r.description.flags = FFX_API_RESOURCE_FLAGS_NONE; r.description.usage = usage;
     return r;
 }
+/* ROR_TU_TIMING=1: the GPU time of the upscaler and of frame generation alone (each submitted by itself and waited for; slows the run). */
+static int tu_timing = -1; static double tu_ms[2]; static int tu_n[2];
+static uint64_t tu_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
+static void tu_timed(int which, uint64_t t0) {
+    hw_flush(); begin_cb();
+    tu_ms[which] += (double)(tu_now() - t0) / 1e6;
+    if (++tu_n[which] == 40) { fprintf(stderr, "[gs_hw] %s: %.2f ms per picture on the GPU (mean of 40, submit and wait included)\n", which ? "frame generation" : "temporal upscaler", tu_ms[which] / 40.0); tu_ms[which] = 0; tu_n[which] = 0; }
+}
+/* ROR_HW_VRAMLOG=1: video memory of this process (VK_EXT_memory_budget) and what the vendor libraries say they use, every 64 presented pictures. */
+static void vram_log(void) {
+    static int n; if (!vram_want || n++ % 64 != 60) return;
+    typedef void (VKAPI_PTR *PProps2)(VkPhysicalDevice, VkPhysicalDeviceMemoryProperties2 *);
+    PProps2 props2 = (PProps2)gipa(inst, "vkGetPhysicalDeviceMemoryProperties2");
+    if (!props2) return;
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT bud; memset(&bud, 0, sizeof bud); bud.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+    VkPhysicalDeviceMemoryProperties2 mp = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &bud };
+    props2(phys, &mp);
+    uint64_t local = 0;
+    for (uint32_t i = 0; i < mp.memoryProperties.memoryHeapCount; i++) if (mp.memoryProperties.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) local += bud.heapUsage[i];
+    char extra[200]; int o = 0; extra[0] = 0;
+    if (tu_dlss && dlss_live) { SlDLSSState st; memset(&st, 0, sizeof st); st.h = (SlBase)SL_HEAD(SL_GUID_DLSS_STATE, 1); if (sl_dlss_state(&dlss_vp, &st) == SL_OK) o += snprintf(extra + o, sizeof extra - (size_t)o, "; DLSS reports %.0f MiB", (double)st.estimatedVRAMUsageInBytes / 1048576.0); }
+    if (!tu_dlss && fsr_ctx) { struct FfxApiEffectMemoryUsage mu = { 0, 0 }; struct ffxQueryDescUpscaleGetGPUMemoryUsage q = { { FFX_API_QUERY_DESC_TYPE_UPSCALE_GPU_MEMORY_USAGE, 0 }, &mu };
+        if (ffx_query(&fsr_ctx, &q.header) == FFX_API_RETURN_OK) o += snprintf(extra + o, sizeof extra - (size_t)o, "; the FSR upscaler reports %.0f MiB", (double)mu.totalUsageInBytes / 1048576.0); }
+    if (fg_ctx) { struct FfxApiEffectMemoryUsage mu = { 0, 0 }; struct ffxQueryDescFrameGenerationGetGPUMemoryUsage q = { { FFX_API_QUERY_DESC_TYPE_FRAMEGENERATION_GPU_MEMORY_USAGE, 0 }, &mu };
+        if (ffx_query(&fg_ctx, &q.header) == FFX_API_RETURN_OK) o += snprintf(extra + o, sizeof extra - (size_t)o, "; FSR frame generation reports %.0f MiB", (double)mu.totalUsageInBytes / 1048576.0); }
+    fprintf(stderr, "[gs_hw] video memory used by this process: %.0f MiB%s\n", (double)local / 1048576.0, extra);
+}
+/* The in-between picture of the previous upscaled picture and this one (f_out) into f_gen. 1: f_gen holds one. */
+static int fg_dispatch(const HwFsr3 *p, int rw, int rh, int reset) {
+    if (!fg_ok || !fg_ctx || fg_dw != fsr_dw || fg_dh != fsr_dh || fg_rw != rw || fg_rh != rh) return 0;
+    uint64_t t0 = 0; if (tu_timing) { hw_flush(); begin_cb(); t0 = tu_now(); }
+    uint32_t flags = FFX_FRAMEGENERATION_FLAG_NO_SWAPCHAIN_CONTEXT_NOTIFY | (fg_debug == 2 ? FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_TEAR_LINES : 0) | (fg_debug == 3 ? FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_VIEW : 0);
+    struct FfxApiRect2D whole = { 0, 0, fsr_dw, fsr_dh };
+    struct ffxConfigureDescFrameGeneration cf; memset(&cf, 0, sizeof cf);
+    cf.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
+    cf.frameGenerationEnabled = true; cf.allowAsyncWorkloads = false; cf.HUDLessColor = fsr_res(0, 0, 0); cf.flags = flags; cf.generationRect = whole; cf.frameID = fg_frame;
+    ffxReturnCode_t rc = ffx_configure(&fg_ctx, &cf.header);
+    if (rc != FFX_API_RETURN_OK) { fg_drop("it could not be configured", rc); return 0; }
+    struct ffxDispatchDescFrameGenerationPrepareV2 pr; memset(&pr, 0, sizeof pr);
+    pr.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_V2;
+    pr.frameID = fg_frame; pr.flags = flags; pr.commandList = (void *)cb;
+    pr.renderSize.width = (uint32_t)rw; pr.renderSize.height = (uint32_t)rh;
+    pr.jitterOffset.x = fsr_jx; pr.jitterOffset.y = fsr_jy; pr.motionVectorScale.x = 1.0f; pr.motionVectorScale.y = 1.0f;
+    pr.frameTimeDelta = p->dt_ms < 1.0f ? 1.0f : p->dt_ms; pr.reset = reset != 0;
+    pr.cameraNear = p->cam_near; pr.cameraFar = p->cam_far; pr.cameraFovAngleVertical = p->cam_fovy; pr.viewSpaceToMetersFactor = p->unit_m;
+    pr.depth = fsr_res(&f_depth, FFX_API_SURFACE_FORMAT_R32_FLOAT, FFX_API_RESOURCE_USAGE_READ_ONLY);
+    pr.motionVectors = fsr_res(&f_mv, FFX_API_SURFACE_FORMAT_R16G16_FLOAT, FFX_API_RESOURCE_USAGE_READ_ONLY);
+    pr.cameraUp[1] = 1.0f; pr.cameraRight[0] = 1.0f; pr.cameraForward[2] = 1.0f;       /* the camera's world position is not known here (only the 3.1 interpolation is used, which does not need it) */
+    rc = ffx_dispatch(&fg_ctx, &pr.header);
+    if (rc != FFX_API_RETURN_OK) { rendering = 0; cur_rt = cur_ds = -1; fg_drop("its preparation pass failed", rc); return 0; }
+    struct ffxDispatchDescFrameGeneration dg; memset(&dg, 0, sizeof dg);
+    dg.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION;
+    dg.commandList = (void *)cb;
+    dg.presentColor = fsr_res(&f_out, FFX_API_SURFACE_FORMAT_R16G16B16A16_FLOAT, FFX_API_RESOURCE_USAGE_READ_ONLY);
+    dg.outputs[0] = fsr_res(&f_gen, FFX_API_SURFACE_FORMAT_R16G16B16A16_FLOAT, FFX_API_RESOURCE_USAGE_UAV);
+    dg.numGeneratedFrames = 1; dg.reset = reset != 0;
+    dg.backbufferTransferFunction = FFX_API_BACKBUFFER_TRANSFER_FUNCTION_SRGB; dg.minMaxLuminance[0] = 0.0f; dg.minMaxLuminance[1] = 200.0f;
+    dg.generationRect = whole; dg.frameID = fg_frame;
+    rc = ffx_dispatch(&fg_ctx, &dg.header);
+    rendering = 0; cur_rt = cur_ds = -1;
+    if (rc != FFX_API_RETURN_OK) { fg_drop("generating a picture failed", rc); return 0; }
+    fg_frame++;
+    if (tu_timing) tu_timed(1, t0);
+    int had = fg_have; fg_have = 1;
+    return had && !reset;                          /* the first picture after a reset has no partner */
+}
 int hw_fsr3_upscale(const HwFsr3 *p) {
-    if (!fsr_ok || !fsr_ctx || p->slot < 0 || p->slot > 1) return 0;
+    if (!(tu_dlss ? dlss_live : fsr_ok && fsr_ctx) || p->slot < 0 || p->slot > 1) return 0;
+    if (tu_timing < 0) tu_timing = getenv("ROR_TU_TIMING") != 0;
     Rt *c = &rts[p->color], *m = &rts[p->mv];
     int rw = p->sw * N, rh = p->sh * N, ox = p->sx * N, oy = p->sy * N;
     if (rw != fsr_rw || rh != fsr_rh || ox + rw > c->col.w || oy + rh > c->col.h || ox + rw > m->col.w || oy + rh > m->col.h) {
@@ -902,7 +1361,12 @@ int hw_fsr3_upscale(const HwFsr3 *p) {
     to_layout(&f_col, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL); to_layout(&f_mv, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     to_layout(&f_depth, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL); to_layout(&f_react, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     to_layout(&f_out, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    Img *shown = &f_out; int view = fsr_view;
+    Img *shown = &f_out; int view = fsr_view, reset = p->reset || fsr_fresh, gen = 0;
+    uint64_t t0 = 0; if (tu_timing) { hw_flush(); begin_cb(); t0 = tu_now(); }
+    if (tu_dlss && (view < 1 || view > 4)) {
+        if (!dlss_eval(p, rw, rh)) return 0;
+        fsr_fresh = 0;
+    } else
     if (view < 1 || view > 4) {
         struct ffxDispatchDescUpscale d; memset(&d, 0, sizeof d);
         d.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
@@ -933,8 +1397,13 @@ int hw_fsr3_upscale(const HwFsr3 *p) {
         fsr_fresh = 0;
         rendering = 0; cur_rt = cur_ds = -1;         /* the upscaler bound its own pipelines */
     }
-    /* the 2D layer over the upscaled picture */
-    Img *out = &f_comp[p->slot];
+    if (tu_timing) tu_timed(0, t0);
+    if (fg_ok && p->fg && (view < 1 || view > 4)) gen = fg_dispatch(p, rw, rh, reset);
+    else fg_have = 0;
+    /* the 2D layer over the upscaled picture (and over the generated one, if there is one) */
+    for (int g = 0; g <= gen; g++) {
+    Img *out = g ? &f_compg[p->slot] : &f_comp[p->slot];
+    if (g) shown = &f_gen;
     to_layout(out, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     if (view >= 1 && view <= 4) {
         float rr[4] = { 0, 0, (float)rw, (float)rh };
@@ -948,7 +1417,8 @@ int hw_fsr3_upscale(const HwFsr3 *p) {
         fpass(out->view, fsr_dw, fsr_dh, 2, 1, shown->set, b->col.set_lin, orr, full, 0, 2, 0.0f);
     } else fpass(out->view, fsr_dw, fsr_dh, 2, 0, shown->set, VK_NULL_HANDLE, full, full, 0, 3, 0.0f);
     to_layout(out, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    return 1;
+    }
+    return 1 + gen;
 }
 void hw_fsr3_show(int slot) { pr_fsr_slot = slot; }
 static void stage_img(Img *im, int w, int h, int f16) {
@@ -962,9 +1432,14 @@ static void stage_img(Img *im, int w, int h, int f16) {
  * picture goes through the stage images, otherwise it is one pass. */
 static void present_draw(Rt *r, VkImageView view, int tw, int th, int fmtsel, int sx, int sy, int sw, int sh, int dx, int dy, int dw, int dh, int filter, int sat64) {
     float src[4] = { (float)(sx * N), (float)(sy * N), (float)(sw * N), (float)(sh * N) }, dst[4] = { (float)dx, (float)dy, (float)dw, (float)dh };
+    vram_log();
     /* FSR 3.1: a finished picture of exactly this size is waiting (hw_fsr3_show); otherwise filter 3 means FSR 1.0 */
     Img *up = 0;
-    if (pr_fsr_slot >= 0) { if (r && filter == 3 && fsr_ok && f_comp[pr_fsr_slot].img && f_comp[pr_fsr_slot].w == dw && f_comp[pr_fsr_slot].h == dh) up = &f_comp[pr_fsr_slot]; pr_fsr_slot = -1; }
+    if (pr_fsr_slot >= 0) {
+        Img *k = pr_fsr_slot >= 2 ? &f_compg[pr_fsr_slot & 1] : &f_comp[pr_fsr_slot];      /* 2, 3: the generated picture that leads up to kept picture 0, 1 */
+        if (r && filter == 3 && (fsr_ok || tu_dlss) && k->img && tu_qw == dw && tu_qh == dh) up = k;
+        pr_fsr_slot = -1;
+    }
     if (filter == 3) filter = 2;
     int bloom = pr_bloom > 0, chain = r && dw > 0 && dh > 0 && (filter == 2 || bloom);
     if (!chain) {
@@ -986,9 +1461,18 @@ static void present_draw(Rt *r, VkImageView view, int tw, int th, int fmtsel, in
     done.valid = 0;
     stage_img(&st_a, dw, dh, 1); stage_img(&st_b, dw, dh, 0);
     int mode = filter == 2 ? (sw * N < dw ? 2 : sw * N > dw ? 3 : 0) : filter;
+    if (up && (up->w != dw || up->h != dh)) {       /* DLSS covered part of the scale: stage A <- its picture by EASU (or the area filter), stage B <- RCAS and the colour controls */
+        float us[4] = { 0, 0, (float)up->w, (float)up->h }; int um = up->w < dw ? 2 : 3;
+        to_layout(&st_a, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        ppass(st_a.view, dw, dh, 2, 0, 0, 0, dw, dh, um == 2 ? up->set : up->set_lin, VK_NULL_HANDLE, us, full, um, 0, 64, 1, 0.0f);
+        to_layout(&st_a, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL); to_layout(&st_b, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        ppass(st_b.view, dw, dh, 1, 0, 0, 0, dw, dh, st_a.set, lut_on ? lut_img.set : VK_NULL_HANDLE, full, full, 0, lut_on, sat64, 2, um == 2 ? pr_rcas : 0.0f);
+    } else
     if (up) {                       /* stage B <- the upscaled picture: colour controls only */
         to_layout(&st_b, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-        ppass(st_b.view, dw, dh, 1, 0, 0, 0, dw, dh, up->set, lut_on ? lut_img.set : VK_NULL_HANDLE, full, full, 0, lut_on, sat64, 2, 0.0f);
+        /* (FSR 3.1 has sharpened inside the upscaler. DLSS has no sharpening of its own: --sharpness is the RCAS pass here, one stop weaker than for FSR 1.0) */
+        static float dk = -1.0f; if (dk < 0.0f) dk = getenv("ROR_DLSS_RCAS") ? (float)atof(getenv("ROR_DLSS_RCAS")) : 0.5f;
+        ppass(st_b.view, dw, dh, 1, 0, 0, 0, dw, dh, up->set, lut_on ? lut_img.set : VK_NULL_HANDLE, full, full, 0, lut_on, sat64, 2, tu_dlss ? pr_rcas * dk : 0.0f);
     } else {
     to_layout(&st_a, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     ppass(st_a.view, dw, dh, 2, 0, 0, 0, dw, dh, mode == 2 ? r->col.set : r->col.set_lin, VK_NULL_HANDLE, src, full, mode, 0, 64, 1, 0.0f);

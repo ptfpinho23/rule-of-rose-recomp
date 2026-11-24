@@ -3,6 +3,7 @@
  * straight through (VIF1 DIRECT). */
 #include "gs.h"
 #include "vu.h"
+#include "vinterp.h"
 
 typedef struct {
     u32 r[4], c[4], cl, wl, mask, mode, itop, itops, top, tops, base, ofst, dbf, mark, code, err;
@@ -90,8 +91,7 @@ static int unpack_fast(u32 *dst, const u8 *src, u32 num, u32 vn, u32 vl, u32 usn
 }
 
 /* src = the packed data that follows the command word. */
-static void do_unpack(int n, Vif *v, u32 code, const u8 *src) {
-    VU *vu = n ? &g_vu1 : &g_vu0;
+static void do_unpack(VU *vu, Vif *v, u32 code, const u8 *src) {
     u32 cmd = code >> 24, num = (code >> 16) & 0xFF, imm = code & 0xFFFF;
     u32 vn = (cmd >> 2) & 3, vl = cmd & 3, m = (cmd >> 4) & 1, usn = (imm >> 14) & 1;
     u32 addr = (imm & 0x3FF) + ((imm & 0x8000) ? v->tops : 0);
@@ -157,10 +157,26 @@ static void start_micro(int n, Vif *v, u32 addr, int cont) {
 }
 
 /* One complete command: w = its words (command word first), not necessarily aligned. */
+int g_vi_rec;                 /* rt/vinterp.c records the VIF1 commands of every frame (frame interpolation from the VU1 inputs) */
+static u32 cmd_words(const Vif *v, u32 code) {
+    u32 cmd = (code >> 24) & 0x7F, num = (code >> 16) & 0xFF;
+    if (cmd >= 0x60) return unpack_words(v, code & 0x7FFFFFFFu);
+    return cmd == 0x20 ? 1 : (cmd == 0x30 || cmd == 0x31) ? 4 : cmd == 0x4A ? (num ? num : 256) * 2 : 0;
+}
+static __attribute__((noinline)) void record(const Vif *v, const u8 *w) {
+    u32 code = rd32(w), cmd = (code >> 24) & 0x7F, imm = code & 0xFFFF;
+    VRec r = { .w = w, .code = code, .words = cmd_words(v, code), .tops = v->tops, .mask = v->mask, .cl = (u8)v->cl, .wl = (u8)v->wl, .mode = (u8)v->mode };
+    r.rel = (imm & 0x8000) != 0; r.dest = cmd >= 0x60 ? (imm & 0x3FF) + (r.rel ? v->tops : 0) : 0;
+    vi_rec(&r);
+}
 static void command(int n, Vif *v, const u8 *w) {
     u32 code = rd32(w), cmd = (code >> 24) & 0x7F, imm = code & 0xFFFF, num = (code >> 16) & 0xFF;
     v->code = code;
-    if (cmd >= 0x60) { do_unpack(n, v, code, w + 4); return; }
+    if (UNLIKELY(g_vi_rec) && n) {
+        record(v, w);
+        if (cmd == 0x14 || cmd == 0x15 || cmd == 0x17) { vi_run_begin(cmd == 0x17 ? ~0u : imm * 8); start_micro(n, v, imm * 8, cmd == 0x17); vi_run_end(); return; }
+    }
+    if (cmd >= 0x60) { do_unpack(n ? &g_vu1 : &g_vu0, v, code, w + 4); return; }
     switch (cmd) {
     case 0x00: break;
     case 0x01: v->cl = imm & 0xFF; v->wl = imm >> 8; break;
@@ -247,6 +263,32 @@ static void vif_write1(int n, const u8 *data, u32 bytes) {
     }
 }
 
+/* ---- a second VIF1, for rt/vinterp.c: recorded commands on a private state and VU1 instance (any thread) ---- */
+size_t vif_state_size(void) { return sizeof(Vif); }
+void vif1_state_save(void *dst) { memcpy(dst, &vif[1], sizeof(Vif)); }
+void vif_w_command(void *state, VUW *wk, const u8 *w) {
+    Vif *v = state; VU *vu = vu_w_vu(wk);
+    u32 code = rd32(w), cmd = (code >> 24) & 0x7F, imm = code & 0xFFFF;
+    if (cmd >= 0x60) { do_unpack(vu, v, code, w + 4); return; }
+    switch (cmd) {
+    case 0x01: v->cl = imm & 0xFF; v->wl = imm >> 8; break;
+    case 0x02: v->ofst = imm & 0x3FF; v->dbf = 0; v->tops = v->base; break;
+    case 0x03: v->base = imm & 0x3FF; break;
+    case 0x04: v->itops = imm & 0x3FF; break;
+    case 0x05: v->mode = imm & 3; break;
+    case 0x14: case 0x15: case 0x17:
+        v->top = v->tops; v->itop = v->itops;
+        if (v->dbf) { v->tops = v->base; v->dbf = 0; } else { v->tops = v->base + v->ofst; v->dbf = 1; }
+        vu->vi_top = v->top; vu->vi_itop = v->itop;
+        vu_w_exec(wk, cmd == 0x17 ? 0xFFFFFFFFu : imm * 8);
+        break;
+    case 0x20: v->mask = rd32(w + 4); break;
+    case 0x30: memcpy(v->r, w + 4, 16); break;
+    case 0x31: memcpy(v->c, w + 4, 16); break;
+    default: break;
+    }
+}
+
 u32 vif_read_reg(int n, u32 off) {
     Vif *v = &vif[n];
     switch (off) {
@@ -272,7 +314,7 @@ void vif_write_reg(int n, u32 off, u32 val) {
     Vif *v = &vif[n];
     if (UNLIKELY(vifdump_frame != ~0ull || !vifdump_init)) vifdump(1, n, off, val, 0);
     switch (off) {
-    case 0x10: if (val & 1) vif_reset(n); break;   /* FBRST */
+    case 0x10: if (val & 1) { vif_reset(n); if (UNLIKELY(g_vi_rec) && n) vi_note(1); } break;   /* FBRST */
     case 0x20: v->err = val; break;
     case 0x30: v->mark = val; break;
     }
