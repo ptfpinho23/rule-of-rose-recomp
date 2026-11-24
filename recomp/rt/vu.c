@@ -26,7 +26,7 @@
 #include <emmintrin.h>
 
 static int vi_delay = 1;
-static int vu_clip_chain = 0;         /* ROR_VUCLIP=1: CLIP shifts into the newest clip flags, in-flight results included (see U_CLIP) */
+static int vu_clip_chain = 1;         /* CLIP shifts into the newest clip flags, in-flight results included (see U_CLIP); ROR_VUCLIP=0: into the visible ones, as until 2026-11-24 */
 static u64 FLAG_LATENCY = 4;      /* instructions before MAC/status/clip results are visible */
 VU g_vu1 = { .vf = { [0] = { .f = { 0.0f, 0.0f, 0.0f, 1.0f } } } };
 static u8 vu0_micro[0x1000], vu0_mem[0x1000], vu1_micro[0x4000], vu1_mem[0x4000];
@@ -673,11 +673,15 @@ void do_upper(VU *v, r128 *acc, FlagRegs *f, int lat, int uk, int usrc, int ufs,
         break;
     case U_ABS: vu_abs(v, (u32)udest, udst, ufs); break;
     case U_CLIP: {
-        /* The new judgement is shifted into the newest clip flags, i.e. including results that are
-         * still in flight: "CLIP; CLIP; ...; FCAND" sequences closer than the flag latency (0x2528,
-         * 0x3ae0 in this game's program) collect all their judgements. That is believed to be the
-         * hardware behaviour, but it changes two reference screenshots and is unconfirmed, so it is
-         * off by default (ROR_VUCLIP=1): by default the judgement is shifted into the visible flags. */
+        /* The clip flags are a shift register: every CLIP moves the 24 bits up by six and puts its
+         * judgement in the low six, in program order. A CLIP that follows another one closer than the
+         * flag latency therefore shifts the earlier one's result, although no FCxxx can see it yet.
+         * The program relies on it: at 0x3ae0 / 0x3af8 two CLIPs three instructions apart are tested
+         * by one FCAND with a mask over both judgements (0xbefbef), and the polygon clipper tests the
+         * vertices of a triangle with consecutive CLIPs (0x2528, 0x2530, 0x2548). Shifting into the
+         * visible flags instead (the behaviour until 2026-11-24, ROR_VUCLIP=0) loses the earlier
+         * judgements; ground polygons reaching behind the camera then pass as "inside" and are drawn
+         * unclipped, with a wrapped Z and a negative Q, as a band across the picture. */
         u32 oclip = v->clip;
         if (vu_clip_chain) for (int k = 0; k < 4; k++) if (f->ev[k] & EV_CLIP) v->clip = f->ev[k] & 0xFFFFFF;
         vu_clip(v, ufs, uft);

@@ -1278,12 +1278,15 @@ now including the new steps (5.7 pairing, 1.0 shared vertices).
   compared with the nearest pictures at a real frame before and after; a
   pixel counts when its value is more than 16 outside the range found within
   8 pixels in both. Pictures with at least 3 / 10 / 40 such pixels (of
-  230,400), leaving out vblanks 21780-21800 where the game itself changes
-  the tint of a foreground trunk every frame:
+  230,400), leaving out vblanks 21780-21800, where a band crosses the
+  picture and changes its tint every frame (taken for game content at the
+  time; it is the unclipped polygon of the section "Clip flags" below, in
+  both renderers and not related to interpolation):
   previous build 87 / 19 / 4 of 2200 (4.0% / 0.9% / 0.2%),
   now 7 / 4 / 2 of 2578 (0.3% / 0.2% / 0.1%). The two largest remaining hits
-  (190 pixels, vblanks 21868-21869) are a foreground branch that enters the
-  picture in that frame and is drawn from the start of the interval.
+  (190 pixels, vblanks 21868-21869) are the same unclipped polygon coming
+  into the picture in that frame (see "Clip flags" below), drawn from the
+  start of the interval.
 - Presents per second at 3840x2160, `--aspect stretch`, `--sharpness 88`,
   blocks of 1024 presents over the walk: mean 200.3 -> 205.1, lowest block
   121.8 -> 132.3. The remaining dips are the frames that are not
@@ -1419,3 +1422,106 @@ generation in `hw_tex_create`, one line in `draw_range`, `hw_tex_filter`,
   hardware or other scenes than the walk and the bus stop.
 - No integrated GPU was available: the cost there is inferred from the
   software driver.
+
+## Clip flags: consecutive CLIPs (2026-11-24)
+
+Seen on the software renderer at 4:3: a wide straight-edged band across the
+picture near the bus stop, translucent, red in one frame and green in the
+next. The same on the GPU renderer. Reproduced with
+`recomp/tools/script-uphill.txt` at vblanks 21784-21800.
+
+### What it is
+Frame 21790 (`ROR_GSDUMP=21790 ROR_GSDUMP_ALL=1` on a capture of the frame):
+a triangle fan with the ground texture at 0x3a00 whose vertices are
+
+    (802,-499) z=fffff001 q<0 | (-464,1018) z=b31 | (-416,1067) z=bc7
+    (802,-499) z=fffff001 q<0 | (-416,1067) z=bc7 | (1256,-1408) z=ffffe0bc rgba=fdd966b5
+
+i.e. a ground polygon reaching behind the camera that left VU1 unclipped:
+vertices behind the eye are projected with a negative Q, their Z wraps to
+0xfffff..., and the last vertex of the fan carries whatever was in the
+clipper's output buffer (hence the colour that changes every frame). The
+shadow-receiver pass draws the same polygons (texture 0x2300, ten more such
+triangles); alpha test hides those. 12 triangles of 11,855 in that frame.
+
+### Cause
+`vu.c`, CLIP. The clip flags are a 24-bit shift register: each CLIP shifts
+it up by six bits and puts its judgement in the low six, in program order,
+and FCAND / FCOR / FCEQ see the result four instructions later. The runtime
+computed "shifted flags" from the flags *visible* at the time of the CLIP.
+A CLIP that follows another within those four instructions then does not see
+the first one's judgement and, when its own result arrives, overwrites it.
+The game's program does this everywhere it matters:
+
+    2528: CLIP vf28, vf28w      3ae0: CLIP vf9, vf7w
+    2530: CLIP vf29, vf29w      3af8: CLIP vf13, vf7w
+    2548: CLIP vf10, vf10w      3b18: FCAND vi1, 0xbefbef
+
+(three vertices of a triangle; two CLIPs three instructions apart tested by
+one FCAND whose mask spans both judgements). With the earlier judgements
+lost, a triangle with one vertex outside the clip volume and the others
+inside can be taken for "inside" and is sent to the GS as it is.
+
+The correct behaviour was already implemented behind `ROR_VUCLIP=1` (the new
+judgement is shifted into the newest flags, results still in flight
+included; FCSET drops results in flight) and had been left off as
+unconfirmed. It is now the default; `ROR_VUCLIP=0` gives the old behaviour.
+Interpreter and generated code share the CLIP case.
+
+### Evidence
+- Frame 21790, software: triangles with a wrapped Z 12 -> 0 (frames 21786,
+  21794, 21798 the same); the 146 remaining triangles with a negative Q are
+  the shadow projection's texture coordinates, with ordinary Z.
+- Pictures before / after at the same frame, software and GPU at 4x and 1x:
+  `build/recomp/band-check/`.
+- 200 software shots over the whole scripted run (every 125 vblanks to
+  25,000): 8 differ. 7750, 7875, 13750, 13875 (cutscene at the bus stop: a
+  brownish translucent polygon over the picture is gone), 21875 (a
+  road-textured polygon that covered the whole screen is gone), 23250 (a
+  dashed dark line across the path), 24875 (33 pixels in the top row), 25000
+  (a translucent shape over the fence). All of them are stray polygons
+  disappearing.
+- The 16 pictures and the audio of the standard regression run do not
+  change (Linux and Windows identical to the previous build).
+- Interpreter (`ROR_VUFAST=0`) and generated code: 10 shots up to 21790
+  identical; `vubench starts` on the 3,723 VU1 program starts of frame
+  21790: same hash for every one with and without the generated code.
+- GPU at 1x against software at frame 21790: 92 pixels differing by more
+  than 8 before (same band in both), 4 after.
+
+### Widescreen
+`wide.c` divides the VU1 clip factor and the guard band by the widening
+while the frustum is set up, because polygons with wrapped Z crossed the
+picture at 16:9 and 21:9. At 21:9, frames 21786-21798, triangles with a
+wrapped Z per frame:
+
+| | old CLIP | new CLIP |
+|---|---|---|
+| without that correction (`ROR_WIDE_NOCLIPFIX=1`) | 15-18 | 0 |
+| with it | 0 | 0 |
+
+So the correction was hiding the same defect and is not needed for these
+frames any more. It is left in place: it has been verified over the walk,
+and whether a clip volume 1.75 times wider in view space is harmless
+everywhere has not been tested.
+
+### Test switches added
+`ROR_GSDUMP_ALL=1` (every vertex in a `ROR_GSDUMP` listing),
+`ROR_WIDE_NOCLIPFIX=1`, `ROR_SHOT_FROM=frame` (`--shots` saves nothing
+before that frame).
+
+### Software renderer with FSR 1.0 at 3840x2160: grain and sharpening
+Same measurement as in the previous section (bus stop, standing, two game
+frames, post-processed picture via `--post-shots`):
+
+| sharpness | grain 100: mean / share over 8 | grain 50: mean / share over 8 |
+|---|---|---|
+| 88 | 2.06 / 0.32% | 1.25 / 0.10% |
+| 60 | 1.98 / 0.18% | 1.17 / 0.06% |
+| 30 | 1.95 / 0.16% | 1.14 / 0.05% |
+| 0 | 1.94 / 0.13% | |
+
+(1920x1080, sharpness 60, grain 100: 2.04 / 0.24%.) The grain is drawn at
+512x448 and enlarged 4.2 times, so every speck is a blob four to five
+screen pixels wide; its strength sets the mean, sharpening mostly adds
+outliers (2.5 times as many strongly changing pixels at 88 as at 0).

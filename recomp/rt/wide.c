@@ -141,6 +141,7 @@ int wide_hook(Ctx *c, u32 entry) {
     half = (256.0f + k0 * (1984.0f - 256.0f)) / (float)g_wide;
     k1 = (half - 256.0f) / (1984.0f - 256.0f); if (k1 < 0.02f) k1 = 0.02f;
     half = 1984.0f / (float)g_wide; g1[0] = 2048.0f - half; g1[1] = 2048.0f + half;
+    { static int keep = -1; if (keep < 0) keep = getenv("ROR_WIDE_NOCLIPFIX") != 0; if (keep) { k1 = k0; g1[0] = g0[0]; g1[1] = g0[1]; } }   /* test: volumes as the game sets them */
     memcpy(HPTR(a0 + 0x12128), &k1, 4); memcpy(HPTR(0x32a5e4), g1, 8);
     f_00228b80(c);
     memcpy(HPTR(a0 + 0x12128), &k0, 4); memcpy(HPTR(0x32a5e4), g0, 8);

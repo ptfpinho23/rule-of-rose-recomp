@@ -1488,7 +1488,7 @@ static void pool_init(void) {
     }
 }
 
-/* Debug: ROR_GSDUMP=<frame> logs that frame's draw calls, grouped by state. */
+/* Debug: ROR_GSDUMP=<frame> logs that frame's draw calls, grouped by state (ROR_GSDUMP_ALL=1: with every vertex). */
 static void dump_prim(const DState *st, int type) {
     static u64 last_key[6]; static u32 run; static s32 bx0, by0, bx1, by1; static u32 zmin, zmax;
     const Ctxt *c = &st->c;
@@ -1521,7 +1521,8 @@ static void dump_prim(const DState *st, int type) {
                c->tcc, c->tfx, c->cbp, st->ate, st->atst, st->aref, st->afail, st->date, st->zte, st->ztst, st->aa, st->ab, st->ac, st->ad, st->fix,
                c->fbp, c->fbw, c->fpsm, c->fbmsk, c->zbp, c->zpsm, c->zmsk);
     }
-    if (run < 2) for (int i = 0; i < n; i++)
+    static int all = -1; if (all < 0) all = getenv("ROR_GSDUMP_ALL") != 0;      /* every primitive instead of the first two of a group */
+    if (run < 2 || all) for (int i = 0; i < n; i++)
         rt_log("       v%d xy=(%.1f,%.1f) z=%x rgba=%02x%02x%02x%02x stq=(%g,%g,%g) uv=(%u,%u)\n", i, vq[i].x / 16.0, vq[i].y / 16.0, vq[i].z,
                vq[i].r, vq[i].g, vq[i].b, vq[i].a, vq[i].s, vq[i].t, vq[i].q, vq[i].u, vq[i].v);
     run++;

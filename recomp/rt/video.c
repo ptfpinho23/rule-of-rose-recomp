@@ -99,6 +99,8 @@ static void run_post(const u32 *px, int w, int h, int ow, int oh) {
     post_run(px, w, h, out_px, ow, oh, &post_cfg);
     post_ms += (double)(plat_time_ns() - t0) / 1e6; post_n++;
 }
+/* ROR_SHOT_FROM=frame (testing): --shots saves nothing before that frame */
+static u64 shot_from(void) { static s64 f = -1; if (f < 0) { const char *e = getenv("ROR_SHOT_FROM"); f = e ? (s64)strtoll(e, 0, 10) : 0; } return (u64)f; }
 void video_config(int window, int shots, int frames, int nosync) {
     want_window = window; shot_every = shots; max_frames = frames; no_sync = nosync;
     gs_renderer(want_gpu, gpu_internal);        /* takes effect in gs_init (hw_init, called next) */
@@ -159,7 +161,7 @@ void video_present(void) {
       last = t; lastc = c; lw = hw_stat_wait_ns; lf = hw_stat_flushes; }
     /* GPU renderer presenting through its swapchain: the picture stays on the
      * GPU; it is read back only for a screenshot. */
-    int shot_due = shot_every && frame_no % (u64)shot_every == 0;
+    int shot_due = shot_every && frame_no % (u64)shot_every == 0 && frame_no >= shot_from();
     int gpu = gs_hw_active(), have = 0;
     if (gpu && want_fsr3 && !gpu_swap) {             /* FSR 3.1 works across frames: it needs the output rectangle on every frame, shot or not */
         int ow = res_w ? res_w : (wide_aspect() > 0 ? (int)(480 * win_scale * wide_aspect() + 0.5) : 640 * win_scale), oh = res_w ? res_h : 480 * win_scale, rx, ry, rw, rh;
@@ -198,7 +200,7 @@ void video_present(void) {
             if (pad_set_state) pad_set_state(pad_buttons, 0x80, 0x80, 0x80, 0x80);
         }
     if (pad_fake()) pad_update(frame_no, pad_buttons, 0);       /* test hook: synthetic gamepad, with or without a window */
-    if (have && shot_every && frame_no % (u64)shot_every == 0) {
+    if (have && shot_every && frame_no % (u64)shot_every == 0 && frame_no >= shot_from()) {
         char path[128];
         snprintf(path, sizeof path, "build/recomp/shots/frame_%06llu.png", (unsigned long long)frame_no);
         save_png(path, px, w, h);
@@ -210,7 +212,7 @@ void video_present(void) {
     static s64 fast_until = -1;
     if (fast_until < 0) { const char *e = getenv("ROR_FAST_UNTIL"); fast_until = e ? (s64)strtoll(e, 0, 10) : 0; }
     int fast = fast_until > 0 && (s64)frame_no < fast_until;
-    int shot_now = have && post_shots && shot_every && frame_no % (u64)shot_every == 0, posted = 0;
+    int shot_now = have && post_shots && shot_every && frame_no % (u64)shot_every == 0 && frame_no >= shot_from(), posted = 0;
     if (want_window && !fast) {
         if (!win_open) {
             if (vwin_open(sw, sh, want_fullscreen)) {
