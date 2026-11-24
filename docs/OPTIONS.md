@@ -26,7 +26,7 @@ ror-game --iso PATH [--scale 1..4 | --res WxH] [--wide 16:9] [picture options]
 | `--vsync 0\|1` | GPU renderer only: tear-free presentation (default 1) |
 | `--pad auto\|off\|xinput\|playstation` | gamepad: `auto` (default) uses the gamepads it finds, `off` ignores gamepads; `xinput` / `playstation` restrict it to XInput pads or to PlayStation pads (Linux: to non-Sony / Sony devices) |
 | `--pad-deadzone 0..90` | part of the stick travel around the centre that is ignored, in percent (default 24); the rest of the travel is the full analog range |
-| `--fps 0\|display\|25..1000` | GPU renderer only (experimental): frame interpolation. `0` (default) shows the game's own 25 pictures per second; `display` presents in-between pictures at the monitor's refresh rate; a number presents at most that many per second. Adds one game frame (40 ms) plus 20-60 ms of picture delay |
+| `--fps 0\|display\|25..1000` | GPU renderer only (experimental): frame interpolation. `0` (default) shows the game's own 25 pictures per second; `display` presents in-between pictures at the monitor's refresh rate; a number presents at most that many per second. Adds one game frame (40 ms) plus 20-60 ms of picture delay. Geometry is moved between two frames only where both frames agree on what it is; everything else is shown as the game drew it, and after a camera cut the real frames are shown without in-betweens |
 
 With `--renderer gpu` the same picture options run as shaders: `--filter fsr`
 is FSR 1.0 (EASU) when the internal picture is smaller than the window and an

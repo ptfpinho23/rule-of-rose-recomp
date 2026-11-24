@@ -1204,3 +1204,113 @@ come from the driver sources, not from captures of real devices; the
 sequential-button and BTN_TRIGGER_HAPPY rules and the merged XInput slots
 have never met hardware. Not done: reading `/dev/input/js*` (world-readable
 by default) as a fallback when the event node is not accessible.
+
+## Frame interpolation: validated pairs and shared vertices (2026-11-24)
+
+Reported with `--fps 240` on the GPU renderer: polygons that travel across
+the picture and thin black outlines around patches of ground, none of it with
+`--fps 0`.
+
+### Causes
+Measured over the uphill walk (`recomp/tools/script-uphill.txt`, vblanks
+21350-25050, about 12,000-15,000 primitives per frame):
+
+- Pairing was by position in the draw list, per draw state, accepted when no
+  vertex moved more than 96 native pixels. The game culls and orders per
+  frame, so the lists shift: about 11% of the accepted pairs (2.2 of 19.7
+  million) joined two different triangles of the same mesh - other texture
+  coordinates, or an area ratio above 3, or opposite facing - inside the 96
+  pixel limit. Their vertices were blended, which draws a triangle that is in
+  neither frame.
+- A primitive without a partner (10-15% of the vertices) was drawn at its new
+  place for the whole interval while its neighbours were in between. During
+  camera motion that opens a crack as wide as the motion along the shared
+  edges and shows the cleared background: the black outlines.
+- The picture rectangle, `--aspect stretch`, the window size and `--wide` do
+  not take part: pairing works on the native draw list. The statistics lines
+  of a run at 3840x2160 stretched and one at 1440x1080 are identical.
+
+### What the pairing does now (`hwi_boundary`, `hwi_rematch`, `hwi_check`)
+1. In-order pairing as before. `hwi_check` tests every pair: same vertex
+   count, texture coordinates equal (0.003, or 0.75 texel for texel
+   coordinates), area within a factor of 4 (triangles over 64 square pixels
+   only), same facing (over 16 square pixels), within the 96 pixel limit.
+2. A batch with a failing or missing pair keeps its valid in-order pairs; the
+   other primitives look for an unclaimed previous primitive of the same
+   state with their texture coordinates. Many primitives share coordinates
+   (leaf cards, tiled ground), so the nearest is taken only if it is twice
+   nearer than the second nearest.
+3. Vote per vertex: all pairs whose primitives share a vertex (same target,
+   same position in the new frame) must name the same previous position.
+   The position most pairs name wins, the smaller motion on a tie; pairs
+   that disagree are dissolved. This also keeps the layers of a surface
+   drawn in several passes together; layers interpolated differently get
+   different depths in between and show through each other as dotted dark
+   triangles.
+4. Primitives without a partner get previous positions from that table:
+   each vertex that is also a vertex of a paired primitive was where that
+   one was. Vertices found nowhere move like the found ones of their
+   primitive and are entered in the table so that the next primitive uses
+   the same place (three rounds, to reach the inside of an unpaired patch).
+   The result must pass `hwi_check`. A primitive with no known vertex is
+   drawn at its new place, as before.
+
+The fallback is therefore "move with the neighbours", and only for
+primitives with no neighbour "appear at the new place". Leaving a primitive
+at its new place was the cause of the cracks, and dropping whole batches to
+that state (tried first) made large cracks around every dropped patch.
+Sprites are not touched by steps 3 and 4.
+
+The 70% whole-picture threshold stays: over the walk 1494 of 1625 frames
+interpolate at least 90% of their vertices, 123 between 80 and 90%, none
+between 70 and 80%, 8 below 70% (camera cuts, shown as real frames only).
+
+### Cost
+The in-order pass searched the previous list forward for every primitive
+without a partner: 27.7 ms per frame in the walk, on the game thread. It now
+uses an index of the previous frame by state (`hwi_kbuild`): 0.25 ms, same
+pairs (statistics identical). Whole pairing per frame: 31 ms before, 6.7 ms
+now including the new steps (5.7 pairing, 1.0 shared vertices).
+
+### Results (RTX 3090, Windows, `--renderer gpu --internal 4 --fps 240`)
+- Detector: presented pictures grabbed from the swapchain over vblanks
+  21600-25040; every picture in the middle of an interval (t 0.3-0.7) is
+  compared with the nearest pictures at a real frame before and after; a
+  pixel counts when its value is more than 16 outside the range found within
+  8 pixels in both. Pictures with at least 3 / 10 / 40 such pixels (of
+  230,400), leaving out vblanks 21780-21800 where the game itself changes
+  the tint of a foreground trunk every frame:
+  previous build 87 / 19 / 4 of 2200 (4.0% / 0.9% / 0.2%),
+  now 7 / 4 / 2 of 2578 (0.3% / 0.2% / 0.1%). The two largest remaining hits
+  (190 pixels, vblanks 21868-21869) are a foreground branch that enters the
+  picture in that frame and is drawn from the start of the interval.
+- Presents per second at 3840x2160, `--aspect stretch`, `--sharpness 88`,
+  blocks of 1024 presents over the walk: mean 200.3 -> 205.1, lowest block
+  121.8 -> 132.3. The remaining dips are the frames that are not
+  interpolated because textures were uploaded (about 300 of 1800).
+- Vertices interpolated: 87-90% -> 95-96%.
+- Without `--fps`: 46 shots of the GPU renderer over 23,000 frames identical
+  to the previous build. Software renderer: 16 frames and audio of the
+  standard run identical to the previous build on Linux and Windows.
+  `--filter fsr3` runs with and without `--fps` (the made-up previous
+  positions also give those primitives motion vectors). `--wide 16:9` with
+  `--fps`: checked on in-between pictures of two frames.
+
+### Switches for looking at it
+`ROR_HW_INTERP_CHECK=0` pairs as before (no validation, vote or shared
+vertices); `ROR_HW_INTERP_STATS=1` logs per frame the failing pairs, the
+outvoted pairs, the primitives placed by shared vertices and the share of
+vertices interpolated, and every 250 frames the time spent.
+
+### Not covered
+- Only the uphill walk and the scenes before it were measured. Indoor
+  scenes, characters close to the camera and effects (particles, water) have
+  not been looked at.
+- Geometry the game clips itself against the near plane changes its vertex
+  set from frame to frame; such triangles pass the tests when they stay
+  within the limits. None was identified in the walk.
+- A primitive that is new and shares no vertex with anything still appears
+  at the start of the interval instead of at its end.
+- The detector sees values outside both neighbouring pictures; a wrong
+  triangle with the colours of its surroundings is invisible to it (and
+  mostly to the eye).

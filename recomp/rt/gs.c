@@ -1815,13 +1815,36 @@ static int hwi_moved(const RPrim *c, const RPrim *p) {
  * with the previous frame's primitives of the same state by texture
  * coordinates instead. Returns the number of vertices that found a partner
  * that has not moved further than the limit. */
+static int hwi_check(const RPrim *c, const RPrim *p);
+static RPrim *hwi_syn; static int hwi_nsyn, hwi_csyn;       /* previous positions made up for primitives without a partner: partner[i] = -2 - index */
+static int hwi_strict = -1, hwi_stats;                       /* ROR_HW_INTERP_CHECK=0: pairs are not validated (as before 2026-11-24); ROR_HW_INTERP_STATS=1: log */
+/* The previous frame's primitives grouped by state, in list order (made once per frame). */
+static struct { u64 key; int start, n, fill; } *hwi_kt; static int hwi_ktn, *hwi_kidx, *hwi_kbno, hwi_kcap;   /* kbno: number of the batch a primitive is in */
+static int hwi_kslot(u64 key) {
+    int sl = (int)((key * 0x9E3779B97F4A7C15ull) >> 40) & (hwi_ktn - 1);
+    while (hwi_kt[sl].n >= 0 && hwi_kt[sl].key != key) sl = (sl + 1) & (hwi_ktn - 1);
+    return sl;
+}
+static void hwi_kbuild(void) {
+    int tn = 256, at = 0; while (tn < hwi_nprev * 2) tn *= 2;
+    if (tn != hwi_ktn) { hwi_ktn = tn; hwi_kt = realloc(hwi_kt, sizeof *hwi_kt * (size_t)tn); }
+    if (hwi_kcap < hwi_nprev + 1) { hwi_kcap = hwi_nprev + 1024; hwi_kidx = realloc(hwi_kidx, sizeof(int) * (size_t)hwi_kcap); hwi_kbno = realloc(hwi_kbno, sizeof(int) * (size_t)hwi_kcap); }
+    for (int k = 0; k < tn; k++) hwi_kt[k].n = -1;
+    for (int q = 0; q < hwi_nprev; q++) {
+        int sl = hwi_kslot(hwi_prev[q].key);
+        if (hwi_kt[sl].n < 0) { hwi_kt[sl].key = hwi_prev[q].key; hwi_kt[sl].n = 0; hwi_kt[sl].start = -1; }
+        hwi_kt[sl].n++;
+    }
+    for (int q = 0; q < hwi_nprev; q++) {
+        int sl = hwi_kslot(hwi_prev[q].key);
+        if (hwi_kt[sl].start < 0) { hwi_kt[sl].start = at; at += hwi_kt[sl].n; hwi_kt[sl].fill = 0; }
+        hwi_kidx[hwi_kt[sl].start + hwi_kt[sl].fill++] = q;
+        hwi_kbno[q] = q ? hwi_kbno[q - 1] + (hwi_prev[q].key != hwi_prev[q - 1].key) : 0;
+    }
+}
 static long hwi_rematch(int i, int e, int *partner) {
     u64 key = hwi_cur[i].key; long nm = 0;
-    int np = 0, cap = 256, *idx = malloc(sizeof(int) * (size_t)cap);
-    for (int q = 0; q < hwi_nprev; q++) if (hwi_prev[q].key == key) {
-        if (np == cap) { cap *= 2; idx = realloc(idx, sizeof(int) * (size_t)cap); }
-        idx[np++] = q;
-    }
+    int ks = hwi_kslot(key), np = hwi_kt[ks].n > 0 ? hwi_kt[ks].n : 0; const int *idx = hwi_kidx + (np ? hwi_kt[ks].start : 0);
     int tn = 16; while (tn < np * 2) tn *= 2;
     int *tab = malloc(sizeof(int) * (size_t)tn), *next = malloc(sizeof(int) * (size_t)(np + 1)); u64 *hv = malloc(sizeof(u64) * (size_t)(np + 1));
     for (int k = 0; k < tn; k++) tab[k] = -1;
@@ -1830,16 +1853,47 @@ static long hwi_rematch(int i, int e, int *partner) {
         int slot = (int)(hv[k] >> 40) & (tn - 1);
         next[k] = tab[slot]; tab[slot] = k;
     }
-    for (int k = i; k < e; k++) {
-        u64 h = hwi_uvhash(&hwi_cur[k]); int slot = (int)(h >> 40) & (tn - 1), *link = &tab[slot];
-        partner[k] = -1;
-        for (; *link >= 0; link = &next[*link]) if (hv[*link] == h && hwi_prev[idx[*link]].n == hwi_cur[k].n && !hwi_moved(&hwi_cur[k], &hwi_prev[idx[*link]])) {
-            partner[k] = idx[*link]; nm += hwi_cur[k].n;
-            *link = next[*link];                     /* each previous primitive is used once */
-            break;
+    if (!hwi_strict) {                               /* as before the pairs were validated: the first one in reach */
+        for (int k = i; k < e; k++) {
+            u64 h = hwi_uvhash(&hwi_cur[k]); int *link = &tab[(int)(h >> 40) & (tn - 1)];
+            partner[k] = -1;
+            for (; *link >= 0; link = &next[*link]) if (hv[*link] == h && hwi_prev[idx[*link]].n == hwi_cur[k].n && !hwi_moved(&hwi_cur[k], &hwi_prev[idx[*link]])) {
+                partner[k] = idx[*link]; nm += hwi_cur[k].n;
+                *link = next[*link];                 /* each previous primitive is used once */
+                break;
+            }
         }
+        free(tab); free(next); free(hv);
+        return nm;
     }
-    free(idx); free(tab); free(next); free(hv);
+    /* In-order pairs that pass hwi_check stay. The others look for a previous
+     * primitive with their texture coordinates that nobody has. Several
+     * primitives of a mesh can have the same coordinates (rows of grass, leaf
+     * cards): the nearest is taken, and only when it is clearly nearer than
+     * the second nearest; a primitive left alone is placed by its shared
+     * vertices later, a wrong partner would drag it across its neighbours. */
+    u8 *used = calloc((size_t)np + 1, 1);
+    for (int k = i; k < e; k++) {
+        if (partner[k] < 0) continue;
+        if (hwi_check(&hwi_cur[k], &hwi_prev[partner[k]])) { partner[k] = -1; continue; }
+        int lo = 0, hi = np - 1;
+        while (lo < hi) { int m = (lo + hi) / 2; if (idx[m] < partner[k]) lo = m + 1; else hi = m; }
+        if (np && idx[lo] == partner[k] && !used[lo]) { used[lo] = 1; nm += hwi_cur[k].n; } else partner[k] = -1;
+    }
+    for (int k = i; k < e; k++) {
+        if (partner[k] >= 0) continue;
+        u64 h = hwi_uvhash(&hwi_cur[k]); int best = -1; float bestd = 1e30f, second = 1e30f;
+        for (int c = tab[(int)(h >> 40) & (tn - 1)], tries = 0; c >= 0 && tries < 64; c = next[c], tries++) {
+            const RPrim *pv = &hwi_prev[idx[c]];
+            if (used[c] || hv[c] != h || pv->n != hwi_cur[k].n) continue;
+            float dx = hwi_cur[k].v[0].x - pv->v[0].x, dy = hwi_cur[k].v[0].y - pv->v[0].y, d = dx * dx + dy * dy;
+            if (d >= second || hwi_check(&hwi_cur[k], pv)) continue;
+            if (d < bestd) { second = bestd; bestd = d; best = c; } else second = d;
+        }
+        if (best >= 0 && bestd * 4.0f <= second) { partner[k] = idx[best]; used[best] = 1; nm += hwi_cur[k].n; }
+    }
+    free(used);
+    free(tab); free(next); free(hv);
     return nm;
 }
 /* ---- frame interpolation in the game: packages and the presenter thread ----------------------
@@ -1895,8 +1949,8 @@ static Pkg *hwp_publish(const int *partner, int ok, int pic, int sx, int sy, int
         q->h.rt = hwp_w_rt(c->h.rt); q->h.ds = hwp_w_ds(c->h.ds);
         if (q->h.tex_kind == 2) q->h.tex = hwp_w_rt(c->h.tex);
         memcpy(q->cur, c->v, sizeof(HwVertex) * (size_t)c->n);
-        if ((ok || (hw_fsr3 && !hwf_cut)) && partner[i] >= 0) {      /* (not ok: the pairs are only used for FSR 3.1 motion vectors) */
-            const RPrim *pv = &hwi_prev[partner[i]];
+        if ((ok || (hw_fsr3 && !hwf_cut)) && partner[i] != -1) {     /* (not ok: the pairs are only used for FSR 3.1 motion vectors) */
+            const RPrim *pv = partner[i] >= 0 ? &hwi_prev[partner[i]] : &hwi_syn[-2 - partner[i]];
             q->paired = 1;
             if (c->h.flags & HWF_SPRITE) {         /* a sprite that changed size is another thing: let it jump, do not morph */
                 float w0 = c->v[5].x - c->v[0].x, h0 = c->v[5].y - c->v[0].y, w1 = pv->v[5].x - pv->v[0].x, h1 = pv->v[5].y - pv->v[0].y;
@@ -2256,13 +2310,46 @@ static void *hwp_thread(void *arg) {
     }
     return 0;
 }
+/* Is primitive p of the previous frame really c one frame earlier? Pairing is
+ * by position in the draw list first, and a list changes between frames (the
+ * game culls, clips and orders per frame), so a pair can join two different
+ * triangles; blending their vertices draws a polygon that sweeps across the
+ * picture. A pair is only kept when nothing speaks against it. Returns 0 or
+ * the reasons: 1 other texture coordinates (another triangle of the mesh),
+ * 2 area changed by more than four times, 4 facing flipped, 8 moved further
+ * than the limit. */
+static int hwi_check(const RPrim *c, const RPrim *p) {
+    int bad = 0;
+    if (c->n != p->n) return 15;
+    if (hwi_moved(c, p)) bad |= 8;
+    if (c->h.flags & HWF_SPRITE) return bad;                 /* (sprites: size and texture cell are compared when the package is made) */
+    if (c->h.flags & HWF_TME) {
+        float tol = (c->h.flags & HWF_TEXEL) ? 0.75f : 0.003f;
+        for (int q = 0; q < c->n; q++) {
+            float wc = c->v[q].q != 0.0f ? c->v[q].q : 1.0f, wp = p->v[q].q != 0.0f ? p->v[q].q : 1.0f;
+            if (fabsf(c->v[q].s / wc - p->v[q].s / wp) > tol || fabsf(c->v[q].t / wc - p->v[q].t / wp) > tol) { bad |= 1; break; }
+        }
+    }
+    if (c->n == 3) {
+        float ac = (c->v[1].x - c->v[0].x) * (c->v[2].y - c->v[0].y) - (c->v[2].x - c->v[0].x) * (c->v[1].y - c->v[0].y);
+        float ap = (p->v[1].x - p->v[0].x) * (p->v[2].y - p->v[0].y) - (p->v[2].x - p->v[0].x) * (p->v[1].y - p->v[0].y);
+        float mc = fabsf(ac), mp = fabsf(ap);                /* twice the area, native pixels */
+        /* (small triangles change their area and facing freely as they turn edge-on, and cannot make a
+         * visible wrong shape: the tests are for triangles of some size, 2A > 128 = an 8 x 8 pixel square) */
+        if ((mc > 128.0f || mp > 128.0f) && (mc > 4.0f * mp || mp > 4.0f * mc)) bad |= 2;
+        if (mc > 32.0f && mp > 32.0f && (ac > 0) != (ap > 0)) bad |= 4;
+    }
+    return bad;
+}
 static void hwi_boundary(HRt *disp, u32 dbx, u32 dby, u32 ww, u32 hh) {
     int N = hw_scale, nrt = hw_rt_count();
     hwi_frame++;
     int want = hwi_frame >= hw_interp_first && hwi_frame < hw_interp_first + hw_interp_count;
     /* match batches */
-    int *partner = malloc(sizeof(int) * (size_t)(hwi_ncur + 1));
-    long tot = 0, matched = 0, snapped = 0; int j = 0, batches = 0, mb = 0, sb = 0, rb = 0;
+    int *partner = malloc(sizeof(int) * (size_t)(hwi_ncur + 1)); u64 tm0 = plat_time_ns(), tm1 = 0, tm2 = 0;
+    if (hwi_strict < 0) { hwi_strict = !(getenv("ROR_HW_INTERP_CHECK") && atoi(getenv("ROR_HW_INTERP_CHECK")) == 0); hwi_stats = getenv("ROR_HW_INTERP_STATS") != 0; }
+    long tot = 0, matched = 0, snapped = 0, n_cross = 0; int j = 0, batches = 0, mb = 0, sb = 0, rb = 0;
+    hwi_kbuild();
     /* Primitive by primitive, in order. When the states differ, the previous
      * list is searched forward for the start of a batch with this state (a
      * batch may have grown, shrunk or been split differently: its common
@@ -2271,8 +2358,14 @@ static void hwi_boundary(HRt *disp, u32 dbx, u32 dby, u32 ww, u32 hh) {
     for (int i = 0; i < hwi_ncur; i++) {
         partner[i] = -1;
         if (j < hwi_nprev && hwi_prev[j].key == hwi_cur[i].key) { partner[i] = j++; continue; }
-        for (int s = j + 1, tries = 0; s < hwi_nprev && tries < 64; s++)
-            if (hwi_prev[s].key != hwi_prev[s - 1].key) { tries++; if (hwi_prev[s].key == hwi_cur[i].key) { partner[i] = s; j = s + 1; break; } }
+        if (j >= hwi_nprev) continue;
+        /* the next batch with this state after j, at most 64 batches on (from the index by state: the first
+         * primitive with the state behind j starts a batch, the one at j having another state) */
+        int ks = hwi_kslot(hwi_cur[i].key);
+        if (hwi_kt[ks].n <= 0) continue;
+        const int *L = hwi_kidx + hwi_kt[ks].start; int lo = 0, hi = hwi_kt[ks].n;
+        while (lo < hi) { int m = (lo + hi) / 2; if (L[m] <= j) lo = m + 1; else hi = m; }
+        if (lo < hwi_kt[ks].n && hwi_kbno[L[lo]] - hwi_kbno[j] <= 64) { partner[i] = L[lo]; j = L[lo] + 1; }
     }
     for (int i = 0; i < hwi_ncur;) {
         int e = i; while (e < hwi_ncur && hwi_cur[e].key == hwi_cur[i].key) e++;
@@ -2281,6 +2374,7 @@ static void hwi_boundary(HRt *disp, u32 dbx, u32 dby, u32 ww, u32 hh) {
             nv += hwi_cur[k].n;
             if (partner[k] < 0) continue;
             nm += hwi_cur[k].n;
+            if (!snap && hwi_strict) snap = hwi_check(&hwi_cur[k], &hwi_prev[partner[k]]) != 0;      /* a wrong pair: the order changed */
             for (int q = 0; q < hwi_cur[k].n && !snap; q++) {
                 float dx = hwi_cur[k].v[q].x - hwi_prev[partner[k]].v[q].x, dy = hwi_cur[k].v[q].y - hwi_prev[partner[k]].v[q].y;
                 if (dx * dx + dy * dy > hwi_snap_px * hwi_snap_px) snap = 1;
@@ -2326,10 +2420,23 @@ static void hwi_boundary(HRt *disp, u32 dbx, u32 dby, u32 ww, u32 hh) {
                 u64 h = hwi_uvhash(&hwi_cur[i]); int *link = &tab[(int)(h >> 40) & (tn - 1)];
                 /* at most 16 candidates each: scenery made of many primitives with the same
                  * texture coordinates would make this quadratic when its textures change */
-                for (int tries = 0; *link >= 0 && tries < 16; link = &next[*link], tries++) if (hv[*link] == h && hwi_prev[*link].n == hwi_cur[i].n && !hwi_moved(&hwi_cur[i], &hwi_prev[*link])) {
-                    partner[i] = *link; matched += hwi_cur[i].n; *link = next[*link];
-                    break;
+                if (!hwi_strict) {
+                    for (int tries = 0; *link >= 0 && tries < 16; link = &next[*link], tries++) if (hv[*link] == h && hwi_prev[*link].n == hwi_cur[i].n && !hwi_moved(&hwi_cur[i], &hwi_prev[*link])) {
+                        partner[i] = *link; matched += hwi_cur[i].n; *link = next[*link];
+                        break;
+                    }
+                    continue;
                 }
+                /* the nearest one that passes hwi_check, and not further than a quarter of the general limit:
+                 * with the state unknown, other meshes with the same texture coordinates are candidates too */
+                int *best = 0; float bestd = hwi_snap_px * hwi_snap_px / 16.0f;
+                for (int tries = 0; *link >= 0 && tries < 64; link = &next[*link], tries++) {
+                    const RPrim *pv = &hwi_prev[*link];
+                    if (hv[*link] != h || pv->n != hwi_cur[i].n) continue;
+                    float dx = hwi_cur[i].v[0].x - pv->v[0].x, dy = hwi_cur[i].v[0].y - pv->v[0].y, d = dx * dx + dy * dy;
+                    if (d < bestd && !hwi_check(&hwi_cur[i], pv)) { bestd = d; best = link; }
+                }
+                if (best) { partner[i] = *best; matched += hwi_cur[i].n; *best = next[*best]; n_cross++; }
             }
             free(used); free(tab); free(next); free(hv);
         }
@@ -2362,6 +2469,138 @@ static void hwi_boundary(HRt *disp, u32 dbx, u32 dby, u32 ww, u32 hh) {
     int pic = disp->hw;
     {   int cnt[32] = { 0 }, best = 0;
         for (int i = 0; i < hwi_ncur; i++) if (++cnt[hwi_cur[i].h.rt & 31] > best) { best = cnt[hwi_cur[i].h.rt & 31]; pic = hwi_cur[i].h.rt; }
+    }
+    /* Validation: a pair that fails hwi_check is dissolved; what becomes of the
+     * primitive is decided below. */
+    {   long n_pairs = 0, n_bad = 0, why[4] = { 0, 0, 0, 0 }, n_weld = 0, n_vote = 0; float worst = 0;
+        for (int i = 0; i < hwi_ncur;) {
+            int e = i; while (e < hwi_ncur && hwi_cur[e].key == hwi_cur[i].key) e++;
+            long nv = 0, good = 0;
+            for (int k = i; k < e; k++) {
+                nv += hwi_cur[k].n;
+                if (partner[k] < 0) continue;
+                int bad = hwi_check(&hwi_cur[k], &hwi_prev[partner[k]]);
+                n_pairs++;
+                if (!bad) { good += hwi_cur[k].n; continue; }
+                n_bad++; for (int b = 0; b < 4; b++) why[b] += (bad >> b) & 1;
+                if (hwi_stats) for (int q = 0; q < hwi_cur[k].n; q++) {
+                    float dx = hwi_cur[k].v[q].x - hwi_prev[partner[k]].v[q].x, dy = hwi_cur[k].v[q].y - hwi_prev[partner[k]].v[q].y, d = sqrtf(dx * dx + dy * dy);
+                    if (d > worst) worst = d;
+                }
+                if (hwi_strict) { matched -= hwi_cur[k].n; partner[k] = -1; }
+            }
+            i = e;
+        }
+        /* Welding. A primitive without a partner used to be drawn where the new
+         * frame has it for the whole interval; while the camera moves, its
+         * neighbours are in between and a crack as wide as the motion opens
+         * along the shared edges. Meshes share vertices: a vertex of such a
+         * primitive that is also a vertex of a validly paired one (same
+         * target, same position in the new frame) was at that one's previous
+         * position. Vertices found nowhere move like the found ones of their
+         * primitive; a primitive with none stays where it is. */
+        tm1 = plat_time_ns();
+        if (hwi_strict && hwi_nprev) {
+            /* (a table of slots pointing at entries made in order of appearance: only the slots are cleared per frame) */
+            typedef struct { u32 kx, ky, kz; int rt; float px, py, pz; float cx[3], cy[3], cz[3]; u16 cn[3]; } WV;
+            static WV *went; static int *wslot, wtn, wcap; int tn = 1024, nent = 0; while (tn < hwi_ncur * 12) tn *= 2;
+            if (tn != wtn) { wtn = tn; wslot = realloc(wslot, sizeof(int) * (size_t)tn); }
+            if (wcap < hwi_ncur * 6 + 16) { wcap = hwi_ncur * 6 + 4096; went = realloc(went, sizeof(WV) * (size_t)wcap); }
+            memset(wslot, 0xFF, sizeof(int) * (size_t)tn);
+            WV *tab = went;
+            /* WFIND: e = the entry of vertex q of c, or -1 with sl = the free slot where it would go */
+            #define WFIND(e, sl, c, q) do { u32 kx_, ky_, kz_; memcpy(&kx_, &(c)->v[q].x, 4); memcpy(&ky_, &(c)->v[q].y, 4); memcpy(&kz_, &(c)->v[q].z, 4); \
+                sl = (int)(((kx_ * 2654435761u) ^ (ky_ * 2246822519u) ^ (kz_ * 3266489917u) ^ ((u32)(c)->h.rt * 668265263u)) >> 7) & (tn - 1); \
+                while ((e = wslot[sl]) >= 0 && !(tab[e].rt == (c)->h.rt && tab[e].kx == kx_ && tab[e].ky == ky_ && tab[e].kz == kz_)) sl = (sl + 1) & (tn - 1); } while (0)
+            #define WADD(e, sl, c, q) do { e = nent++; wslot[sl] = e; memcpy(&tab[e].kx, &(c)->v[q].x, 4); memcpy(&tab[e].ky, &(c)->v[q].y, 4); memcpy(&tab[e].kz, &(c)->v[q].z, 4); tab[e].rt = (c)->h.rt; } while (0)
+            /* One previous place per vertex. The pairs vote: primitives that share a
+             * vertex (neighbours in a mesh, and the layers of a surface drawn in
+             * several passes) must agree where it was; layers that disagree get
+             * different depths in between and show through each other in a dot
+             * pattern. The place most pairs name wins, the smaller move on a tie;
+             * pairs that name another place are dissolved and placed below. */
+            for (int i = 0; i < hwi_ncur; i++) {
+                if (partner[i] < 0 || (hwi_cur[i].h.flags & HWF_SPRITE)) continue;
+                const RPrim *c = &hwi_cur[i], *pv = &hwi_prev[partner[i]];
+                for (int q = 0; q < c->n; q++) {
+                    int en, sl; WFIND(en, sl, c, q);
+                    if (en < 0) { WADD(en, sl, c, q); tab[en].cn[0] = tab[en].cn[1] = tab[en].cn[2] = 0; }
+                    WV *w = &tab[en];
+                    int k = 0;
+                    for (; k < 3 && w->cn[k]; k++) if (fabsf(w->cx[k] - pv->v[q].x) <= 0.25f && fabsf(w->cy[k] - pv->v[q].y) <= 0.25f) break;
+                    if (k == 3) continue;
+                    if (!w->cn[k]) { w->cx[k] = pv->v[q].x; w->cy[k] = pv->v[q].y; w->cz[k] = pv->v[q].z; }
+                    if (w->cn[k] < 65535) w->cn[k]++;
+                }
+            }
+            for (int k = 0; k < nent; k++) {
+                WV *w = &tab[k]; float cx, cy; memcpy(&cx, &w->kx, 4); memcpy(&cy, &w->ky, 4);
+                int best = 0; float bd = 0;
+                for (int m = 0; m < 3 && w->cn[m]; m++) {
+                    float d = (w->cx[m] - cx) * (w->cx[m] - cx) + (w->cy[m] - cy) * (w->cy[m] - cy);
+                    if (m == 0 || w->cn[m] > w->cn[best] || (w->cn[m] == w->cn[best] && d < bd)) { best = m; bd = d; }
+                }
+                w->px = w->cx[best]; w->py = w->cy[best]; w->pz = w->cz[best];
+            }
+            for (int i = 0; i < hwi_ncur; i++) {
+                if (partner[i] < 0 || (hwi_cur[i].h.flags & HWF_SPRITE)) continue;
+                const RPrim *c = &hwi_cur[i], *pv = &hwi_prev[partner[i]];
+                for (int q = 0; q < c->n; q++) {
+                    int en, sl; WFIND(en, sl, c, q); (void)sl;
+                    if (fabsf(tab[en].px - pv->v[q].x) > 0.25f || fabsf(tab[en].py - pv->v[q].y) > 0.25f) { matched -= c->n; partner[i] = -1; n_vote++; break; }
+                }
+            }
+            hwi_nsyn = 0;
+            /* (three rounds: a vertex placed by estimate is entered in the table, so that every primitive
+             * sharing it uses the same place, and primitives further inside an unpaired patch find it later) */
+            for (int round = 0; round < 3; round++) {
+                long placed = 0;
+                for (int i = 0; i < hwi_ncur; i++) {
+                    if (partner[i] != -1 || (hwi_cur[i].h.flags & HWF_SPRITE)) continue;
+                    const RPrim *c = &hwi_cur[i]; float px[6], py[6], pz[6]; int have[6], nf = 0; float mx = 0, my = 0, mz = 0;
+                    for (int q = 0; q < c->n; q++) {
+                        int en, sl; WFIND(en, sl, c, q); (void)sl;
+                        have[q] = en >= 0;
+                        if (have[q]) { px[q] = tab[en].px; py[q] = tab[en].py; pz[q] = tab[en].pz; mx += px[q] - c->v[q].x; my += py[q] - c->v[q].y; mz += pz[q] - c->v[q].z; nf++; }
+                    }
+                    if (!nf) continue;
+                    if (hwi_nsyn == hwi_csyn) { hwi_csyn = hwi_csyn ? hwi_csyn * 2 : 4096; hwi_syn = realloc(hwi_syn, sizeof(RPrim) * (size_t)hwi_csyn); }
+                    RPrim *sp = &hwi_syn[hwi_nsyn]; *sp = *c;
+                    for (int q = 0; q < c->n; q++) {
+                        if (have[q]) { sp->v[q].x = px[q]; sp->v[q].y = py[q]; sp->v[q].z = pz[q]; }
+                        else { sp->v[q].x += mx / (float)nf; sp->v[q].y += my / (float)nf; sp->v[q].z += mz / (float)nf; }
+                    }
+                    if (hwi_check(c, sp)) continue;            /* (the same tests as for a pair: no flips, no bursting) */
+                    for (int q = 0; q < c->n; q++) if (!have[q]) {
+                        int en, sl; WFIND(en, sl, c, q);       /* (an earlier vertex of this primitive may have entered the same place) */
+                        if (en < 0) { WADD(en, sl, c, q); tab[en].px = sp->v[q].x; tab[en].py = sp->v[q].y; tab[en].pz = sp->v[q].z; }
+                    }
+                    partner[i] = -2 - hwi_nsyn++; matched += c->n; n_weld++; placed++;
+                }
+                if (!placed) break;
+            }
+            #undef WFIND
+            #undef WADD
+        }
+        tm2 = plat_time_ns();
+        if (hwi_stats) {
+            static u64 frames, frames_bad, pairs, bads; static u64 ns_a, ns_b; ns_a += tm1 - tm0; ns_b += tm2 - tm1;
+            frames++; frames_bad += n_bad > 0; pairs += (u64)n_pairs; bads += (u64)n_bad;
+            {   /* why primitives are alone: is there anything with their state in the previous frame at all? */
+                static u64 fr; long alone = 0, nokey = 0;
+                if (++fr % 50 == 0) {
+                    for (int i = 0; i < hwi_ncur; i++) if (partner[i] == -1) {
+                        alone++; nokey += hwi_kt[hwi_kslot(hwi_cur[i].key)].n <= 0;
+                    }
+                    rt_log("[istat] vblank %llu: %d primitives (%d in the previous frame), %ld alone, of those %ld have no primitive with their state in the previous frame; %ld paired across states\n",
+                           (unsigned long long)g_gs_frames, hwi_ncur, hwi_nprev, alone, nokey, n_cross);
+                }
+            }
+            if (n_bad || n_vote) rt_log("[istat] vblank %llu: %ld of %ld pairs fail (texture coordinates %ld, area %ld, facing %ld, distance %ld; largest move %.0f px); %ld pairs outvoted at a shared vertex; %ld primitives placed by shared vertices; %ld of %ld vertices interpolated\n",
+                              (unsigned long long)g_gs_frames, n_bad, n_pairs, why[0], why[1], why[2], why[3], worst, n_vote, n_weld, matched, tot);
+            if (frames % 250 == 0) rt_log("[istat] total after vblank %llu: %llu frames, %llu with failing pairs; %llu of %llu pairs failed; per frame %.2f ms pairing, %.2f ms shared vertices\n", (unsigned long long)g_gs_frames,
+                                          (unsigned long long)frames, (unsigned long long)frames_bad, (unsigned long long)bads, (unsigned long long)pairs, ns_a / 1e6 / (double)frames, ns_b / 1e6 / (double)frames);
+        }
     }
     int ok = hwi_nprev > 0 && tot > 0 && matched * 10 >= tot * 7 && !hwi_uploads && !hwi_texgone && hwi_have_start;
     hwf_replay = !hwi_uploads && hwi_have_start > 0; hwf_cut = !(hwi_nprev > 0 && tot > 0 && matched * 10 >= tot * 7);
