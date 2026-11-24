@@ -1413,6 +1413,9 @@ void MainWindow::play()
                    env.contains(k) ? env.value(k).toLocal8Bit().constData() : "(unset)");
         if (env.contains("ROR_APP_DIR"))
             printf("[dry-run] env: ROR_APP_DIR=%s\n", env.value("ROR_APP_DIR").toLocal8Bit().constData());
+        // Diagnostic switches set in the launcher's own environment reach the game unchanged.
+        if (env.contains("ROR_PERFLOG"))
+            printf("[dry-run] env: ROR_PERFLOG=%s (passed through)\n", env.value("ROR_PERFLOG").toLocal8Bit().constData());
         fflush(stdout);
         gameEnded(true, {});
         return;

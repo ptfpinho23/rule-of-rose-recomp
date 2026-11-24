@@ -206,6 +206,8 @@ Files
   lib/, plugins/   Qt 6 and the other libraries the launcher needs
   licenses/        licences of the bundled typeface and of FSR
   game.log         written on each start: the game's console output
+                   (start the launcher with ROR_PERFLOG=1 in the environment
+                   to add timing lines to it, for reporting slowness)
 
 Running the game without the launcher
   ./ror-game --iso /path/to.iso [switches]
@@ -381,6 +383,9 @@ Files
   amd_fidelityfx_*.dll   AMD FSR 3.1 runtime, used by ror-game.exe
   licenses\          licences of the bundled typeface and of FSR
   game.log           written on each start: the game's console output
+                     (start the launcher with ROR_PERFLOG=1 set - in a command
+                     prompt: set ROR_PERFLOG=1 - to add timing lines to it,
+                     for reporting slowness)
 
 Running the game without the launcher
   ror-game.exe --iso C:\path\to.iso [switches]
