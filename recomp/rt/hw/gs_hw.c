@@ -360,14 +360,19 @@ int hw_start(int scale) {
 #undef X
     VkPhysicalDevice pd[16]; uint32_t n = 16;
     vkEnumeratePhysicalDevices(inst, &n, pd);
+    if (!n) fprintf(stderr, "[gs_hw] Vulkan reports no graphics device\n");
     int best = -1, want = getenv("ROR_VK_DEVICE") ? atoi(getenv("ROR_VK_DEVICE")) : -1;
     for (uint32_t i = 0; i < n; i++) {
         VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(pd[i], &p);
+        /* one line per device in the log, for bug reports */
+        fprintf(stderr, "[gs_hw] device %u: %s, type %d, Vulkan %u.%u.%u, driver 0x%x, vendor 0x%x%s\n", i, p.deviceName, (int)p.deviceType,
+                VK_VERSION_MAJOR(p.apiVersion), VK_VERSION_MINOR(p.apiVersion), VK_VERSION_PATCH(p.apiVersion), p.driverVersion, p.vendorID,
+                p.apiVersion < VK_API_VERSION_1_3 ? " (not usable: Vulkan 1.3 needed; a newer graphics driver may help)" : "");
         if (p.apiVersion < VK_API_VERSION_1_3) continue;
         VkPhysicalDeviceVulkan13Features f13 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES };
         VkPhysicalDeviceFeatures2 f2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f13 };
         vkGetPhysicalDeviceFeatures2(pd[i], &f2);
-        if (!f2.features.dualSrcBlend || !f13.dynamicRendering) continue;
+        if (!f2.features.dualSrcBlend || !f13.dynamicRendering) { fprintf(stderr, "[gs_hw] device %u lacks a needed feature\n", i); continue; }
         if (want >= 0 ? (int)i == want : (best < 0 || p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU)) { best = (int)i; snprintf(devname, sizeof devname, "%s", p.deviceName); dev_discrete = p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU; have_depth_clamp = f2.features.depthClamp != 0; }
     }
     if (best < 0) return 0;
@@ -589,7 +594,10 @@ static int swap_create(int w, int h) {
     static VkSurfaceFormatKHR fm[64]; uint32_t nf = 64;
     vkGetPhysicalDeviceSurfaceFormatsKHR(phys, surf, &nf, fm);
     VkSurfaceFormatKHR f = fm[0];
-    for (uint32_t i = 0; i < nf; i++) if (fm[i].format == VK_FORMAT_B8G8R8A8_UNORM || fm[i].format == VK_FORMAT_R8G8B8A8_UNORM) { f = fm[i]; break; }
+    /* an 8-bit format in the ordinary sRGB colour space first: with HDR on, a display also lists other colour spaces */
+    int picked = 0;
+    for (uint32_t i = 0; i < nf && !picked; i++) if ((fm[i].format == VK_FORMAT_B8G8R8A8_UNORM || fm[i].format == VK_FORMAT_R8G8B8A8_UNORM) && fm[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) { f = fm[i]; picked = 1; }
+    for (uint32_t i = 0; i < nf && !picked; i++) if (fm[i].format == VK_FORMAT_B8G8R8A8_UNORM || fm[i].format == VK_FORMAT_R8G8B8A8_UNORM) { f = fm[i]; picked = 1; }
     VkPresentModeKHR pm[16]; uint32_t np = 16, have = 0;
     vkGetPhysicalDeviceSurfacePresentModesKHR(phys, surf, &np, pm);
     for (uint32_t i = 0; i < np; i++) have |= 1u << pm[i];
@@ -612,7 +620,8 @@ static int swap_create(int w, int h) {
     if (!(caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR)) ci.compositeAlpha = VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR;
     ci.presentMode = mode; ci.clipped = 1; ci.oldSwapchain = swp;
     VkSwapchainKHR ns;
-    if (vkCreateSwapchainKHR(dev, &ci, 0, &ns) != VK_SUCCESS) return 0;
+    { VkResult r = vkCreateSwapchainKHR(dev, &ci, 0, &ns);
+      if (r != VK_SUCCESS) { fprintf(stderr, "[gs_hw] cannot create the swapchain (%ux%u, format %d): error %d\n", e.width, e.height, (int)f.format, (int)r); return 0; } }
     if (swp) { for (uint32_t i = 0; i < nsw; i++) vkDestroyImageView(dev, swview[i], 0); vkDestroySwapchainKHR(dev, swp, 0); }
     swp = ns; nsw = 8;
     vkGetSwapchainImagesKHR(dev, swp, &nsw, swimg);
@@ -624,7 +633,7 @@ static int swap_create(int w, int h) {
         vi.subresourceRange = (VkImageSubresourceRange){ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
         CHECK(vkCreateImageView(dev, &vi, 0, &swview[i]));
     }
-    fprintf(stderr, "[gs_hw] swapchain %ux%u, %u images, present mode %s\n", e.width, e.height, nsw,
+    fprintf(stderr, "[gs_hw] swapchain %ux%u, %u images, format %d, colour space %d, present mode %s\n", e.width, e.height, nsw, (int)f.format, (int)f.colorSpace,
             mode == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox" : mode == VK_PRESENT_MODE_IMMEDIATE_KHR ? "immediate" : "fifo");
     return 1;
 }
@@ -1520,12 +1529,20 @@ const uint32_t *hw_present_pixels(int rt, int sx, int sy, int sw, int sh, int dx
     hw_flush();
     return (const uint32_t *)(rmap + at);
 }
+/* A picture that could not be presented: said once per cause in the log (bug reports of a black window). */
+static void present_failed(int what, int code) {
+    static unsigned said;
+    static const char *const why[4] = { "the window has no Vulkan surface", "the swapchain could not be created", "no swapchain image could be acquired", "the present call failed" };
+    if (said & (1u << what)) return;
+    said |= 1u << what;
+    fprintf(stderr, "[gs_hw] nothing is shown: %s (code %d)\n", why[what], code);
+}
 void hw_present(int rt, int sx, int sy, int sw, int sh, int dx, int dy, int dw, int dh, int ww, int wh, int linear, int sat64) {
-    if (!surf) return;
+    if (!surf) { present_failed(0, 0); return; }
     if ((!swp || (int)swext.width != ww || (int)swext.height != wh) && ww > 0 && wh > 0) {
         hw_flush();
         pthread_mutex_lock(&qm[0]); pthread_mutex_lock(&qm[1]); vkDeviceWaitIdle(dev); int okc = swap_create(ww, wh); pthread_mutex_unlock(&qm[1]); pthread_mutex_unlock(&qm[0]);
-        if (!okc && !swp) return;
+        if (!okc && !swp) { if (ww > 0 && wh > 0) present_failed(1, 0); return; }
     }
     if (!swp) return;
     uint32_t idx = 0;
@@ -1537,7 +1554,7 @@ void hw_present(int rt, int sx, int sy, int sw, int sh, int dx, int dy, int dw, 
         if (!okc) return;
         ar = vkAcquireNextImageKHR(dev, swp, ~0ull, sem_acq, VK_NULL_HANDLE, &idx);
     }
-    if (ar != VK_SUCCESS && ar != VK_SUBOPTIMAL_KHR) return;
+    if (ar != VK_SUCCESS && ar != VK_SUBOPTIMAL_KHR) { present_failed(2, (int)ar); return; }
     emit_batch(); end_rendering(); begin_cb();
     Rt *r = rt >= 0 ? &rts[rt] : 0;
     if (r) to_layout(&r->col, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
@@ -1556,8 +1573,9 @@ void hw_present(int rt, int sx, int sy, int sw, int sh, int dx, int dy, int dw, 
     submit_cb(sem_acq, sem_done, async_on && is_game && !grabbed);
     VkPresentInfoKHR pi = { VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, 0, 1, &sem_done, 1, &swp, &idx, 0 };
     pthread_mutex_lock(&qm[qi]);
-    vkQueuePresentKHR(queues[qi], &pi);
+    VkResult pr = vkQueuePresentKHR(queues[qi], &pi);
     pthread_mutex_unlock(&qm[qi]);
+    if (pr != VK_SUCCESS && pr != VK_SUBOPTIMAL_KHR && pr != VK_ERROR_OUT_OF_DATE_KHR) present_failed(3, (int)pr);
 }
 static void need_staging(size_t bytes) { if (soff + bytes > slimit) hw_flush(); if (bytes > st_cap) die("staging too small", 0); }
 

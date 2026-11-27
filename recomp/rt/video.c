@@ -44,7 +44,7 @@ static int frameskip = 1;
 #define FRAMESKIP_OK_NS 1000000ll        /* ... and stop asking once within this of it */
 static PostSettings post_cfg = { POST_FSR, 0, 60, 0, 0, 100, 100, 0 };
 static u32 *out_px; static int out_w, out_h; static size_t out_cap;
-static double post_ms, show_ms; static u32 post_n;
+static double post_ms, show_ms; static u32 post_n; static u64 shown_n;
 void video_set_scale(int n) { if (n >= 1 && n <= 4) win_scale = n; }
 /* Picture options from the command line (name without the dashes; value 0
  * for flags). Returns 0 if the name or the value is not valid. */
@@ -390,13 +390,14 @@ void video_present(void) {
                                              (post_cfg.saturation * 64 + 50) / 100, no_sync || !pace_next ? t0 : pace_next);
                 else
                 gs_hw_show(rx, ry, rw, rh, ow, oh, gpu_filter(), post_lut(&post_cfg, lut) ? lut : 0, (post_cfg.saturation * 64 + 50) / 100);
-                show_ms += (double)(plat_time_ns() - t0) / 1e6; post_n++;
+                show_ms += (double)(plat_time_ns() - t0) / 1e6; post_n++; shown_n++;
             } else if (have && ow > 0 && oh > 0) {
                 static int since;
                 int fresh = post_frame(px, w, h, ow, oh); posted = 1;
                 if (fresh || ++since >= 12) {            /* an unchanged picture: only refreshed now and then (the window may have been covered) */
                     u64 t0 = plat_time_ns();
                     vwin_show(out_px, ow, oh);
+                    shown_n++;
                     show_ms += (double)(plat_time_ns() - t0) / 1e6;
                     since = 0;
                 }
@@ -428,6 +429,25 @@ void video_present(void) {
         char path[128];
         snprintf(path, sizeof path, "build/recomp/shots/post_%06llu.png", (unsigned long long)frame_no);
         save_png(path, out_px, out_w, out_h);
+    }
+    if (want_window && (frame_no == 250 || frame_no == 750 || frame_no == 3000)) {
+        /* A few lines for bug reports: is the game running, is anything being drawn, and does the picture
+         * that goes to the window have anything in it. */
+        int ow = 0, oh = 0; char pic[96] = "";
+        if (win_open) vwin_size(&ow, &oh);
+        if (!gpu && out_px && out_w > 0 && out_h > 0) {
+            unsigned mx = 0; u64 sum = 0, n = 0;
+            for (int y = 0; y < out_h; y += 8)
+                for (int x = 0; x < out_w; x += 8) {
+                    u32 c = out_px[(size_t)y * out_w + x]; unsigned l = (c & 255) + ((c >> 8) & 255) + ((c >> 16) & 255);
+                    if (l > mx) mx = l;
+                    sum += l; n++;
+                }
+            snprintf(pic, sizeof pic, ", picture brightness mean %u max %u of 255", (unsigned)(sum / (n ? n * 3 : 1)), mx / 3);
+        }
+        rt_log("[video] status after %llu s: renderer %s, window %s %dx%d%s, %llu primitives drawn so far, %llu pictures shown%s\n",
+               (unsigned long long)(frame_no / 50), gpu ? "gpu" : "software", win_open ? "open" : "NOT open", ow, oh,
+               want_fullscreen ? " fullscreen" : "", (unsigned long long)g_gs_prims, (unsigned long long)shown_n, pic);
     }
     if (max_frames && frame_no >= (u64)max_frames) {
         rt_log("[video] %llu frames, %llu primitives drawn\n", (unsigned long long)frame_no, (unsigned long long)g_gs_prims);
