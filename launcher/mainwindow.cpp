@@ -21,6 +21,7 @@
 #include <QScreen>
 #include <QSettings>
 #include <QStandardPaths>
+#include <QSysInfo>
 #include <QThread>
 #include <QTimer>
 #include <QUrl>
@@ -595,8 +596,12 @@ int MainWindow::defaultFilterIndex() const
 {
     const int threads = g_threads > 0 ? g_threads : QThread::idealThreadCount();
     const QSize out = outputSize();
-    const bool heavy = m_renderer->current() == 0 &&
-                       (qint64(out.width()) * out.height() > 1920 * 1080 || threads < 8);
+    const bool big = qint64(out.width()) * out.height() > 1920 * 1080;
+    // FSR 1.0 to a picture above 1080p is too much for the processor (Software)
+    // and for integrated graphics (measured: 12 ms per picture on a UHD 620 at
+    // 3072x1728, against 0.6 ms for Bilinear).
+    const bool heavy = m_renderer->current() == 0 ? (big || threads < 8)
+                                                  : (big && g_gpu.kind == GpuInfo::Integrated);
     return heavy ? 1 : 2;
 }
 
@@ -715,6 +720,10 @@ void MainWindow::updateOptionStates()
                           : QString("Best at 1× or 2× internal resolution. Windows and the GPU renderer only."))
               : !gpu && m_filter->current() == 2 && bigOut
                     ? QString("With Software, FSR 1.0 is demanding at this picture size; Bilinear is lighter.")
+              : gpu && m_filter->current() == 2 && bigOut && g_gpu.kind == GpuInfo::Integrated
+                    ? QString("On integrated graphics, FSR 1.0 is demanding at this picture size; Bilinear is lighter.")
+              : !gpu && bigOut && g_gpu.kind == GpuInfo::Integrated
+                    ? QString("Software is slow at this picture size on this PC; the GPU renderer is faster.")
                     : QString());
     const bool card = g_gpu.kind == GpuInfo::Discrete || g_gpu.kind == GpuInfo::Integrated;
     setElided(m_gpuLine,
@@ -1449,12 +1458,38 @@ void MainWindow::play()
 #endif
     // The game's console output goes to game.log beside the launcher when
     // that is writable; the last line is shown if the game fails.
+    // The log of the run before is kept as game-previous.log, and each log
+    // starts with what a bug report needs: version, system, graphics card
+    // and the settings in use (the disc image's folder is left out).
     m_logPath = QDir(appDir()).filePath("game.log");
+    if (QFile::exists(m_logPath)) {
+        const QString previous = QDir(appDir()).filePath("game-previous.log");
+        QFile::remove(previous);
+        QFile::rename(m_logPath, previous);
+    }
     QFile probe(m_logPath);
     if (probe.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        QString version = "local build";
+        QFile vf(QDir(appDir()).filePath("buildkit/VERSION"));
+        if (vf.open(QIODevice::ReadOnly))
+            version = QString::fromUtf8(vf.readAll()).trimmed();
+        QStringList shown = args;
+        const int isoAt = int(shown.indexOf("--iso"));
+        if (isoAt >= 0 && isoAt + 1 < shown.size())
+            shown[isoAt + 1] = QFileInfo(shown[isoAt + 1]).fileName();
+        const bool card = g_gpu.kind == GpuInfo::Discrete || g_gpu.kind == GpuInfo::Integrated;
+        const QString head = QString("[launcher] Rule of Rose PC port %1 on %2 (%3), %4 processor threads\n"
+                                     "[launcher] graphics: %5\n"
+                                     "[launcher] settings: %6\n")
+            .arg(version, QSysInfo::prettyProductName(), QSysInfo::currentCpuArchitecture())
+            .arg(QThread::idealThreadCount())
+            .arg(card ? QString("%1 (%2)").arg(g_gpu.name, g_gpu.kind == GpuInfo::Discrete ? "graphics card" : "integrated")
+                      : QString("no Vulkan graphics device found"))
+            .arg(shown.join(' '));
+        probe.write(head.toUtf8());
         probe.close();
         m_game->setProcessChannelMode(QProcess::MergedChannels);
-        m_game->setStandardOutputFile(m_logPath);
+        m_game->setStandardOutputFile(m_logPath, QIODevice::Append);
     } else {
         m_logPath.clear();
         m_game->setProcessChannelMode(QProcess::ForwardedChannels);
