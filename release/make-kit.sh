@@ -90,7 +90,13 @@ printf '%s\n' "$VERSION" > "$K/VERSION"
 if [ "$PLAT" = linux ]; then
   cp release/ror-build.sh "$OUT/ror-build"; chmod +x "$OUT/ror-build" "$K/vugen"
 else
-  $MC -O2 -municode -static release/ror-build-win.c -o "$OUT/ror-build.exe"
+  # version information and manifest, as for the launcher (release/win/app.rc)
+  vnum=$(printf '%s' "$VERSION" | sed -n 's/^v\{0,1\}\([0-9]\+\)\.\([0-9]\+\)\.\([0-9]\+\).*/\1,\2,\3,0/p'); vnum=${vnum:-0,0,0,0}
+  sed -e "s|@ROR_VER@|$vnum|g" -e "s|@ROR_VER_STR@|$VERSION|g" -e "s|@ROR_DESC@|Rule of Rose PC Port game builder|" \
+      -e "s|@ROR_FILE@|ror-build.exe|g" -e "s|@ROR_MANIFEST@|$PWD/release/win/app.manifest|" release/win/app.rc.in > "$K/ror-build.rc"
+  "$LLVM_MINGW/bin/x86_64-w64-mingw32-windres" "$K/ror-build.rc" -O coff -o "$K/ror-build.res"
+  $MC -O2 -municode -static release/ror-build-win.c "$K/ror-build.res" -o "$OUT/ror-build.exe"
+  rm -f "$K/ror-build.res" "$K/ror-build.rc"
   "$LLVM_MINGW/bin/x86_64-w64-mingw32-strip" "$OUT/ror-build.exe" "$K/vugen.exe"
 fi
 if [ "${RUNTIME_ONLY:-0}" = 1 ]; then echo "make-kit: RUNTIME_ONLY=1, stopping before the compiler and Python are added" >&2; exit 0; fi

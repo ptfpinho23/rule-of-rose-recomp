@@ -1,0 +1,31 @@
+/* Version information and manifest of the Windows programs. The @NAMES@ are
+ * filled in by launcher/CMakeLists.txt and release/make-kit.sh. */
+#include <winver.h>
+1 24 "@ROR_MANIFEST@"
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION @ROR_VER@
+PRODUCTVERSION @ROR_VER@
+FILEFLAGSMASK 0x3fL
+FILEFLAGS 0
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904b0"
+    BEGIN
+      VALUE "CompanyName", "Pedro Pinho"
+      VALUE "FileDescription", "@ROR_DESC@"
+      VALUE "FileVersion", "@ROR_VER_STR@"
+      VALUE "InternalName", "@ROR_FILE@"
+      VALUE "OriginalFilename", "@ROR_FILE@"
+      VALUE "ProductName", "Rule of Rose PC Port"
+      VALUE "ProductVersion", "@ROR_VER_STR@"
+      VALUE "LegalCopyright", "MIT License. https://github.com/ptfpinho23/rule-of-rose-recomp"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x409, 1200
+  END
+END

@@ -1,5 +1,20 @@
 # What's new
 
+## 0.1.4
+
+- Laptops with integrated graphics: the launcher now picks the light
+  upscaler at large screen sizes, where FSR 1.0 made the game run slowly
+  with broken sound, and warns when a slow combination is chosen.
+- With high dynamic range (HDR) switched on in Windows, the game now asks
+  for a standard picture format first.
+- Better problem reports: `game.log` (next to the launcher) now starts with
+  the version, your system, graphics card and settings, and says whether
+  pictures are reaching the window. The log of the run before is kept as
+  `game-previous.log`. If something goes wrong, send those two files.
+
+- Windows: the launcher and the game builder now carry proper version and
+  publisher information, which some antivirus programs expect to see.
+
 ## 0.1.3
 
 **The picture**
