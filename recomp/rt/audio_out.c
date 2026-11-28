@@ -1,10 +1,14 @@
 /* audio_out.c — host audio output and WAV dump.
  *
- * audio_frame() is called once per video frame: it pulls 960 stereo frames
- * (20 ms at 48 kHz) from the sound driver's mixer (rxsnd_mix) and
+ * audio_frame() is called once per video field: it pulls that field's stereo
+ * sample frames at 48 kHz (960 = 20 ms on the European game; 800 or 801 =
+ * 16.68 ms on the USA game, rt.h video_field_samples) from the sound driver's
+ * mixer (rxsnd_mix) and
  *   - appends them to the WAV file named by $ROR_WAV, if set;
  *   - when the run is paced in real time, sends them to the sound device
- *     (plat.h adev_*: audio_pulse.c on Linux, audio_waveout.c on Windows).
+ *     (plat.h adev_*: audio_pulse.c on Linux, audio_waveout.c on Windows),
+ *     which takes blocks of 960; fields that are shorter are collected into
+ *     such blocks first.
  *     The device never stalls the emulation, at worst a frame of sound is
  *     dropped; without a device there is one log line and silence.
  *     When the game runs slower than real time for a while (frames arrive
@@ -52,7 +56,7 @@ static void wav_header(void) {
 }
 
 /* ---- slow game ----------------------------------------------------------
- * The game makes 20 ms of sound per video frame. If a frame takes 25 ms of
+ * The game makes one field of sound (20 ms at 50 Hz) per video field. If a field takes 25 ms of
  * real time, the device runs dry for 5 ms out of every 25: a click 40 times a
  * second. So the real time the last 25 frames took is compared with the half
  * second of sound they made. A stall that the pacing catches up again leaves
@@ -76,10 +80,10 @@ static s16 slow_q[FRAMES_PER_CALL * 2 * 8]; static int slow_qn;          /* soun
 static u32 slow_blocks;
 #define SLOW_QCAP ((int)(sizeof slow_q / sizeof slow_q[0] / 2))
 /* in: one frame of sound; ratio >= 1: how much longer it has to last. Appends to the queue. */
-static void slow_stretch(const s16 *in, double ratio) {
+static void slow_stretch(const s16 *in, int n, double ratio) {
     const double step = 1.0 / ratio;
     double pos = slow_phase;                      /* position in the input; -1 is the last sample frame of the previous call */
-    while (pos < FRAMES_PER_CALL - 1) {
+    while (pos < n - 1) {
         int i = (int)(pos + 1.0) - 1;             /* floor, for pos >= -1 */
         double fr = pos - (double)i;
         const s16 *a = i < 0 ? slow_prev : in + i * 2, *b = in + (i + 1) * 2;
@@ -90,29 +94,30 @@ static void slow_stretch(const s16 *in, double ratio) {
         }
         pos += step;
     }
-    slow_phase = pos - FRAMES_PER_CALL;
+    slow_phase = pos - n;
 }
-static void slow_play(const s16 *pcm) {
+/* pcm: the n sample frames of one video field (n = 960 at 50 Hz) */
+static void slow_play(const s16 *pcm, int n) {
     u64 now = plat_time_ns();
     double ratio = 1.0;
     if (slow_k >= SLOW_WINDOW) {
-        ratio = (double)(now - slow_t[slow_k % SLOW_WINDOW]) / (SLOW_WINDOW * 20e6);
+        ratio = (double)(now - slow_t[slow_k % SLOW_WINDOW]) / (SLOW_WINDOW * (double)VIDEO_FIELD_NS);
         if (ratio > SLOW_MAX) ratio = SLOW_MAX;
     }
     slow_t[slow_k++ % SLOW_WINDOW] = now;
     slow_over = ratio >= SLOW_ON ? slow_over + 1 : 0;
     if (!slow_stretching && slow_over >= SLOW_AFTER) { slow_stretching = 1; slow_phase = 0.0; }
     else if (slow_stretching && ratio < SLOW_OFF) slow_stretching = 0;
-    if (slow_stretching) slow_stretch(pcm, ratio < 1.0 ? 1.0 : ratio);
-    else if (slow_qn == 0) { adev_play(pcm); goto done; }
-    else if (slow_qn + FRAMES_PER_CALL <= SLOW_QCAP) { memcpy(slow_q + slow_qn * 2, pcm, FRAME_BYTES); slow_qn += FRAMES_PER_CALL; }
+    if (slow_stretching) slow_stretch(pcm, n, ratio < 1.0 ? 1.0 : ratio);
+    else if (slow_qn == 0 && n == FRAMES_PER_CALL) { adev_play(pcm); goto done; }
+    else if (slow_qn + n <= SLOW_QCAP) { memcpy(slow_q + slow_qn * 2, pcm, (size_t)n * 4); slow_qn += n; }
     while (slow_qn >= FRAMES_PER_CALL) {
         adev_play(slow_q); slow_blocks += (u32)slow_stretching;
         slow_qn -= FRAMES_PER_CALL;
         memmove(slow_q, slow_q + FRAMES_PER_CALL * 2, (size_t)slow_qn * 4);
     }
 done:
-    slow_prev[0] = pcm[(FRAMES_PER_CALL - 1) * 2]; slow_prev[1] = pcm[(FRAMES_PER_CALL - 1) * 2 + 1];
+    slow_prev[0] = pcm[(n - 1) * 2]; slow_prev[1] = pcm[(n - 1) * 2 + 1];
 }
 
 /* ---- entry points ----------------------------------------------------- */
@@ -136,11 +141,13 @@ void audio_init(int rt) {
 }
 void audio_frame(void) {
     if (!inited) audio_init(1);
-    s16 pcm[FRAMES_PER_CALL * 2];
-    rxsnd_mix(pcm, FRAMES_PER_CALL);
+    static u64 field;
+    s16 pcm[MAX_FIELD_SAMPLES * 2];
+    const int n = (int)video_field_samples(field++);
+    rxsnd_mix(pcm, n);
     if (wav) {
-        fwrite(pcm, 1, FRAME_BYTES, wav); wav_bytes += FRAME_BYTES;
+        fwrite(pcm, 1, (size_t)n * 4, wav); wav_bytes += (u32)n * 4;
         if (++wav_calls % 250 == 0) { wav_header(); fflush(wav); }      /* keep the file valid if the run is killed */
     }
-    if (realtime) slow_play(pcm);
+    if (realtime) slow_play(pcm, n);
 }

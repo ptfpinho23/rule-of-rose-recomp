@@ -29,7 +29,7 @@ static inline int hw_phys(u32 *a) {
 /* ---- timers T0..T3 -------------------------------------------------------
  * 16-bit counters clocked from the bus clock (147.456 MHz, optionally /16 or
  * /256) or from H-blank. Counts are derived from the virtual clock. */
-#define TICKS_PER_SEC (TICKS_PER_FRAME * 50)
+#define TICKS_PER_SEC (TICKS_PER_FRAME * VIDEO_HZ_NUM / VIDEO_HZ_DEN)
 typedef struct { u32 mode, comp, hold, base_count; u64 base_time; } Timer;
 static Timer tm[4];
 #define TM_CUE 0x80u

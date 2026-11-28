@@ -2148,3 +2148,191 @@ DLSS Frame Generation in any form; `--framegen fsr` in the running game
 (replays only); a card without DLSS support but with the DLLs present; a
 session of hours; DLSS past the three areas the scripts reach. Streamline is
 not shut down at exit, like the rest of Vulkan here.
+
+## USA disc, SLUS-21448 (NTSC), next to the European one (2026-11-27)
+
+The port builds and runs two editions: `SLES_542.18` (Europe, PAL, 50 Hz) and
+`SLUS_214.48` (USA, NTSC, 59.94 Hz). One release serves both; the game program
+is always made from the disc the player has.
+
+### The table: `recomp/games.py`
+Everything that depends on a particular build of the executable is one entry
+there: key (`pal` / `ntsc`), serial, name and sha256 of the executable, video
+mode, and three addresses. `gen.py` identifies the executable by its sha256
+and writes the entry into the generated `funcs.h` as `ROR_GAME_*`,
+`ROR_FN_CAMERA`, `ROR_GUARD_BAND`; `rt/support.c` (compiled with the generated
+code) turns them into `const RorGame ror_game` (rt.h), which is all the rest
+of the runtime looks at. The precompiled runtime of a release is therefore the
+same for both discs. `tools/vu1extract.py` and `release/ror_build.py` read the
+same table (the kit ships it as `buildkit/recomp/games.py`).
+
+| | Europe (pal) | USA (ntsc) |
+|---|---|---|
+| executable, size | `SLES_542.18`, 2,456,780 | `SLUS_214.48`, 2,296,472 |
+| sha256 | 71417965...7692 | 262efe71...1af3 |
+| `.text` | 0x100000 + 0x182dc8 | 0x100000 + 0x180e88 |
+| `.vutext` | 0x293230 + 0x4180 | 0x291230 + 0x4180 |
+| `.data` / `.rodata` / `.bss` start | 0x297f00 / 0x2fb000 / 0x32f100 | 0x295f00 / 0x2e5300 / 0x308100 |
+| instructions, function entries | 413,499 / 10,069 | 411,450 / 9,948 |
+| camera builder (`fn_camera`, rt/wide.c hook) | 0x228b80 | 0x226c58 |
+| guard-band floats (`guard_band`) | 0x32a5e4 | 0x3035d4 |
+| VU1 upload routine (`fn_vu1_upload`) | 0x221000 | 0x21f0d8 |
+| VU1 stream constants found there | 0x2932b0 .. 0x2967ff | 0x2912b0 .. 0x2947ff |
+| save folder on the memory card | `BESLES-54218` | `BASLUS-21448` |
+| SetGsCrt | interlace, mode 3 | interlace, mode 2 |
+| game pictures per second | 25 | 30 (690 game frames in 1380 vblanks of the walk) |
+
+It is a different build throughout (every address moves; the four functions
+compared lie 0x1F28 or 0x1F40 lower), but the same program: the counterparts were found by
+searching the USA code for the European function's instruction words with the
+address-bearing fields masked (jump targets, `lui` immediates, immediates not
+relative to `sp`); each of the three has exactly one match. Inside the camera
+builder the renderer offset of the VU1 clip factor is the same (+0x12128) and
+the guard-band address comes from the same `lui`/`addiu` pair (0x228bd8 /
+0x226cb0).
+
+What needed no change, and why:
+- **gen.py**: nothing in it is address-specific. The idle-spin shortcut
+  (`TICK_SPIN`) is found by the shape of the loop, in both builds.
+- **VU1 micro program**: the 16 KiB image extracted from the USA executable is
+  byte-identical to the European one (29 MPG blocks, 1668 instructions, hash
+  208dc456c8f9e587). The generated fast path, the jump-target hints in
+  vubench.c, the clip-flag fix and frame interpolation from the VU1 inputs
+  (which is built on this program's command stream) therefore apply unchanged.
+- **IOP modules**: all ten modules the European disc has are byte-identical on
+  the USA disc, the sound driver RXSNDDRV.IRX included (the USA disc also
+  carries SNDBGEXT.IRX and USBD.IRX; neither is loaded in the tested stretch).
+  The game addresses quoted in the comments of iop_dbc.c and pad.c are
+  references into the European build; nothing reads them.
+- **kernel.c:681** prints stack words that look like code addresses
+  (< 0x297eb8) in a crash dump only.
+
+Differences seen in play: the USA disc has no language screen (one language;
+`DATA/EVT` instead of `EVT_ENG` .. `EVT_SPA`) and goes straight to the
+memory-card message; two more screens before the logos ("Sony Computer
+Entertainment Inc. Presents", a disclaimer); the title screen names Atlus USA.
+
+### Timing (rt.h)
+- A field is `TICKS_PER_FRAME` ticks in both modes; what changes is fields per
+  second (`VIDEO_HZ_NUM / VIDEO_HZ_DEN`: 50, or 60000/1001), lines per field
+  (`HSYNC_PER_FRAME`: 312, or 263) and the length of a field in real time
+  (`VIDEO_FIELD_NS`: 20 ms, or 16.683333 ms). Timers (hw.c), the pacing clock,
+  the performance log and the frameskip message (video.c), the lead time of the
+  interpolation packages (gs.c) and the PCM position of the sound driver use
+  these instead of constants. For the European game every expression has the
+  value it had before.
+- **The USA game gets 8,000,000 ticks per field, the European 2,000,000.**
+  The tick count is the speed of the emulated processor. The USA movies are 30
+  pictures a second, and with 2,000,000 the game's own movie code does not
+  finish a picture in two fields: the intro movie runs about 8 % slow and its
+  sound stream runs dry. Measured over the whole intro movie (no skip, 9000
+  vblanks, `ROR_SNDDBG=1`, which now logs each `adpcm stream underrun`): 35
+  underruns with 2,000,000, 1 with 8,000,000, and that one is at vblank 6923,
+  after the movie has faded out (the end of the stream). With 2,000,000 the
+  same pictures appear about 350 vblanks later by the end. The game waits for
+  the vblank either way. `-DNTSC_TICKS_PER_FRAME=n` (EXTRA=) rebuilds with
+  another value to repeat this. The European value was left alone so that its
+  regression output does not change; whether its movies would gain from more
+  was not looked at.
+- **Sound**: 48,000 / 59.94 = 800.8 sample frames per field. `rt.h
+  video_field_samples(k)` gives 801, 801, 801, 801, 800 (960 for PAL); the
+  driver tick (iop_rxsnd.c) renders that many and `audio_frame` pulls that
+  many, each with its own field counter, so the FIFO between them does not
+  drift. The WAV of an N-field run is exactly N x 800.8 frames (18,000 fields:
+  14,414,400). The devices still take 960-frame blocks: fields are collected
+  into blocks in audio_out.c's queue (the one the slow-game stretch already
+  had), so a block leaves every 1.2 fields. `tools/audio_slow_test.c
+  -DSLOWTEST_NTSC` checks that the device gets the mixer's samples unchanged at
+  full speed and a gap-free stretch at 25 ms per field. The sound driver's
+  own video-rate setting is never changed from its default 60 by either game
+  in the tested stretch (a change is now logged: `[rxsnd] the game sets the
+  driver's video rate`).
+- Picture: the game sets the same 512x448 interlaced display; nothing in
+  gs.c depended on the mode.
+
+### Building
+- `GAME=ntsc recomp/build.sh` / `build-win.sh`: executable
+  `build/ntsc/SLUS_214.48` (taken from `$ROR_ISO`, `Rule of Rose (USA).iso`
+  in the repository root, or `build/ntsc/usa.iso`), generated code
+  `build/recomp/ntsc/gen`, objects `build/recomp/ntsc/obj` and `.../win/obj`,
+  programs `build/recomp/ntsc/ror` and `build/recomp/ntsc/win/ror.exe`. Without
+  `GAME` everything is where it was. (`tools/gamefiles.sh paths` hands the
+  directories to the build scripts.) build-win.sh's `GEN=1` now works: the
+  variable used to be overwritten by the directory name before it was tested.
+- `ROR_ELF=build/ntsc/SLUS_214.48 recomp/disasm.py ADDR [N]` disassembles the
+  USA code.
+- A program holds one edition and says which at start (`[boot] SLUS-21448
+  (USA, NTSC), ...`); given the other disc it stops with a message.
+
+### Release, launcher
+- `ror-build` accepts either disc: the executable is found by name in the
+  root directory, its sha256 must be the table's. The stamp has a `serial`
+  field, compared first by `--check` (`needs build: disc changed`).
+- The launcher prepares each disc into `<game folder>/<serial>/`, so both stay
+  prepared and a game is never started with the other disc's image; a
+  `ror-game` left directly in the game folder by 0.1.4 or older is removed.
+  Saves: European `saves/mc0` as before, USA `saves/SLUS-21448/mc0`. The two
+  games use different folders on a card and do not list each other's data, so
+  one shared card would also have worked; separate cards keep an existing
+  European card untouched by anything the USA game does. Texts that said
+  "European disc" or "50 Hz" follow the chosen disc ("Original (60 Hz)").
+
+### Script and landmarks (USA, no memory card)
+`recomp/tools/script-uphill-ntsc.txt` (`--script "$(cat ...)"`): Right + Cross
+at 700/760 ("Begin anyway"), Start at 3000 (skips the intro movie) and 3600
+(title), Cross at 4200 (New Game), Start at 5000 (skips the opening movie),
+Right every 250 from 6600 to 10100 (storybook pages), Circle at 10500, Cross
+every 400 from 10900 to 13300 (captions), Left from 14000, Up+Left from 14960.
+
+| vblank | on screen |
+|---|---|
+| 0-700 | "No memory card (PS2) inserted" (with a card: straight on, everything about 450 earlier) |
+| 750 | Sony Computer Entertainment Inc. Presents |
+| 1000-1250 | disclaimer |
+| 1500-2500 | logo movie (Punchline, Shirogumi, Atlus USA) |
+| 2600-6800 | intro movie when not skipped; after it, at 7000, the next one |
+| 3250 / 3750 | title "Press START" / menu New Game, Load Game, Option |
+| 4500-5000 | opening movie with subtitles |
+| 5250-5750 | chapter card "The Little Princess" |
+| 6000-10250 | 3D storybook |
+| 10750-13750 | first scene (bus stop), captions |
+| 14000-16250 | walking: bus stop, path uphill |
+| 16500-17250 | cutscene at the sign |
+
+### Verification
+Scratch pictures are not kept; the numbers:
+- European regression (script-uphill.txt, 25,000 vblanks, 25 PNG + WAV): the
+  build before this work, the new build on Linux and on Windows, and the games
+  made by the 0.1.5-test kit on both systems all give the same 26 md5s
+  (frame_025000 7f430f9c..., audio.wav 91fe7c11...; the 16,000-vblank WAV is
+  still 670b42cf...).
+- USA, same recipe with the USA script, 18,000 vblanks, shots every 250 (72 PNG
+  + WAV): Linux == Windows == kit-built games on both.
+- USA GPU renderer: lavapipe 1x against software at seven frames: at most
+  0.03 % of the pixels differ by more than 8. RTX 3090: 1x, 2x, 4x, 8x;
+  `--wide` 16:9, 21:9, 32:9 (3D from vblank 5847, the opening movie 4:3);
+  nearest, bilinear, fsr, fsr3 (3.1.6, 1024x896 -> 1920x1440), dlss (310.9.16);
+  grain 0; texture filter original / smooth; picture settings.
+  `ROR_WIDE_NOCLIPFIX=1` changes the 21:9 picture, so the clip volumes at the
+  USA addresses are being adjusted.
+- USA frame interpolation, windowed, vblanks 14000-15400 (`ROR_FAST_UNTIL`),
+  `--internal 4`: `--fps 60 / 120 / 144 / 240 / display` present 59 / 119 /
+  143 / 237 / 143 pictures a second, 0 vblanks behind; 686 of 690 game frames
+  interpolated (3 cuts, 1 upload); inputs: runs ok 99.53 %, primitives ok
+  95.78 % (European walk 21400-22800: 99.51 % / 95.57 %);
+  `ROR_INTERP_SELFCHECK`: 0 differences; `ROR_INTERP_DETECT=14200,14700`: 248
+  packages measured, 0 / 0 / 0.
+- USA paced without a window, 15,400 vblanks: 257.8 s (59.94 Hz would be
+  256.9 s plus start-up), 17 vblanks late in all.
+- Pad: `ROR_PAD_FAKE` buttons, and stick from 14000: 16 PNG + WAV data equal to
+  the script run. `ROR_PAD_SELFTEST` ok.
+- The reference interpreter (`--interp`) and the recompiled USA code give the
+  same pictures over the first 900 vblanks.
+
+### Not done / not known
+- The USA game was never run with a sound device (all runs `ROR_NOAUDIO=1`):
+  the block queue at 59.94 Hz is only covered by the test tool and the WAV.
+- Saving and loading at a save point (neither disc), `--frameskip` in action,
+  DLSS frame generation, a look at a fullscreen picture, other GPUs.
+- Play beyond vblank 18,000.
+- The 8,000,000 ticks are a measured sufficient value, not a derived one.

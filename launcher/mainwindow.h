@@ -32,7 +32,7 @@ public:
     // Where the game executable is, or empty: "ror-game" beside the launcher,
     // then build/recomp/ror in a folder above it, then $ROR_GAME. workDir
     // receives the directory to start it in.
-    static QString findGameBinary(QString *workDir = nullptr);
+    QString findGameBinary(QString *workDir = nullptr) const;
 
     // Where a game built on this PC lives (see the "prepare" step in the
     // .cpp). Default: <per-user application data>/game.
@@ -109,6 +109,8 @@ private:
     QWidget *buildPrepare();
     QString builderPath() const;
     QString builtGamePath() const;
+    QString discGameDir() const;      // gameDir()/<serial of the chosen disc>
+    QString saveDir() const;          // the memory-card folder of the chosen disc
     void refreshGameState();
     void updatePlayButton();
     void showPrepareState(int state);          // 0 working, 1 failed
@@ -171,7 +173,7 @@ private:
     QSize outputSize() const;        // the size the picture is upscaled to with the current choices
     Slider *m_grain = nullptr;
     QLabel *m_fpsLabel = nullptr, *m_vsyncLabel = nullptr, *m_internalLabel = nullptr,
-           *m_qualityNote = nullptr;
+           *m_qualityNote = nullptr, *m_savePath = nullptr;
     QString m_desktopRes;            // primary screen in real pixels, "WxH"
     Slider *m_sharp = nullptr, *m_bright = nullptr, *m_contrast = nullptr, *m_gamma = nullptr,
            *m_saturation = nullptr, *m_bloom = nullptr;

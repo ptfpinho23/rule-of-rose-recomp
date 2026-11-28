@@ -2249,7 +2249,7 @@ static long hwi_rematch(int i, int e, int *partner) {
  * set, draws the list with vertices blended by t = elapsed / duration, and
  * presents; at t = 1, and for packages that must not be interpolated (cut,
  * movie upload), it shows the finished picture. t_ns is the game's ideal
- * 50 Hz vblank time plus one vblank, so in-betweens are spaced by the clock,
+ * vblank time (50 Hz, or 59.94 Hz on the USA game) plus one vblank, so in-betweens are spaced by the clock,
  * not by when the game thread happened to finish.
  * Hand-over is race-free because: packages and save slots rotate over four
  * buffers and the game thread waits (hwp_using) until the presenter has left
@@ -2441,14 +2441,15 @@ static Pkg *hwp_publish(const int *partner, int ok, int pic, int sx, int sy, int
     /* Start late enough that the package is there in time: one vblank after
      * the ideal time at least, more if the game thread has been finishing its
      * frames later than that (slowly forgotten). */
-    static u64 lead = 20000000ull;
+    const u64 field_ns = VIDEO_FIELD_NS;                     /* 20 ms at 50 Hz */
+    static u64 lead; if (!lead) lead = field_ns;
     {   u64 nowp = plat_time_ns(), late = nowp > hwp_ideal_ns ? nowp - hwp_ideal_ns : 0;
-        lead = lead > 20200000ull ? lead - 200000ull : 20000000ull;
+        lead = lead > field_ns + 200000ull ? lead - 200000ull : field_ns;
         if (late + 4000000ull > lead) lead = late + 4000000ull;
         if (lead > 60000000ull) lead = 60000000ull;
     }
     u64 d = hwp_ideal_ns - hwp_last_ideal;
-    P->dur_ns = (hwp_last_ideal && d >= 10000000ull && d <= 100000000ull) ? d : 40000000ull;
+    P->dur_ns = (hwp_last_ideal && d >= 10000000ull && d <= 100000000ull) ? d : 2 * field_ns;
     hwp_last_ideal = hwp_ideal_ns;
     P->t_ns = hwp_ideal_ns + lead; hwp_lead_ms = (float)lead / 1e6f;
     pthread_mutex_lock(&hwp_mx); P->seq = k; hwp_newest = P; pthread_mutex_unlock(&hwp_mx);
@@ -2612,7 +2613,7 @@ static int hwf_render(Pkg *P, float t, int slot, int dw, int dh) {
     HwFsr3 f; memset(&f, 0, sizeof f);
     f.color = P->pic_w; f.sx = P->sx; f.sy = P->sy; f.sw = P->sw; f.sh = P->sh; f.mv = P->f_mv;
     f.ovl_b = P->f_ovl ? P->f_ob : -1; f.ovl_w = P->f_ovl ? P->f_ow : -1; f.slot = slot; f.reset = reset; f.no_reactive = noreact;
-    f.dt_ms = hw_fps_on && hwf_last_ns ? (float)(now - hwf_last_ns) / 1e6f : 40.0f; if (f.dt_ms > 100.0f) f.dt_ms = 100.0f;
+    f.dt_ms = hw_fps_on && hwf_last_ns ? (float)(now - hwf_last_ns) / 1e6f : (float)(2 * VIDEO_FIELD_NS) / 1e6f;     /* one game frame: 40 ms at 50 Hz */ if (f.dt_ms > 100.0f) f.dt_ms = 100.0f;
     f.fg = hw_fg;
     f.cam_near = P->cam[0]; f.cam_far = P->cam[1]; f.cam_fovy = P->cam[2];
     f.unit_m = 0.025f;               /* estimate: one game unit is about 2.5 cm (near plane 5, far 2000..5000) */
@@ -2642,7 +2643,7 @@ static void hwf_show(int hw, int linear, int dw, int dh) {
     { static int log = -1; if (log < 0) log = getenv("ROR_FSR3_LOG") != 0;
       if (log && (g_gs_frames % 200 == 0)) rt_log("[fsr3] vblank %llu: present of target %d at %dx%d; slots: %d %dx%d valid %d, %d %dx%d valid %d\n", (unsigned long long)g_gs_frames, hw, dw, dh, hwf_out[0].pic, hwf_out[0].w, hwf_out[0].h, hwf_out[0].valid, hwf_out[1].pic, hwf_out[1].w, hwf_out[1].h, hwf_out[1].valid); }
     /* Frame generation: the first vblank that displays a new picture shows the generated one leading up to it, the
-     * following vblanks the picture itself (the game draws 25 pictures for 50 vblanks, so that is 50 different ones). */
+     * following vblanks the picture itself (the game draws one picture for two vblanks, so that is one different picture per vblank). */
     for (int s = 0; s < 2; s++) if (hwf_out[s].valid && hwf_out[s].pic == hw && hwf_out[s].w == dw && hwf_out[s].h == dh) { hw_fsr3_show(hwf_out[s].gen ? 2 + s : s); hwf_out[s].gen = 0; }
 }
 static int cmp_u64(const void *a, const void *b) { u64 x = *(const u64 *)a, y = *(const u64 *)b; return x < y ? -1 : x > y; }

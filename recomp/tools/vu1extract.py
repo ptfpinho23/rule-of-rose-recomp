@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""vu1extract.py ELF OUT.bin — the VU1 micro program as the game (SLES-54218) uploads it.
+"""vu1extract.py ELF OUT.bin — the VU1 micro program as the game uploads it.
 
 The game keeps its VU micro code in the ELF section `.vutext` as a ready-made
 VIF packet stream: MPG commands (0x4A, NUM = instructions, IMMEDIATE = load
-address in 64-bit instructions) each followed by their code. The function at
-0x221000 builds the DMA tag that sends the VU1 part: a REF tag whose address
+address in 64-bit instructions) each followed by their code. One function
+(0x221000 on the European disc; fn_vu1_upload in games.py) builds the DMA tag that sends the VU1 part: a REF tag whose address
 and length come from two address constants (lui/addiu pairs) in its first
 instructions. Only the MPG blocks inside that range reach VU1 (one more block
 and the VU0 program follow it in the section and are not part of it).
@@ -13,10 +13,9 @@ The output is VU1's 16 KiB micro memory after that upload, untouched words
 zero: the image recomp/tools/vubench `gen` turns into the fast path
 (vu1_fast.inc), and the one rt/vu.c compares the live micro memory with."""
 import os, struct, sys
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+sys.path[:0] = [os.path.dirname(os.path.abspath(__file__)), os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')]
 from elf import Elf   # recomp/elf.py
-
-UPLOAD_FN = 0x221000      # lui t6 / sd / lui t7 / addiu t6 / addiu t7: start and last byte of the stream
+import games          # recomp/games.py (in the release kit both sit beside this file)
 
 def word(e, va):
     for s in e.segments:
@@ -32,8 +31,11 @@ def const(e, lui_va, addiu_va, reg):
 
 def extract(elf_path):
     e = Elf(elf_path)
-    start = const(e, UPLOAD_FN, UPLOAD_FN + 0x0C, 14)
-    qwc = (const(e, UPLOAD_FN + 0x08, UPLOAD_FN + 0x10, 15) - start) >> 4
+    game = games.by_elf_data(e.data)
+    if game is None: raise SystemExit('vu1extract: %s is not an executable this project knows' % elf_path)
+    fn = game['fn_vu1_upload']      # lui t6 / sd / lui t7 / addiu t6 / addiu t7: start and last byte of the stream
+    start = const(e, fn, fn + 0x0C, 14)
+    qwc = (const(e, fn + 0x08, fn + 0x10, 15) - start) >> 4
     w = [word(e, start + 4 * i) for i in range(qwc * 4)]
     img = bytearray(0x4000); i = 0; blocks = 0
     while i < len(w):

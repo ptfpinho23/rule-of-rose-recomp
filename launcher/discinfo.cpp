@@ -7,15 +7,23 @@
 #include <QRegularExpression>
 #include <QStringList>
 
-const char *const kDiscSerial = "SLES-54218";
-
 namespace {
 
-const char *const kBootFile = "SLES_542.18";
+// The editions the port knows (the same list as recomp/games.py, which is
+// what the builder goes by).
+struct KnownDisc {
+    const char *bootFile, *serial, *region;
+    int hz;
+};
+const KnownDisc kDiscs[] = {
+    {"SLES_542.18", "SLES-54218", "Europe", 50},
+    {"SLUS_214.48", "SLUS-21448", "USA", 60},
+};
 const qint64 kSector = 2048;
 
 const QStringList kIsoNames = {
     "Rule of Rose (Europe) (En,Fr,De,Es,It).iso",
+    "Rule of Rose (USA).iso",
     "RuleOfRose.iso",
 };
 
@@ -34,6 +42,11 @@ QString serialFromBootFile(QString name)
 }
 
 } // namespace
+
+QString supportedDiscsText()
+{
+    return QString("the European (%1) or USA (%2) release").arg(kDiscs[0].serial, kDiscs[1].serial);
+}
 
 QString findDiscIso()
 {
@@ -94,7 +107,7 @@ DiscInfo checkDisc(const QString &path)
     // Walk the root directory. Records never straddle a sector; a zero
     // length byte means "skip to the next sector".
     static const QRegularExpression bootRe("^S[CL][A-Z]{2}_\\d{3}\\.\\d{2}$");
-    bool found = false;
+    const KnownDisc *found = nullptr;
     QString other;
     for (int pos = 0; pos + 33 < root.size();) {
         const int len = quint8(root[pos]);
@@ -111,8 +124,12 @@ DiscInfo checkDisc(const QString &path)
             name.truncate(semi);
         const bool isDir = quint8(root[pos + 25]) & 2;
         if (!isDir) {
-            if (name == kBootFile)
-                found = true;
+            const KnownDisc *known = nullptr;
+            for (const KnownDisc &k : kDiscs)
+                if (name == k.bootFile)
+                    known = &k;
+            if (known)
+                found = known;
             else if (other.isEmpty() && bootRe.match(name).hasMatch())
                 other = name;
         }
@@ -121,20 +138,22 @@ DiscInfo checkDisc(const QString &path)
 
     if (found) {
         info.state = DiscInfo::Ok;
-        info.serial = kDiscSerial;
-        info.message = QString("Rule of Rose (Europe)  ·  %1  ·  %2 MB")
-                           .arg(kDiscSerial)
+        info.serial = found->serial;
+        info.region = found->region;
+        info.hz = found->hz;
+        info.message = QString("Rule of Rose (%1)  ·  %2  ·  %3 MB")
+                           .arg(info.region, info.serial)
                            .arg(fi.size() / (1024 * 1024));
         return info;
     }
     info.state = DiscInfo::WrongDisc;
     if (!other.isEmpty()) {
         info.serial = serialFromBootFile(other);
-        info.message = QString("Wrong disc: this image is %1. The port needs the European "
-                               "release, %2.").arg(info.serial, kDiscSerial);
+        info.message = QString("Wrong disc: this image is %1. The port needs %2.")
+                           .arg(info.serial, supportedDiscsText());
     } else {
-        info.message = QString("Wrong disc: %1 is not on this image. The port needs the "
-                               "European release, %2.").arg(kBootFile, kDiscSerial);
+        info.message = QString("Wrong disc: no Rule of Rose program on this image. The port "
+                               "needs %1.").arg(supportedDiscsText());
     }
     return info;
 }

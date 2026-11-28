@@ -7,11 +7,44 @@
 
 #define RAM_SIZE 0x02000000u
 
-/* PAL timing in runtime ticks (1 tick ~ 1 executed-instruction unit). */
-#define TICKS_PER_FRAME 2000000ull
-#define HSYNC_PER_FRAME 312u
+/* The edition this program was built from: rt/support.c fills it from the
+ * generated funcs.h (recomp/games.py is the table). Everything in the runtime
+ * that depends on the build of the game's executable reads it here. */
+typedef struct {
+    const char *key, *serial, *elf, *region;
+    int ntsc;                 /* 1: NTSC, 59.94 fields per second, 262.5 lines; 0: PAL, 50, 312 */
+    u32 fn_camera;            /* the camera builder (rt/wide.c) */
+    u32 guard_band;           /* two floats: the guard band's x limits (rt/wide.c) */
+} RorGame;
+extern const RorGame ror_game;
+
+/* Video timing in runtime ticks (1 tick ~ 1 executed-instruction unit; calls
+ * and loops are charged in round numbers, so it is not an exact count).
+ * TICKS_PER_FRAME is one field (vblank to vblank), and with it the speed of
+ * the emulated processor: how much game code fits into a field. The European
+ * game runs with 2,000,000. The USA game gets 8,000,000: its movies are 30
+ * pictures a second at twice the bit rate, the game's own MPEG code (motion
+ * compensation runs on the EE) then needs more than two fields of 2,000,000
+ * for a picture, the movie stutters and its sound stream runs dry. Measured
+ * on the intro movie (recomp/NOTES.md, "USA disc"): 35 stream underruns with
+ * 2,000,000, 5 with 6,000,000, none inside a movie with 8,000,000. The game
+ * waits for the vblank in both editions, so a faster processor only shortens
+ * what it would otherwise be late with. */
+#ifndef NTSC_TICKS_PER_FRAME          /* (-DNTSC_TICKS_PER_FRAME=n: to repeat that measurement) */
+#define NTSC_TICKS_PER_FRAME 8000000ull
+#endif
+#define TICKS_PER_FRAME (ror_game.ntsc ? NTSC_TICKS_PER_FRAME : 2000000ull)
+#define HSYNC_PER_FRAME (ror_game.ntsc ? 263u : 312u)
 #define TICKS_PER_HSYNC (TICKS_PER_FRAME / HSYNC_PER_FRAME)
 #define MAX_SLICE 20000
+/* fields per second as a fraction, and the length of one in nanoseconds */
+#define VIDEO_HZ_NUM (ror_game.ntsc ? 60000u : 50u)
+#define VIDEO_HZ_DEN (ror_game.ntsc ? 1001u : 1u)
+#define VIDEO_FIELD_NS (ror_game.ntsc ? 16683333ull : 20000000ull)
+/* 48 kHz sample frames in field k (counted from 0): 960 per PAL field; NTSC has 800.8, so four fields of
+ * 801 and one of 800. The sound driver's tick and the host output both count with this. */
+#define MAX_FIELD_SAMPLES 960
+static inline u32 video_field_samples(u64 k) { return ror_game.ntsc ? (u32)((k + 1) * 4004 / 5 - k * 4004 / 5) : 960u; }
 
 /* INTC causes / DMAC channels */
 enum { INTC_GS, INTC_SBUS, INTC_VBLANK_S, INTC_VBLANK_E, INTC_VIF0, INTC_VIF1,

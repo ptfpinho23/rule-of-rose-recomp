@@ -1,4 +1,5 @@
-/* video.c — presentation: shows the GS display buffer in a window at 50 Hz
+/* video.c — presentation: shows the GS display buffer in a window at the game's
+ * field rate (50 Hz for the European game, 59.94 Hz for the USA one; rt.h VIDEO_FIELD_NS)
  * (video_x11.c / video_win32.c, which also map the keyboard to the
  * controller), and can save PNG screenshots (used for testing without a
  * display). */
@@ -35,7 +36,7 @@ static int want_gpu, gpu_internal = 4, gpu_vsync = 1, gpu_swap;      /* --render
 static int gpu_fps, gpu_interp;          /* --fps: 0 off, -1 display rate, N; gpu_interp: the presenter thread is running */
 static int want_fsr3;                    /* --filter fsr3 (1) / dlss (2): temporal upscaling on the GPU renderer, FSR 3.1 or DLSS; everywhere else it is --filter fsr */
 static int want_fg;                      /* --framegen fsr (1) / dlss (2): frame generation on the GPU renderer */
-static u64 pace_next;                    /* ideal time of the next emulated vblank (50 Hz pacing clock) */
+static u64 pace_next;                    /* ideal time of the next emulated vblank (pacing clock: 50 or 59.94 Hz) */
 /* --frameskip auto|off. auto: while the game runs behind its 50 Hz clock in a window, the renderer leaves out
  * whole frames (gs_frameskip) so that game speed and sound stay right and only the picture rate drops.
  * Never in unpaced or headless runs, with frame interpolation or FSR 3.1 (they pair consecutive frames). */
@@ -250,7 +251,7 @@ static void perf_tick(void) {
         lw = &hw_stat_wait_ns ? hw_stat_wait_ns : 0; perf_show_ns = perf_sleep_ns = perf_show_gpu = perf_slip = 0;
         return;
     }
-    a->n++; a->ns += d; if (perf_slip > 20000000ull) a->late++; if (perf_slip > a->slip) a->slip = perf_slip; if (d > a->maxi) a->maxi = d;
+    a->n++; a->ns += d; if (perf_slip > VIDEO_FIELD_NS) a->late++; if (perf_slip > a->slip) a->slip = perf_slip; if (d > a->maxi) a->maxi = d;
     perf_slip = 0;
     a->vu += (u64)((double)(g_vu_stat_ticks[0] - g_vu_stat_ticks[1]) * perf_tick_ns); a->gs1 += (u64)((double)g_vu_stat_ticks[1] * perf_tick_ns);
     memset(g_vu_stat_ticks, 0, sizeof g_vu_stat_ticks);
@@ -260,11 +261,11 @@ static void perf_tick(void) {
     { u64 w = &hw_stat_wait_ns ? hw_stat_wait_ns : 0; a->gpu += w - lw; lw = w; }
     a->show += perf_show_ns; a->sleep += perf_sleep_ns; perf_show_ns = perf_sleep_ns = 0;
     if (g_perf_on > 1) { extern int hw_flush_counts[16] __attribute__((weak)); if (&hw_flush_counts[0]) for (int i = 0; i < 16; i++) perf_sites[i] += hw_flush_counts[i]; }
-    perf_audio += 20.0 - (double)d / 1e6;
+    perf_audio += (double)VIDEO_FIELD_NS / 1e6 - (double)d / 1e6;
     if (perf_audio > 100.0) perf_audio = 100.0;
     if (perf_audio < 0.0) { perf_audio = 60.0; a->starved++; if (a->amin > 0.0) a->amin = 0.0; }      /* ran empty: a device would fill up again */
     if (perf_audio < a->amin) a->amin = perf_audio;
-    if (a->n < 50) return;
+    if (a->n < (ror_game.ntsc ? 60u : 50u)) return;
     for (int i = 0; i < 258; i++) { u32 c = g_perf_hist[i]; g_perf_hist[i] = 0; a->hist[i] = c; a->pres += c; if (i >= 34) a->o8 += c; if (i >= 67) a->o16 += c; }
     a->pmax = g_perf_pres_max; g_perf_pres_max = 0;
     for (int i = 0; i < VIS_N; i++) a->vi[i] = __atomic_exchange_n(&g_vi_stat[i], 0, __ATOMIC_RELAXED);
@@ -446,7 +447,7 @@ void video_present(void) {
             snprintf(pic, sizeof pic, ", picture brightness mean %u max %u of 255", (unsigned)(sum / (n ? n * 3 : 1)), mx / 3);
         }
         rt_log("[video] status after %llu s: renderer %s, window %s %dx%d%s, %llu primitives drawn so far, %llu pictures shown%s\n",
-               (unsigned long long)(frame_no / 50), gpu ? "gpu" : "software", win_open ? "open" : "NOT open", ow, oh,
+               (unsigned long long)(frame_no * VIDEO_HZ_DEN / VIDEO_HZ_NUM), gpu ? "gpu" : "software", win_open ? "open" : "NOT open", ow, oh,
                want_fullscreen ? " fullscreen" : "", (unsigned long long)g_gs_prims, (unsigned long long)shown_n, pic);
     }
     if (max_frames && frame_no >= (u64)max_frames) {
@@ -454,10 +455,10 @@ void video_present(void) {
         exit(0);
     }
     perf_show_ns += plat_time_ns() - perf_in; perf_show_gpu += (&hw_stat_wait_ns ? hw_stat_wait_ns : 0) - perf_gw; perf_paced = !no_sync && !fast;
-    if (!no_sync && !fast) {                         /* pace to 50 Hz */
+    if (!no_sync && !fast) {                         /* pace to the field rate */
         u64 now = plat_time_ns();
         if (!pace_next) pace_next = now;
-        pace_next += 20000000;
+        pace_next += VIDEO_FIELD_NS;
         s64 ahead = (s64)(pace_next - now);
         {   static int asking, logged; static u64 last_skipped;
             if (frameskip && win_open && !gpu_interp && !want_fsr3) {
@@ -467,8 +468,8 @@ void video_present(void) {
             if (frame_no % 500 == 0) {
                 u64 sk, fr; gs_frameskip_stats(&sk, &fr);
                 if (sk != last_skipped && (!logged || getenv("ROR_FPSLOG"))) {       /* once; with ROR_FPSLOG every time */
-                    rt_log("[video] this machine is not keeping up at these settings: %llu pictures were left out in the last 500 vblanks (10 s) to keep the game and its sound at full speed (--frameskip off turns this off)\n",
-                           (unsigned long long)(sk - last_skipped));
+                    rt_log("[video] this machine is not keeping up at these settings: %llu pictures were left out in the last 500 vblanks (%d s) to keep the game and its sound at full speed (--frameskip off turns this off)\n",
+                           (unsigned long long)(sk - last_skipped), ror_game.ntsc ? 8 : 10);
                     logged = 1;
                 }
                 last_skipped = sk;

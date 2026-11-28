@@ -67,7 +67,7 @@ static void cdvd_ncmd_call(RpcCall *rc) {
     case 0x01: case 0x03: {  /* sceCdRead / sceCdReadDVDV: { lsn, sectors, buf, mode, intr_data, readpos } */
         u32 lsn = rd32(rc->send), n = rd32(rc->send + 4), buf = rd32(rc->send + 8);
         u32 intr = rd32(rc->send + 16), readpos = rd32(rc->send + 20);
-        if (g_verbose) rt_log("[cdvd] read lsn=%u sectors=%u -> 0x%08x\n", lsn, n, buf);
+        if (g_verbose) rt_log("[cdvd] vblank %llu: read lsn=%u sectors=%u -> 0x%08x\n", (unsigned long long)(g_now / TICKS_PER_FRAME), lsn, n, buf);
         if ((buf & 0x1FFFFFFFu) + (u64)n * 2048 > RAM_SIZE) rt_fatal(rc->ctx, "sceCdRead buffer 0x%x+%u sectors outside RAM", buf, n);
         iso_read(lsn, n, gptr(buf));
         /* The data is delivered whole, so the EE-side fix-up record for the

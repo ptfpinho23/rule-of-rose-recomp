@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # build.sh — regenerate the recompiled C and build the game binary.
-#   recomp/build.sh            full build
+#   recomp/build.sh            full build of the European game (SLES-54218) -> build/recomp/ror
+#   GAME=ntsc recomp/build.sh  the USA game (SLUS-21448) -> build/recomp/ntsc/ror; its generated code and
+#                              objects are under build/recomp/ntsc/ too, so the two builds do not touch each other
 #   EXTRA="-DROR_TRACE" ...    extra compiler flags
 # Toolchain (defaults are this project's private set-up: clang 18 under
 # ~/.local/opt/clang and the headers/CRT fetched by tools/fetch-debs.sh):
@@ -13,9 +15,10 @@ CLANG=${CLANG:-$HOME/.local/opt/clang/bin/clang}
 VULKAN_INC=${VULKAN_INC:-tools/vulkan/Vulkan-Headers-1.3.290/include}
 E=tools/debs/extract/usr
 L=/usr/lib/x86_64-linux-gnu
-GEN=build/recomp/gen
-OBJ=${OBJ:-build/recomp/obj}
-OUT=${OUT:-build/recomp/ror}
+export GAME=${GAME:-pal}
+eval "$(recomp/tools/gamefiles.sh paths | sed "s|$PWD/||g")"     # ELF, GEN, BASE of this edition (recomp/games.py)
+OBJ=${OBJ:-$BASE/obj}
+OUT=${OUT:-$BASE/ror}
 if [ "${ROR_TOOLCHAIN:-private}" = system ]; then
   CLANG=${CC:-cc}; INC=""
 else
@@ -25,9 +28,9 @@ else
 fi
 CFLAGS="-O2 -g1 -fwrapv -fno-strict-aliasing -fno-math-errno -ffp-contract=off -Wall -Wno-unused-label -Wno-unused-variable -Wno-unused-but-set-variable -DGS_HW -Irecomp/rt -I$VULKAN_INC -I$GEN ${EXTRA:-}"
 mkdir -p "$OBJ"
-recomp/tools/gamefiles.sh elf        # build/native/SLES_542.18 from the disc image, if it is not there
+recomp/tools/gamefiles.sh elf        # the game's executable from the disc image, if it is not there
 if [ "${NOGEN:-0}" != 1 ]; then
-  python3 recomp/gen.py build/native/SLES_542.18 "$GEN.new" >&2
+  python3 recomp/gen.py "$ELF" "$GEN.new" >&2
   # keep timestamps of unchanged generated files so they are not recompiled
   mkdir -p "$GEN"
   for f in "$GEN.new"/*; do

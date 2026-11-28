@@ -7,6 +7,7 @@
 
 u8 g_iop_ram[IOP_RAM_SIZE];
 u64 g_now; int g_verbose;
+const RorGame ror_game = { "pal", "SLES-54218", "SLES_542.18", "Europe", 0, 0, 0 };   /* 50 Hz timing */
 static u32 heap = 0x100000;
 u32 iop_alloc(u32 size) { u32 a = heap; heap += (size + 63) & ~63u; return a; }
 u64 kernel_now(Ctx *c) { (void)c; return g_now; }

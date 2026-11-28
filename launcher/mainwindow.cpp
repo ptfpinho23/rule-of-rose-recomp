@@ -40,10 +40,21 @@ namespace {
 #ifdef Q_OS_WIN
 const char *const kPackagedGame = "ror-game.exe";
 const char *const kDevGame = "build/recomp/win/ror.exe";
+const char *const kDevGameUsa = "build/recomp/ntsc/win/ror.exe";
 #else
 const char *const kPackagedGame = "ror-game";
 const char *const kDevGame = "build/recomp/ror";
+const char *const kDevGameUsa = "build/recomp/ntsc/ror";
 #endif
+
+// The frame-rate choices; the first is the game's own rate, which depends on
+// the disc (50 Hz European, 60 Hz USA).
+QList<Dropdown::Item> fpsItems(int hz)
+{
+    return {{QString("Original (%1 Hz)").arg(hz), {}, "0"}, {"Match display", {}, "display"},
+            {"60 fps", {}, "60"},      {"120 fps", {}, "120"},
+            {"144 fps", {}, "144"},    {"240 fps", {}, "240"}};
+}
 
 // Window metrics (logical pixels). The window does not resize.
 const int W = 1100, H = 640;
@@ -366,9 +377,7 @@ QWidget *MainWindow::buildOptions()
         s.setValue("video/fps", fpsSaved);
     }
     m_renderer->setCurrent(gpuSaved ? 1 : 0);
-    m_fps->setItems({{"Original (50 Hz)", {}, "0"}, {"Match display", {}, "display"},
-                     {"60 fps", {}, "60"},      {"120 fps", {}, "120"},
-                     {"144 fps", {}, "144"},    {"240 fps", {}, "240"}});
+    m_fps->setItems(fpsItems(50));          // (setDisc puts the chosen disc's rate in the first entry)
     m_fps->setCurrentValue(fpsSaved);
     m_vsync->setChecked(s.value("video/vsync", true).toBool());
     connect(m_renderer, &Segmented::changed, this, [this](int i) {
@@ -548,10 +557,9 @@ QWidget *MainWindow::buildOptions()
                            &m_deadzoneLabel);
     helper(g, 4 * rowH + 8, "Auto: an Xbox-style pad if there is one, else a PlayStation pad. The keyboard always works.");
     helper(g, 4 * rowH + 34, "Without a card the game cannot save or load. Saves are kept in");
-    auto *path = makeLabel(g, serif(15, Italic, 0.2), chalkDim);
-    path->setGeometry(0, 4 * rowH + 56, w, 22);
-    setElided(path, QDir::toNativeSeparators(QDir(appDir()).filePath("saves/mc0")),
-              Qt::ElideMiddle);
+    m_savePath = makeLabel(g, serif(15, Italic, 0.2), chalkDim);
+    m_savePath->setGeometry(0, 4 * rowH + 56, w, 22);
+    setElided(m_savePath, QDir::toNativeSeparators(saveDir()), Qt::ElideMiddle);
     m_sound->setChecked(s.value("game/sound", true).toBool());
     m_memcard->setChecked(s.value("game/memcard", true).toBool());
     connect(m_sound, &QAbstractButton::toggled, this,
@@ -732,8 +740,8 @@ void MainWindow::updateOptionStates()
                     ? QString("No graphics card driver for Vulkan found (only %1, which runs on the processor).").arg(g_gpu.name)
                     : QString("No Vulkan graphics driver found - the game uses the software renderer."));
     setElided(m_qualityNote,
-              !gpu ? QString("Software runs at the original 50 Hz; higher frame rates use the GPU renderer.")
-              : card ? QString("Above 50 Hz, the extra frames are interpolated.")
+              !gpu ? QString("Software runs at the original %1 Hz; higher frame rates use the GPU renderer.").arg(m_disc.hz)
+              : card ? QString("Above the original %1 Hz, the extra frames are interpolated.").arg(m_disc.hz)
               : g_gpu.kind == GpuInfo::Cpu
                     ? QString("The GPU renderer will be slow here: it would run on the processor. Software is faster.")
                     : QString("The GPU renderer needs a Vulkan 1.3 graphics driver; without one the game uses Software."));
@@ -935,7 +943,7 @@ void MainWindow::setDisc(const QString &path, bool remember)
     QString sub;
     switch (m_disc.state) {
     case DiscInfo::Ok:
-        m_discMain->setText(QString("Rule of Rose (Europe)  ·  %1").arg(kDiscSerial));
+        m_discMain->setText(QString("Rule of Rose (%1)  ·  %2").arg(m_disc.region, m_disc.serial));
         m_discLink->setLabel("Change…");
         sub = file;
         break;
@@ -944,7 +952,7 @@ void MainWindow::setDisc(const QString &path, bool remember)
                                 ? QString("Wrong disc")
                                 : QString("Wrong disc  ·  %1").arg(m_disc.serial));
         m_discLink->setLabel("Select another…");
-        sub = QString("This port needs the European release, %1.").arg(kDiscSerial);
+        sub = QString("This port needs %1.").arg(supportedDiscsText());
         break;
     case DiscInfo::NotIso:
         m_discMain->setText("Not a disc image");
@@ -954,8 +962,8 @@ void MainWindow::setDisc(const QString &path, bool remember)
     case DiscInfo::Missing:
         m_discMain->setText("Disc image not found");
         m_discLink->setLabel("Select another…");
-        sub = none ? QString("Your European disc (%1) as an .iso file. Browse, or drop it here.")
-                         .arg(kDiscSerial)
+        sub = none ? QString("Your disc as an .iso file: %1. Browse, or drop it here.")
+                         .arg(supportedDiscsText())
                    : native;
         break;
     }
@@ -964,6 +972,10 @@ void MainWindow::setDisc(const QString &path, bool remember)
     if (m_disc.ok())
         m_discSub->setToolTip(native);
     layoutDisc();
+    // what depends on the edition: the game's own rate in the texts, the save folder
+    m_fps->setItems(fpsItems(m_disc.hz));
+    setElided(m_savePath, QDir::toNativeSeparators(saveDir()), Qt::ElideMiddle);
+    updateOptionStates();
 
     if (remember && m_disc.ok())
         QSettings().setValue("disc/path", m_disc.path);
@@ -1020,8 +1032,27 @@ QString MainWindow::gameDir()
     return g_gameDir;
 }
 
+// Each edition is prepared into its own folder, named after the disc, so a
+// game made from one disc is never started with the other and both can stay
+// prepared side by side.
+QString MainWindow::discGameDir() const
+{
+    return m_disc.ok() ? QDir(gameDir()).filePath(m_disc.serial) : gameDir();
+}
+
+// Memory-card folder. PS2 saves belong to one edition (the European game
+// keeps its data in BESLES-54218 on the card, the USA game in BASLUS-21448,
+// and neither lists the other's), so each disc has its own card: the European
+// one where it has always been, the USA one in a folder named after the disc.
+QString MainWindow::saveDir() const
+{
+    return QDir(appDir()).filePath(m_disc.ok() && !m_disc.european()
+                                       ? QString("saves/%1/mc0").arg(m_disc.serial)
+                                       : QString("saves/mc0"));
+}
+
 QString MainWindow::builderPath() const { return QDir(appDir()).filePath(kBuilder); }
-QString MainWindow::builtGamePath() const { return QDir(gameDir()).filePath(kPackagedGame); }
+QString MainWindow::builtGamePath() const { return QDir(discGameDir()).filePath(kPackagedGame); }
 
 // Decide where the game comes from, and whether it has to be prepared.
 void MainWindow::refreshGameState()
@@ -1035,12 +1066,16 @@ void MainWindow::refreshGameState()
     } else if (!m_disc.ok()) {
         m_gameState = NeedsBuild;          // unknown until there is a disc; PLAY is off anyway
     } else {
-        // "--check" answers at once: 0 = the game in gameDir() is the one
+        // Releases up to 0.1.4 kept the one prepared game directly in
+        // gameDir(); it cannot be used any more, so its files are removed.
+        for (const QString &old : {QString(kPackagedGame), QString("ror-game.stamp"), QString("build.log")})
+            QFile::remove(QDir(gameDir()).filePath(old));
+        // "--check" answers at once: 0 = the game in discGameDir() is the one
         // for this disc image and this package, anything else = prepare it.
         QProcess check;
         check.setProgram(builderPath());
         check.setArguments({"--check", "--iso", QDir::toNativeSeparators(m_disc.path), "--out",
-                            QDir::toNativeSeparators(gameDir())});
+                            QDir::toNativeSeparators(discGameDir())});
         check.setStandardOutputFile(QProcess::nullDevice());
         check.setStandardErrorFile(QProcess::nullDevice());
 #ifdef Q_OS_WIN
@@ -1117,7 +1152,7 @@ QWidget *MainWindow::buildPrepare()
     m_prepLog->move(m_prepRetry->x() - 26 - m_prepLog->width(), 132);
     connect(m_prepLog, &QAbstractButton::clicked, this, [this]() {
         if (!m_testMode)
-            QDesktopServices::openUrl(QUrl::fromLocalFile(QDir(gameDir()).filePath("build.log")));
+            QDesktopServices::openUrl(QUrl::fromLocalFile(QDir(discGameDir()).filePath("build.log")));
     });
 
     m_buildTick = new QTimer(this);
@@ -1155,7 +1190,7 @@ void MainWindow::startPrepare()
             return;
         }
     }
-    QDir().mkpath(gameDir());
+    QDir().mkpath(discGameDir());
     m_buildOut.clear();
     m_buildError.clear();
     m_buildDone.clear();
@@ -1171,7 +1206,7 @@ void MainWindow::startPrepare()
     m_build = new QProcess(this);
     m_build->setProgram(builderPath());
     m_build->setArguments({"--iso", QDir::toNativeSeparators(m_disc.path), "--out",
-                           QDir::toNativeSeparators(gameDir())});
+                           QDir::toNativeSeparators(discGameDir())});
     m_build->setWorkingDirectory(appDir());
     m_build->setStandardErrorFile(QProcess::nullDevice());     // the builder keeps its own log
 #ifdef Q_OS_WIN
@@ -1186,7 +1221,7 @@ void MainWindow::startPrepare()
     });
     m_buildClock.start();
     m_buildTick->start();
-    note("prepare: " + builderPath() + " --iso " + m_disc.path + " --out " + gameDir());
+    note("prepare: " + builderPath() + " --iso " + m_disc.path + " --out " + discGameDir());
     m_build->start();
     updatePlayButton();
     setStatus(Info, "Preparing the game…");
@@ -1266,7 +1301,7 @@ void MainWindow::onBuilderFinished(int code, QProcess::ExitStatus st)
     m_prepText->setText("The game could not be prepared.");
     setElided(m_prepStep, why);
     setStatus(Bad, "The game could not be prepared.",
-              why + "  ·  Log: " + QDir::toNativeSeparators(QDir(gameDir()).filePath("build.log")));
+              why + "  ·  Log: " + QDir::toNativeSeparators(QDir(discGameDir()).filePath("build.log")));
     m_prepare->open();
     emit prepareFinished(false);
 }
@@ -1317,7 +1352,7 @@ void MainWindow::endBuild()
     }
 }
 
-QString MainWindow::findGameBinary(QString *workDir)
+QString MainWindow::findGameBinary(QString *workDir) const
 {
     if (workDir)
         *workDir = appDir();
@@ -1326,7 +1361,7 @@ QString MainWindow::findGameBinary(QString *workDir)
         return packaged.absoluteFilePath();
     QDir d(appDir());
     for (int up = 0; up < 6; ++up) {
-        const QFileInfo dev(d, kDevGame);
+        const QFileInfo dev(d, m_disc.ok() && !m_disc.european() ? kDevGameUsa : kDevGame);
         if (dev.isFile()) {
             // Development builds are run from the repository root.
             if (workDir)
@@ -1374,7 +1409,7 @@ void MainWindow::play()
             printf("[dry-run] action: prepare the game first\n[dry-run] builder: %s\n",
                    builderPath().toLocal8Bit().constData());
             for (const QString &a : QStringList{"--iso", QDir::toNativeSeparators(m_disc.path),
-                                                "--out", QDir::toNativeSeparators(gameDir())})
+                                                "--out", QDir::toNativeSeparators(discGameDir())})
                 printf("[dry-run] builder arg: %s\n", a.toLocal8Bit().constData());
             printf("[dry-run] then play: %s\n", builtGamePath().toLocal8Bit().constData());
             fflush(stdout);
@@ -1404,7 +1439,7 @@ void MainWindow::play()
     env.remove("ROR_NOAUDIO");
     env.remove("ROR_MC_DIR");
     if (m_memcard->isChecked()) {
-        const QString mc = QDir(appDir()).filePath("saves/mc0");
+        const QString mc = saveDir();
         if (!m_dryRun && !QDir().mkpath(mc)) {       // (a dry run leaves no folder behind)
             gameEnded(false, "Cannot create the save folder.",
                       QDir::toNativeSeparators(mc) +

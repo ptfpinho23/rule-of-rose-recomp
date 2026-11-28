@@ -8,7 +8,8 @@
 #   OUTDIR/ror-build(.exe)        the tool (a small starter)
 #   OUTDIR/buildkit/
 #     ror_build.py  VERSION  KITHASH
-#     recomp/       the recompiler (gen.py and its modules) and vu1extract.py
+#     recomp/       the recompiler (gen.py and its modules), games.py (the table of supported
+#                   discs) and vu1extract.py
 #     rt/lib/       the runtime, compiled (every recomp/rt source that does not
 #                   include generated headers); on Windows also libpthread.a
 #     rt/src/       support.c, vu.c, interp.c (they include generated headers
@@ -84,7 +85,7 @@ fi
 
 echo "make-kit: VU1 translator, recompiler, tool" >&2
 $HOSTCC -O2 -w -Irecomp/rt -DVU_NO_FAST $([ "$PLAT" = windows ] && echo "-include recomp/rt/win_compat.h") recomp/tools/vubench.c -o "$K/vugen$EXE" $([ "$PLAT" = linux ] && echo "-lm -s")
-cp recomp/gen.py recomp/sem.py recomp/r5900.py recomp/elf.py recomp/tools/vu1extract.py "$K/recomp/"
+cp recomp/gen.py recomp/sem.py recomp/r5900.py recomp/elf.py recomp/games.py recomp/tools/vu1extract.py "$K/recomp/"
 cp release/ror_build.py "$K/"
 printf '%s\n' "$VERSION" > "$K/VERSION"
 if [ "$PLAT" = linux ]; then

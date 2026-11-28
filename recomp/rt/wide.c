@@ -4,8 +4,9 @@
  * of view and meant to be shown stretched to the wide aspect (post_rect asks
  * wide_present for the aspect of the picture on display).
  *
- * 3D: the game builds every camera in fn 0x228b80(a0 = renderer, a1 = frustum,
- * a2 = world-to-view matrix). a1 points to floats
+ * 3D: the game builds every camera in one function (0x228b80 on the European
+ * disc; ror_game.fn_camera) with a0 = renderer, a1 = frustum,
+ * a2 = world-to-view matrix. a1 points to floats
  *     [0] near  [1] far  [2] left  [3] right  [4] bottom  [5] top   (on the near plane)
  *     [6] [7] depth range   [8..11] viewport x0, x1, y0, y1 (0, 511, 0, 447)
  *     [12] [13] GS XYOFFSET in pixels (1792, 1824)
@@ -19,10 +20,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "cpu.h"
+#include "rt.h"
 #include "gs.h"
 
-void f_00228b80(Ctx *c);
 #include <math.h>
 /* The last 4:3 camera the game built: near, far, vertical field of view
  * (radians), GS depth value at the near and at the far plane. Until one is
@@ -97,9 +97,9 @@ void wide_present(int *num, int *den) {
     else { *num = 4; *den = 3; }
 }
 
-/* cpu.h TRACE_FN: entry of f_00228b80. Returns 1 when the call has been done here. */
+/* cpu.h TRACE_FN: entry of the camera builder. Returns 1 when the call has been done here. */
 int wide_hook(Ctx *c, u32 entry) {
-    if (entry != 0x228b80u) return 0;
+    if (entry != ror_game.fn_camera) return 0;
     {   /* FSR 3.1 (gs.c): the main camera's planes and depth range, widescreen or not */
         float f[8]; memcpy(f, HPTR(c->r[5].u32[0]), sizeof f);
         if (f[0] > 0 && f[1] > f[0] && f[5] > f[4] && f[3] > f[2] && (f[3] - f[2]) / (f[5] - f[4]) > 1.30f && (f[3] - f[2]) / (f[5] - f[4]) < 1.37f && f[6] > f[7] && f[7] > 0) {
@@ -129,7 +129,8 @@ int wide_hook(Ctx *c, u32 entry) {
     /* 0x228b80 also derives two volumes around the screen from pixel limits: VU1's
      * clip volume (screen edge + k * (guard edge - screen edge), k = float at
      * renderer + 0x12128, 0.35 in the bus stop scene: +-863 px from the centre)
-     * and the guard band (GS x/y 64 .. 4031.94, floats at 0x32a5e4 / 0x32a5e8:
+     * and the guard band (GS x/y 64 .. 4031.94, floats at ror_game.guard_band,
+     * 0x32a5e4 / 0x32a5e8 on the European disc:
      * +-1984 px). Both are fixed in pixels, so with a wider frustum they open up
      * in view space, and polygons reaching behind the camera then pass
      * unclipped (seen at 16:9 and 21:9: a ground polygon with wrapped negative
@@ -137,14 +138,14 @@ int wide_hook(Ctx *c, u32 entry) {
      * widening for the duration of the call, which keeps them where they are
      * at 4:3 in view space. */
     float k0, g0[2], k1, g1[2];
-    memcpy(&k0, HPTR(a0 + 0x12128), 4); memcpy(g0, HPTR(0x32a5e4), 8);
+    memcpy(&k0, HPTR(a0 + 0x12128), 4); memcpy(g0, HPTR(ror_game.guard_band), 8);
     half = (256.0f + k0 * (1984.0f - 256.0f)) / (float)g_wide;
     k1 = (half - 256.0f) / (1984.0f - 256.0f); if (k1 < 0.02f) k1 = 0.02f;
     half = 1984.0f / (float)g_wide; g1[0] = 2048.0f - half; g1[1] = 2048.0f + half;
     { static int keep = -1; if (keep < 0) keep = getenv("ROR_WIDE_NOCLIPFIX") != 0; if (keep) { k1 = k0; g1[0] = g0[0]; g1[1] = g0[1]; } }   /* test: volumes as the game sets them */
-    memcpy(HPTR(a0 + 0x12128), &k1, 4); memcpy(HPTR(0x32a5e4), g1, 8);
-    f_00228b80(c);
-    memcpy(HPTR(a0 + 0x12128), &k0, 4); memcpy(HPTR(0x32a5e4), g0, 8);
+    memcpy(HPTR(a0 + 0x12128), &k1, 4); memcpy(HPTR(ror_game.guard_band), g1, 8);
+    rt_lookup(c, ror_game.fn_camera)(c);        /* the generated function; its hook sees the marked copy and runs the body */
+    memcpy(HPTR(a0 + 0x12128), &k0, 4); memcpy(HPTR(ror_game.guard_band), g0, 8);
     memcpy(HPTR(nsp), save, sizeof save);
     c->r[29].u64[0] = old_sp;                           /* a1 is caller-saved; nothing to restore */
     return 1;

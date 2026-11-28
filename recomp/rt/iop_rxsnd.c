@@ -20,7 +20,8 @@
  * Adding audio later: everything a mixer needs is in `spu_ram`, `g_voice[]`
  * (SSA/LSAX/pitch/ADSR/volumes/mix bits/key state), `g_core[]`, `g_fx[]`
  * and `g_pcm[]` (block ring + volumes); `spu_run_frame` is the single place
- * where SPU time advances (960 output samples per call).
+ * where SPU time advances (one video field of output samples per call: 960
+ * at 50 Hz, 800 or 801 at 59.94 Hz).
  *
  * Not implemented (stops with a clear message instead of guessing): BGM
  * playback (cmd 112; the game has no caller for it), XVAB/XSEQ container
@@ -32,7 +33,7 @@
 #define DRV_TICK        TICKS_PER_FRAME      /* driver worker period: one vblank */
 #define SPU_RAM_SIZE    0x200000u
 #define NVOICE          48
-#define SAMPLES_PER_TICK 960                 /* 48 kHz / 50 Hz */
+#define SAMPLES_PER_TICK MAX_FIELD_SAMPLES   /* the most a tick renders: 48 kHz / 50 Hz (rt.h video_field_samples) */
 
 typedef struct In { const u8 *p; u32 n; } In;       /* argument block */
 typedef struct Out { u8 *p; u32 n; } Out;           /* out-data area */
@@ -291,24 +292,26 @@ static void spu_render(s16 *out, int frames) {
     }
 }
 
-/* Output FIFO: the driver tick renders 960 frames, the host pulls them. */
+/* Output FIFO: the driver tick renders one field of sample frames, the host pulls them. */
 #define FIFO_FRAMES (SAMPLES_PER_TICK * 8)
 static s16 g_fifo[FIFO_FRAMES * 2];
 static u32 g_fifo_rd, g_fifo_n;
 
-/* Advance the SPU by one tick (960 output samples). */
+/* Advance the SPU by one tick (one video field of output samples). */
 static void spu_run_frame(void) {
+    static u64 field;
     s16 buf[SAMPLES_PER_TICK * 2];
-    spu_render(buf, SAMPLES_PER_TICK);
-    if (g_fifo_n + SAMPLES_PER_TICK > FIFO_FRAMES) {            /* nobody is listening: drop the oldest tick */
+    const u32 n = video_field_samples(field++);
+    spu_render(buf, (int)n);
+    while (g_fifo_n + n > FIFO_FRAMES) {                        /* nobody is listening: drop the oldest tick */
         g_fifo_rd = (g_fifo_rd + SAMPLES_PER_TICK) % FIFO_FRAMES; g_fifo_n -= SAMPLES_PER_TICK;
     }
     u32 wr = (g_fifo_rd + g_fifo_n) % FIFO_FRAMES;
-    for (int i = 0; i < SAMPLES_PER_TICK; i++) {
+    for (u32 i = 0; i < n; i++) {
         g_fifo[wr * 2] = buf[i * 2]; g_fifo[wr * 2 + 1] = buf[i * 2 + 1];
         wr = (wr + 1) % FIFO_FRAMES;
     }
-    g_fifo_n += SAMPLES_PER_TICK;
+    g_fifo_n += n;
 }
 
 /* --- voice manager API used by the note layer and the ADPCM streams --- */
@@ -953,7 +956,11 @@ static void adpcm_track(Adpcm *a) {                             /* IRX 0xa63c */
     if (!a->nch || a->ch[0].voice < 0) { adpcm_stop_voices(a); return; }
     s32 pos = (s32)(g_voice[a->ch[0].voice].nax - a->ch[0].spu_buf) & ~63;
     if (pos < 0 || pos > a->spu_size) { adpcm_stop_voices(a); return; }
-    if (!a->end && a->spu_fill < a->threshold) { adpcm_stop_voices(a); return; }       /* underrun */
+    if (!a->end && a->spu_fill < a->threshold) {                                        /* underrun */
+        static int dbg = -1; static u32 n; if (dbg < 0) dbg = getenv("ROR_SNDDBG") != 0;
+        if (dbg) rt_log("[rxsnd] adpcm stream underrun %u at vblank %llu: %d bytes left, threshold %d\n", ++n, (unsigned long long)(g_now / TICKS_PER_FRAME), (int)a->spu_fill, (int)a->threshold);
+        adpcm_stop_voices(a); return;
+    }
     s32 d = pos - a->spu_play;
     if (d < 0) d += a->spu_size;
     a->spu_fill -= d;
@@ -1123,8 +1130,9 @@ static void pcm_tick(u64 now) {                                 /* IRX 0xb5ac */
             memmove(&g_pcm_list[k], &g_pcm_list[k + 1], (size_t)(g_pcm_count - k - 1) * sizeof g_pcm_list[0]); g_pcm_count--;
         } else k++;
     }
-    /* position of the SPU in the 8192-byte output buffer: 192000 bytes per second */
-    u32 pos = (u32)(((now - D.pcm_origin) * 192000u / 100000000u) & 0x1FFF);
+    /* position of the SPU in the 8192-byte output buffer: 192000 bytes per second
+     * (a second is TICKS_PER_FRAME * VIDEO_HZ_NUM / VIDEO_HZ_DEN ticks) */
+    u32 pos = (u32)((unsigned __int128)(now - D.pcm_origin) * (192000u * VIDEO_HZ_DEN) / (TICKS_PER_FRAME * VIDEO_HZ_NUM) & 0x1FFF);
     int half = (int)(pos >> 12);
     for (int k = 0; k < g_pcm_count; k++) {
         Pcm *p = &g_pcm[g_pcm_list[k]];
@@ -1149,7 +1157,7 @@ static void pcm_tick(u64 now) {                                 /* IRX 0xb5ac */
  * ====================================================================== */
 static void cfg_tick(void) {                                    /* IRX 0x1680 */
     if (D.cfg_req.mask & 1) D.debug_mask = D.cfg_req.v[0];
-    if (D.cfg_req.mask & 2) D.video_rate = D.cfg_req.v[1];
+    if (D.cfg_req.mask & 2) { if (D.video_rate != D.cfg_req.v[1]) rt_log("[rxsnd] the game sets the driver's video rate to %u\n", D.cfg_req.v[1]); D.video_rate = D.cfg_req.v[1]; }
     if (D.cfg_req.mask & 4) D.stereo = D.cfg_req.v[2];
     for (int i = 0; i < 3; i++) if (D.cfg_req.mask & (8u << i)) D.spdif[i] = D.cfg_req.b[i];
     D.cfg_req.mask = 0;
@@ -1319,10 +1327,11 @@ void rxsnd_call(RpcCall *rc) {
 }
 
 /* Host audio pull: `frames` stereo s16 frames at 48 kHz. SPU time is owned
- * by the driver tick (960 frames per 20 ms of virtual time); this first runs
+ * by the driver tick (one field's sample frames per vblank of virtual time); this first runs
  * the ticks that are due and then drains what they rendered. If the driver
  * has not produced enough (not started yet, or a phase slip), the rest is
- * silence. Call it once per video frame with 960. */
+ * silence. Call it once per video field with that field's count (rt.h
+ * video_field_samples: 960 at 50 Hz). */
 void rxsnd_mix(s16 *out, int frames) {
     cur_ctx = 0;
     if (D.inited) catch_up(g_now);

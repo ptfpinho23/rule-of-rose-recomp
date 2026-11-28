@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """dis.py ADDR [COUNT] — disassemble game code (R5900), for analysis."""
+import os
 import sys
 from elf import Elf
 from r5900 import decode, BRANCHES
@@ -58,7 +59,8 @@ def fmt(i):
 
 
 def main():
-    e = Elf(__file__.rsplit('/', 2)[0] + '/build/native/SLES_542.18')
+    # ROR_ELF=path: another executable (default: the European one; build/ntsc/SLUS_214.48 is the USA one)
+    e = Elf(os.environ.get('ROR_ELF') or __file__.rsplit('/', 2)[0] + '/build/native/SLES_542.18')
     a = int(sys.argv[1], 16)
     n = int(sys.argv[2], 0) if len(sys.argv) > 2 else 32
     for k in range(n):

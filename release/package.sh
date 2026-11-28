@@ -32,7 +32,8 @@ Rule of Rose for PC, version $VERSION
 =======================================
 
 This package does NOT contain the game. You need your own copy of the
-European PlayStation 2 disc (SLES-54218) as an .iso file.
+PlayStation 2 disc as an .iso file: the European release (SLES-54218) or
+the USA release (SLUS-21448).
 
 How to play
   1. Unpack this folder anywhere you like.
@@ -46,7 +47,8 @@ How to play
   5. Press PLAY.
 
 Your disc image is only read, never changed and never sent anywhere.
-Saved games are kept in the saves folder next to the launcher.
+Saved games are kept in the saves folder next to the launcher (each of the
+two discs has its own memory card there).
 
 What is in this folder
   RuleOfRose$exe      the program you start

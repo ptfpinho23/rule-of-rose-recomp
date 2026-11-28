@@ -12,7 +12,8 @@ void video_script(const char *s);
 int  video_option(const char *name, const char *value);
 int  pad_option(const char *name, const char *value);
 
-#define ISO_NAME "Rule of Rose (Europe) (En,Fr,De,Es,It).iso"
+/* the usual file name of the image of each edition (looked for when no --iso is given) */
+#define ISO_NAME (ror_game.ntsc ? "Rule of Rose (USA).iso" : "Rule of Rose (Europe) (En,Fr,De,Es,It).iso")
 static char exe_dir[900] = ".";
 static char iso_buf[1200];
 
@@ -21,7 +22,7 @@ static int readable(const char *p) { FILE *f = plat_fopen(p, "rb"); if (f) fclos
 /* Disc image search: current directory, then the executable's directory and
  * up to four of its parents (so a build inside the source tree finds it). */
 static const char *find_iso(void) {
-    static const char *names[] = { ISO_NAME, "RuleOfRose.iso", "game.iso" };
+    const char *names[] = { ISO_NAME, "RuleOfRose.iso", "game.iso" };
     for (int n = 0; n < 3; n++) if (readable(names[n])) return names[n];
     char dir[900]; snprintf(dir, sizeof dir, "%s", exe_dir);
     for (int up = 0; up < 5; up++) {
@@ -58,7 +59,7 @@ static void usage(const char *prog) {
 
 int main(int argc, char **argv) {
     const char *elf = 0;
-    const char *insn = "build/recomp/gen/insn.bin";
+    const char *insn = ror_game.ntsc ? "build/recomp/ntsc/gen/insn.bin" : "build/recomp/gen/insn.bin";   /* --interp, developer builds: the tables gen.py wrote */
     int window = 1, nosync = 0, shots = 0, frames = 0;
     plat_init(&argc, &argv);
     { int wide_set(const char *v); const char *w = plat_getenv("ROR_WIDE"); if (w && !wide_set(w)) fprintf(stderr, "ROR_WIDE: bad value %s\n", w); }
@@ -127,12 +128,13 @@ int main(int argc, char **argv) {
     else {                                    /* the game's data segments come off the disc */
         u32 lsn, size;
         if (!iso_open(iso)) { fprintf(stderr, "cannot open disc image: %s\n", iso); return 1; }
-        if (!iso_find("\\SLES_542.18;1", &lsn, &size)) {
-            fprintf(stderr, "%s: this is not the European Rule of Rose disc (SLES-54218)\n", iso); return 1;
+        char boot[40]; snprintf(boot, sizeof boot, "\\%s;1", ror_game.elf);
+        if (!iso_find(boot, &lsn, &size)) {       /* this program holds the code of one edition only */
+            fprintf(stderr, "%s: this is not the Rule of Rose disc this program was made from (%s, %s)\n", iso, ror_game.serial, ror_game.region); return 1;
         }
         u8 *b = malloc(((size_t)size + 2047) & ~(size_t)2047);
         iso_read(lsn, (size + 2047) / 2048, b);
-        mem_load_elf_buf(b, size, "SLES_542.18", &entry);
+        mem_load_elf_buf(b, size, ror_game.elf, &entry);
         free(b);
     }
     if (g_use_interp) interp_init(insn);
@@ -140,6 +142,6 @@ int main(int argc, char **argv) {
     hw_init();
     iop_init(iso);
     kernel_init(entry);
-    rt_log("[boot] entry 0x%08x, %s mode\n", entry, g_use_interp ? "interpreter" : "recompiled");
+    rt_log("[boot] %s (%s, %s), entry 0x%08x, %s mode\n", ror_game.serial, ror_game.region, ror_game.ntsc ? "NTSC" : "PAL", entry, g_use_interp ? "interpreter" : "recompiled");
     kernel_run();
 }

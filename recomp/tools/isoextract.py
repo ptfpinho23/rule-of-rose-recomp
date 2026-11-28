@@ -20,7 +20,7 @@ def extract(iso, name, out):
                 if len(data) != fsize: raise SystemExit('isoextract: %s is truncated' % iso)
                 open(out, 'wb').write(data); return
             o += n
-    raise SystemExit('isoextract: %s has no %s in its root directory (not the European Rule of Rose disc, SLES-54218?)' % (iso, name))
+    raise SystemExit('isoextract: %s has no %s in its root directory (not that edition of Rule of Rose?)' % (iso, name))
 
 if __name__ == '__main__':
     extract(sys.argv[1], sys.argv[2], sys.argv[3])

@@ -5,6 +5,9 @@
 #include "plat.h"
 #include "funcs.h"
 
+/* the edition this program is: recomp/games.py -> gen.py -> funcs.h */
+const RorGame ror_game = { ROR_GAME_KEY, ROR_GAME_SERIAL, ROR_GAME_ELF, ROR_GAME_REGION, ROR_GAME_NTSC, ROR_FN_CAMERA, ROR_GUARD_BAND };
+
 int g_use_interp, g_verbose;
 VU g_vu0 = { .vf = { [0] = { .f = { 0.0f, 0.0f, 0.0f, 1.0f } } } };
 static u32 g_last_miss;

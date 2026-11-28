@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# build-win.sh — cross-build the game for Windows x64 (build/recomp/win/ror.exe)
+# build-win.sh — cross-build the game for Windows x64 (build/recomp/win/ror.exe;
+# with GAME=ntsc the USA game, build/recomp/ntsc/win/ror.exe)
 # with the llvm-mingw toolchain in tools/llvm-mingw (target x86_64-w64-mingw32,
 # UCRT). Same sources, optimisation and floating-point flags as build.sh.
-#   recomp/build-win.sh         build (uses the generated C in build/recomp/gen;
+#   recomp/build-win.sh         build (uses the generated C in build/recomp/gen, or build/recomp/ntsc/gen;
 #                               runs gen.py only if that directory is missing)
 #   GEN=1 recomp/build-win.sh   regenerate the C first, like build.sh does
 #   OBJ=dir OUT=file EXTRA="-D..."   as in build.sh
@@ -15,14 +16,16 @@ TC=${LLVM_MINGW:-tools/llvm-mingw}/bin      # LLVM_MINGW=dir: another llvm-mingw
 VULKAN_INC=${VULKAN_INC:-tools/vulkan/Vulkan-Headers-1.3.290/include}
 CLANG=$TC/x86_64-w64-mingw32-clang
 [ -x "$CLANG" ] || { echo "llvm-mingw not found in tools/llvm-mingw (see recomp/NOTES.md, Windows build)" >&2; exit 1; }
-GEN=build/recomp/gen
-OBJ=${OBJ:-build/recomp/win/obj}
-OUT=${OUT:-build/recomp/win/ror.exe}
+REGEN=${GEN:-0}
+export GAME=${GAME:-pal}
+eval "$(recomp/tools/gamefiles.sh paths | sed "s|$PWD/||g")"     # ELF, GEN, BASE of this edition (recomp/games.py)
+OBJ=${OBJ:-$BASE/win/obj}
+OUT=${OUT:-$BASE/win/ror.exe}
 CFLAGS="-O2 -g1 -gcodeview -fwrapv -fno-strict-aliasing -fno-math-errno -ffp-contract=off -Wall -Wno-unused-label -Wno-unused-variable -Wno-unused-but-set-variable -D_WIN32_WINNT=0x0A00 -DUNICODE -D_UNICODE -include recomp/rt/win_compat.h -DGS_HW -Irecomp/rt -I$VULKAN_INC -I$GEN ${EXTRA:-}"
 mkdir -p "$OBJ" "$(dirname "$OUT")"
-recomp/tools/gamefiles.sh elf        # build/native/SLES_542.18 from the disc image, if it is not there
-if [ "${GEN:-0}" = 1 ] || [ ! -e "$GEN/funcs.h" ]; then
-  python3 recomp/gen.py build/native/SLES_542.18 "$GEN.new" >&2
+recomp/tools/gamefiles.sh elf        # the game's executable from the disc image, if it is not there
+if [ "$REGEN" = 1 ] || [ ! -e "$GEN/funcs.h" ]; then
+  python3 recomp/gen.py "$ELF" "$GEN.new" >&2
   mkdir -p "$GEN"
   for f in "$GEN.new"/*; do
     b=$(basename "$f")

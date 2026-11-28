@@ -104,11 +104,13 @@ static inline void mw128(Ctx *c, u32 a, const r128 *v) {
 /* ---- function-entry hook (widescreen, rt/wide.c) --------------------------
  * gen.py puts TRACE_FN(entry) at the top of every generated function. The
  * address is a constant, so the test folds away everywhere but in the hooked
- * function. A hook that returns non-zero has performed the whole call. */
-#ifndef TRACE_FN
+ * function. A hook that returns non-zero has performed the whole call.
+ * ROR_FN_CAMERA is the camera builder of the edition being built; the
+ * generated funcs.h defines it (from recomp/games.py) before including this. */
+#if !defined(TRACE_FN) && defined(ROR_FN_CAMERA)
 struct Ctx;
 int wide_hook(struct Ctx *c, u32 entry);
-#define TRACE_FN(a) do { if ((a) == 0x228b80u && wide_hook(c, (a))) return; } while (0)
+#define TRACE_FN(a) do { if ((a) == ROR_FN_CAMERA && wide_hook(c, (a))) return; } while (0)
 #endif
 
 /* ---- runtime services called from generated code ------------------------ */

@@ -8,6 +8,7 @@
 #
 # Inputs:
 #   linux    game ${BIN:-build/recomp/ror}              (recomp/build.sh)
+#            (BIN=build/recomp/ntsc/ror WINBIN=build/recomp/ntsc/win/ror.exe packages the USA game instead)
 #            launcher built here via  tools/build.sh dist
 #   windows  game ${WINBIN:-build/recomp/win/ror.exe}   (recomp/build-win.sh)
 #            launcher built here via  tools/build-win.sh
@@ -152,7 +153,9 @@ Rule of Rose — native PC build (Linux x86-64)
 Run:      ./RuleOfRose
           This opens the launcher. Choose your disc image, press PLAY.
 
-Needs:    your own copy of the European disc (SLES-54218) as an .iso file.
+Needs:    your own copy of the disc this ror-game was built from as an .iso
+          file (the European one, SLES-54218, unless the folder was packaged
+          from a USA build; ror-game refuses the other disc).
           The launcher finds "Rule of Rose (Europe) (En,Fr,De,Es,It).iso" or
           "RuleOfRose.iso" by itself when it is in this folder or up to four
           folders above; otherwise use Browse. The choice is remembered.
@@ -166,7 +169,7 @@ In the launcher
              Picture shape (4:3 is the original; 16:9, 21:9, 32:9 are
              experimental: 3D scenes get a wider view, menus, movies and
              text stay 4:3), Stretch to fill the window, Frame rate
-             (original 50 Hz, match the display, or 60-240 by interpolating
+             (the game's original rate, match the display, or 60-240 by interpolating
              frames) and V-Sync. Frame rate and V-Sync belong to the GPU
              renderer: choosing one switches the renderer to GPU by itself.
     Quality  Renderer: Software, or GPU (Vulkan 1.3). The launcher looks at
@@ -324,7 +327,9 @@ Rule of Rose - native PC build (Windows 10/11, 64-bit)
 Run:      RuleOfRose.exe
           This opens the launcher. Choose your disc image, press PLAY.
 
-Needs:    your own copy of the European disc (SLES-54218) as an .iso file.
+Needs:    your own copy of the disc this ror-game was built from as an .iso
+          file (the European one, SLES-54218, unless the folder was packaged
+          from a USA build; ror-game refuses the other disc).
           The launcher finds "Rule of Rose (Europe) (En,Fr,De,Es,It).iso" or
           "RuleOfRose.iso" by itself when it is in this folder or up to four
           folders above; otherwise use Browse. The choice is remembered.
@@ -339,7 +344,7 @@ In the launcher
              Picture shape (4:3 is the original; 16:9, 21:9, 32:9 are
              experimental: 3D scenes get a wider view, menus, movies and
              text stay 4:3), Stretch to fill the window, Frame rate
-             (original 50 Hz, match the display, or 60-240 by interpolating
+             (the game's original rate, match the display, or 60-240 by interpolating
              frames) and V-Sync. Frame rate and V-Sync belong to the GPU
              renderer: choosing one switches the renderer to GPU by itself.
     Quality  Renderer: Software, or GPU (Vulkan 1.3). The launcher looks at

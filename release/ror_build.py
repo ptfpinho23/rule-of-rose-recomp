@@ -45,9 +45,11 @@ KIT = os.path.dirname(os.path.abspath(__file__))
 T_START = time.monotonic()
 WINDOWS = os.name == 'nt'
 EXE = '.exe' if WINDOWS else ''
-GAME_ELF = 'SLES_542.18'
-# sha256 of the executable on the European disc (SLES-54218); other editions are not supported
-ELF_SHA256 = '71417965b8931cadcebc33f48439df3290822316e4c139d9c4c7a4b6d7fb7692'
+# The editions that can be built, with the name and sha256 of each one's executable: recomp/games.py
+# (in the kit: buildkit/recomp/games.py; in the source tree: recomp/games.py).
+sys.path[:0] = [os.path.join(KIT, 'recomp'), os.path.join(KIT, '..', 'recomp')]
+import games  # noqa: E402
+SUPPORTED = ' or '.join('%s (%s)' % (g['serial'], g['region']) for g in games.GAMES)
 
 COMMON = ['-fno-sanitize=undefined', '-g0', '-O2', '-fwrapv', '-fno-strict-aliasing', '-fno-math-errno',
           '-ffp-contract=off', '-w', '-DGS_HW']
@@ -90,7 +92,8 @@ def say(line):
 
 
 def read_elf_from_iso(iso):
-    """The game executable from the root directory of the ISO 9660 image; BuildError if this is not the disc."""
+    """(game, data): the entry of games.py and the game executable from the root directory of the ISO 9660
+    image; BuildError if this is not one of the discs."""
     try:
         with open(iso, 'rb') as f:
             f.seek(16 * 2048)
@@ -109,7 +112,8 @@ def read_elf_from_iso(iso):
                     o = (o // 2048 + 1) * 2048
                     continue
                 name = d[o + 33:o + 33 + d[o + 32]].decode('latin1').split(';')[0].upper()
-                if name == GAME_ELF and not d[o + 25] & 2:
+                game = games.by_elf_name(name)
+                if game is not None and not d[o + 25] & 2:
                     flba, fsize = struct.unpack_from('<I', d, o + 2)[0], struct.unpack_from('<I', d, o + 10)[0]
                     if fsize > 64 << 20:
                         break
@@ -117,11 +121,11 @@ def read_elf_from_iso(iso):
                     data = f.read(fsize)
                     if len(data) != fsize:
                         raise BuildError('the disc image is truncated: ' + iso)
-                    return data
+                    return game, data
                 o += n
     except OSError as e:
         raise BuildError('cannot read the disc image: %s' % (e.strerror or e))
-    raise BuildError('this is not the European Rule of Rose disc (SLES-54218): no %s in the image' % GAME_ELF)
+    raise BuildError('this is not a Rule of Rose disc this version can use: it needs %s' % SUPPORTED)
 
 
 def kit_text(name):
@@ -129,9 +133,9 @@ def kit_text(name):
         return f.read().strip()
 
 
-def identity(iso, elf):
+def identity(iso, game, elf):
     """What the built executable depends on; stored in ror-game.stamp."""
-    return {'iso_size': os.path.getsize(iso), 'elf_sha256': hashlib.sha256(elf).hexdigest(),
+    return {'iso_size': os.path.getsize(iso), 'elf_sha256': hashlib.sha256(elf).hexdigest(), 'serial': game['serial'],
             'version': kit_text('VERSION'), 'kit': kit_text('KITHASH')}
 
 
@@ -183,11 +187,11 @@ def check(iso, out):
         say('needs build: a build is running')
         return 1
     try:
-        elf = read_elf_from_iso(iso)
+        game_entry, elf = read_elf_from_iso(iso)
     except BuildError as e:
         say('needs build: ' + str(e))
         return 1
-    want = identity(iso, elf)
+    want = identity(iso, game_entry, elf)
     game, stamp = os.path.join(out, 'ror-game' + EXE), os.path.join(out, 'ror-game.stamp')
     if not os.path.isfile(game):
         say('needs build: no ror-game yet')
@@ -198,10 +202,10 @@ def check(iso, out):
     except (OSError, ValueError):
         say('needs build: no stamp')
         return 1
-    for k in ('elf_sha256', 'iso_size', 'version', 'kit'):
+    for k in ('serial', 'elf_sha256', 'iso_size', 'version', 'kit'):       # serial first: a game made from the other disc
         if have.get(k) != want[k]:
-            say('needs build: %s changed' % {'elf_sha256': 'disc image', 'iso_size': 'disc image', 'version': 'release',
-                                              'kit': 'runtime'}[k])
+            say('needs build: %s changed' % {'serial': 'disc', 'elf_sha256': 'disc image', 'iso_size': 'disc image',
+                                              'version': 'release', 'kit': 'runtime'}[k])
             return 1
     say('up to date')
     return 0
@@ -392,10 +396,13 @@ def build_in(iso, out, jobs, work):
             say('PROGRESS %d 100 %s' % (pct, text))
 
     progress(0, 'Checking your disc')
-    elf = read_elf_from_iso(iso)
-    ident = identity(iso, elf)
-    if ident['elf_sha256'] != ELF_SHA256:
-        raise BuildError('this is not the European Rule of Rose disc (SLES-54218): its %s is a different version' % GAME_ELF)
+    game_entry, elf = read_elf_from_iso(iso)
+    ident = identity(iso, game_entry, elf)
+    if ident['elf_sha256'] != game_entry['sha256']:
+        raise BuildError('this disc (%s) is a version of the game this release does not know: its %s differs'
+                         % (game_entry['serial'], game_entry['elf']))
+    GAME_ELF = game_entry['elf']
+    log.write('disc: %s (%s, %s)\n' % (game_entry['serial'], game_entry['region'], game_entry['video']))
     with open(os.path.join(work, GAME_ELF), 'wb') as f:
         f.write(elf)
 
@@ -503,7 +510,7 @@ def main():
         except (AttributeError, ValueError):
             pass
     ap = argparse.ArgumentParser(prog='ror-build', description='Build the Rule of Rose executable from your own disc image.')
-    ap.add_argument('--iso', required=True, help='disc image of the European release (SLES-54218)')
+    ap.add_argument('--iso', required=True, help='disc image of the European (SLES-54218) or USA (SLUS-21448) release')
     ap.add_argument('--out', required=True, help='folder to put ror-game in (created if needed)')
     ap.add_argument('--jobs', type=int, default=0, help='compilers to run at a time (default: one per processor)')
     ap.add_argument('--check', action='store_true', help='only report whether DIR/ror-game is up to date for this image')

@@ -48,6 +48,7 @@ void rt_fatal(Ctx *c, const char *fmt, ...) {
     va_list ap; va_start(ap, fmt); vfprintf(stderr, fmt, ap); va_end(ap); fputc('\n', stderr); exit(1);
 }
 void rt_log(const char *fmt, ...) { va_list ap; va_start(ap, fmt); vfprintf(stderr, fmt, ap); va_end(ap); }
+const RorGame ror_game = { "pal", "SLES-54218", "SLES_542.18", "Europe", 0, 0, 0 };   /* replays are paced as 50 Hz captures */
 void intc_raise(int cause) { (void)cause; }
 /* --wide (rt/wide.c, rt/gif.c) is not part of a replay: captures hold the primitives as the game sent them */
 int g_gif_path, g_wide_want_p1;
