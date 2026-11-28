@@ -28,7 +28,7 @@ ror-game --iso PATH [--scale 1..4 | --res WxH] [--wide 16:9] [picture options]
 | `--pad auto\|off\|xinput\|playstation` | gamepad: `auto` (default) uses the gamepads it finds, `off` ignores gamepads; `xinput` / `playstation` restrict it to XInput pads or to PlayStation pads (Linux: to non-Sony / Sony devices) |
 | `--pad-deadzone 0..90` | part of the stick travel around the centre that is ignored, in percent (default 24); the rest of the travel is the full analog range |
 | `--frameskip auto\|off` | what happens when the machine is too slow for the chosen settings. `auto` (default): the game keeps its speed and its sound, and whole pictures are left out instead (at most two in a row, so at least a third of them is shown); the log says so once. `off`: every picture is drawn and the game slows down. Only in a window at normal speed; never with `--fps` or `fsr3` |
-| `--fps 0\|display\|25..1000` | GPU renderer only: frame interpolation. `0` (default) shows the game's own 25 pictures per second; `display` presents in-between pictures at the monitor's refresh rate; a number presents at most that many per second. Adds one game frame (40 ms) plus 20-60 ms of picture delay. The 3D scene is moved between two game frames, everything else is shown as the game drew it, and after a camera cut the real frames are shown without in-betweens |
+| `--fps 0\|display\|25..1000` | GPU renderer only: frame interpolation. `0` (default) shows the game's own pictures, 25 per second on the European disc and 30 on the USA disc; `display` presents in-between pictures at the monitor's refresh rate; a number presents at most that many per second. Adds one game frame (40 ms, 33 ms on the USA disc) plus 20-60 ms of picture delay. The 3D scene is moved between two game frames, everything else is shown as the game drew it, and after a camera cut the real frames are shown without in-betweens |
 | `--interp auto\|inputs\|pairs` | how `--fps` (and the motion vectors of `fsr3` / `dlss`) find where a piece of geometry was in the previous frame. `inputs` follows the game's own geometry program: a mesh part that the game sends again in the next frame, with the same structure, gives every one of its vertices its exact previous position, however the camera moved and whatever order things were drawn in. `pairs` is the older method: primitives of the two finished draw lists are paired by position in the list, texture coordinates and shared vertices. `auto` (default) is `inputs` wherever the game runs the geometry program this port knows, with `pairs` for what is left over (2D, clipped polygons, parts that are new in a frame) and as the fallback for whole frames it does not recognise. Also `ROR_INTERP=value`. (`--interp` without one of these words is the reference CPU interpreter, a debugging aid) |
 
 With `--renderer gpu`, `--filter nearest` shows every PS2 pixel as an even block: output pixels that fall between two blocks mix them, so that a window size that is not a whole multiple of the picture does not give blocks of unequal width (at whole multiples it is plain nearest). The software renderer's `nearest` is unchanged.
@@ -54,17 +54,20 @@ needs Windows, `--renderer gpu` and a GeForce RTX card. If a file is missing, un
 run DLSS, the log says so in one line and the picture is scaled with `fsr3` (if AMD's DLLs are present) or `fsr`.
 Use `--internal 2`, `3` or `4`; at `--internal 1` the result flickers.
 
+A game executable is made from one disc and only starts with that disc
+(European, SLES-54218, or USA, SLUS-21448); given the other one it says so and stops.
+
 Without `--iso` the game looks for `Rule of Rose (Europe) (En,Fr,De,Es,It).iso`
-or `RuleOfRose.iso` in the current folder, beside the executable and up to
+(the USA game: `Rule of Rose (USA).iso`) or `RuleOfRose.iso` in the current folder, beside the executable and up to
 four folders above it.
 
 | Environment variable | Effect |
 |---|---|
 | `ROR_ISO=path` | disc image location |
-| `ROR_MC_DIR=dir` | memory-card folder (default `saves/mc0` beside the executable) |
+| `ROR_MC_DIR=dir` | memory-card folder (default `saves/mc0` beside the executable; the launcher sets it to its own `saves/mc0` for the European disc and `saves/SLUS-21448/mc0` for the USA disc) |
 | `ROR_NO_MC=1` | start with no memory card inserted |
 | `ROR_NOAUDIO=1` | no sound |
-| `ROR_PERFLOG=1` | performance log: one `[perf]` line per second of play and a `[perf] total` line at exit, with how the game's 50 Hz ticks were spent (game code, VU1, drawing, textures, frame interpolation, waiting for the GPU, sleeping), whether the game fell behind its clock, how evenly pictures were presented and how many frames were interpolated. Costs next to nothing; the fields are explained above `perf_tick` in `recomp/rt/video.c`. `ROR_PERFLOG=2` adds texture cache and GPU submit details |
+| `ROR_PERFLOG=1` | performance log: one `[perf]` line per second of play and a `[perf] total` line at exit, with how the game's video ticks (50 per second on the European disc, 59.94 on the USA disc) were spent (game code, VU1, drawing, textures, frame interpolation, waiting for the GPU, sleeping), whether the game fell behind its clock, how evenly pictures were presented and how many frames were interpolated. Costs next to nothing; the fields are explained above `perf_tick` in `recomp/rt/video.c`. `ROR_PERFLOG=2` adds texture cache and GPU submit details |
 | `ROR_HW_SYNC=1` | GPU renderer: wait for the graphics card after every frame, as older versions did (for comparison when hunting a problem) |
 | `ROR_PAD_DEBUG=1` | Linux: log every input device, the capabilities of each gamepad and every change of its state (see [CONTROLS.md](CONTROLS.md)) |
 | `ROR_WIDE=16:9` | same as `--wide` (the command line wins) |

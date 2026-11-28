@@ -1,5 +1,14 @@
 # What's new
 
+## 0.1.5
+
+- The North American disc (SLUS-21448) now works too, next to the European
+  one. Choose either disc image in the launcher; it shows which one it is and
+  prepares the right game. Both can stay prepared at the same time.
+- Each disc has its own memory card in the `saves` folder, so saves from the
+  two versions never mix. European saves stay where they were.
+- After this update the game has to be prepared once more.
+
 ## 0.1.4
 
 - Laptops with integrated graphics: the launcher now picks the light

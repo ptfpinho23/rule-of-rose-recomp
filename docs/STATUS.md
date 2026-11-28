@@ -1,5 +1,9 @@
 # Status in detail
 
+Two discs are supported: the European one (SLES-54218, 50 Hz) and the North
+American one (SLUS-21448, 59.94 Hz). Most of what follows was first done on the
+European disc; what was checked on the USA disc is in its own section below.
+
 ## What has been verified
 
 Scripted runs with screenshots cover: language select, memory-card check, logo
@@ -9,7 +13,7 @@ uphill from it.
 
 - The Windows and Linux builds produce byte-identical frames and audio over
   that run.
-- Both hold the game's 50 Hz in a real window with sound, with a large margin
+- Both hold the European game's 50 Hz in a real window with sound, with a large margin
   (the first gameplay scene runs at about 150 fps unthrottled on the
   development machine).
 - The GPU renderer, frame interpolation (`--fps display`), widescreen at 16:9
@@ -28,6 +32,43 @@ uphill from it.
 - DLSS (`--filter dlss`, with NVIDIA's files supplied by the player) has been
   run in the first two areas and the first cutscene on the RTX 3090 only
   (about 180 pictures per second with `--fps 240` at `--internal 2`).
+
+## The USA disc (SLUS-21448)
+
+Verified with a scripted run of 18,000 vblanks (five minutes of play) with
+screenshots: the memory-card message (this disc has no language screen), the
+publisher and disclaimer screens, logo and intro movies, title screen, New
+Game, the opening movie with subtitles, the chapter card, the 3D storybook,
+the first gameplay scene with its captions, the path uphill and the cutscene
+at its end.
+
+- Windows and Linux produce byte-identical frames and audio over that run, and
+  so do the games made by the release's own builder on both systems.
+- Timing: the game runs at 59.94 vblanks a second (measured over 15,400
+  vblanks without a window) and draws 30 pictures a second; the sound comes
+  out at exactly 800.8 samples per vblank, so it neither drifts nor changes
+  pitch. The intro movie plays through with its sound stream never running
+  dry.
+- On the RTX 3090: the GPU renderer at 1x, 2x, 4x and 8x; widescreen at 16:9,
+  21:9 and 32:9 (3D wide, movies and menus 4:3); the upscalers (nearest,
+  bilinear, FSR 1.0, FSR 3.1, DLSS); film grain, the texture filter and the
+  picture settings; frame interpolation at 60, 120, 144, 240 and the display's
+  rate with both methods, over the uphill walk: 686 of 690 game frames
+  interpolated, 99.5 % of the geometry matched with its previous frame (the
+  European walk gives the same figure), and the artifact detector found
+  nothing in 248 in-between pictures. On Linux the GPU renderer ran at 1x on
+  the CPU Vulkan driver.
+- Gamepad input fed through the mapping code (buttons, and the stick for
+  walking) reproduces the keyboard run exactly, as on the European disc.
+- Memory card: with no card the game shows its message at boot; with an empty
+  card it starts without it and Load Game reports that there is no save data.
+
+Not checked on the USA disc: everything listed under "Not tested yet" (it
+applies to both discs), `--frameskip` in action (it needs a machine that is too
+slow), the fullscreen picture by eye (a fullscreen run started and presented;
+nobody looked at the screen), frame generation, and any play beyond the
+stretch above. The known problems below were found on the European disc and
+should be assumed for both.
 
 ## Not tested yet
 

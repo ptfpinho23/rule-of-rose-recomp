@@ -21,7 +21,8 @@
   <img src="docs/options.png" alt="Launcher options" width="49%">
 </p>
 
-A PC version of *Rule of Rose* (European release, SLES-54218). You download
+A PC version of *Rule of Rose*. It works with the European disc (SLES-54218)
+and the North American disc (SLUS-21448). You download
 the launcher from this page, point it at your own copy of the game, and it
 does the rest: it prepares the game for your PC once, then you press PLAY.
 No emulator to set up and nothing else to install.
@@ -39,15 +40,17 @@ No emulator to set up and nothing else to install.
    the `.zip` for Windows 10/11, or the `.tar.gz` for Linux.
 2. **Unpack** it anywhere and start `RuleOfRose.exe` (Windows) or
    `./RuleOfRose` (Linux).
-3. **Choose your disc image.** The launcher checks that it is the right game.
-4. **Press PREPARE GAME.** This happens once and takes a few minutes. You only
-   see it again after updating to a new release.
+3. **Choose your disc image.** The launcher checks that it is the right game
+   and tells you which disc it is, European or USA.
+4. **Press PREPARE GAME.** This happens once per disc and takes a few minutes.
+   You only see it again after updating to a new release.
 5. **Press PLAY.**
 
 That is all. You do not need to install anything else or build anything
 yourself.
 
-Your saves are kept in the `saves` folder next to the launcher. The keyboard
+Your saves are kept in the `saves` folder next to the launcher; each disc has
+its own memory card there, so the two never mix. The keyboard
 and gamepad layout is on the launcher's Controls screen and in
 [docs/CONTROLS.md](docs/CONTROLS.md).
 
@@ -55,7 +58,8 @@ and gamepad layout is on the launcher's Controls screen and in
 
 - **Sharper picture.** Play at the original PS2 resolution or at up to 8 times
   that on your graphics card.
-- **Smooth motion.** The original shows 25 pictures a second. The PC version
+- **Smooth motion.** The original shows 25 pictures a second (30 on the USA
+  disc). The PC version
   can fill in the frames in between, up to your monitor's refresh rate.
 - **Widescreen.** 16:9, 21:9 and 32:9, showing more of the scene to the sides
   instead of stretching it.
@@ -110,7 +114,9 @@ Builds run on Linux with a user-space toolchain, no root needed. The Windows bui
 
 Put your disc image in the repository root as
 `Rule of Rose (Europe) (En,Fr,De,Es,It).iso`, or set `ROR_ISO=/path/to.iso`.
-Then:
+For the USA disc the name is `Rule of Rose (USA).iso`, and the two game build
+scripts take `GAME=ntsc` (outputs under `build/recomp/ntsc/`, beside the
+European ones). Then:
 
 ```sh
 recomp/build.sh          # game, Linux     -> build/recomp/ror
@@ -138,6 +144,9 @@ code.
 | Platform layer | `recomp/rt/plat*`, `video_*`, `audio_*`, `pad_*` | X11, PulseAudio and evdev on Linux; Win32, waveOut, XInput and HID on Windows. |
 | Launcher | `launcher/` | Qt 6 front end. |
 | Tools | `recomp/tools/` | Disassemblers, capture and replay tools, comparison scripts. |
+
+What differs between the two discs (the name and hash of the executable, three
+addresses, 50 or 59.94 Hz) is one small table, `recomp/games.py`.
 
 Run headless, the game is deterministic. Every change is checked by a scripted
 run from boot into gameplay that must produce the same frames and the same
